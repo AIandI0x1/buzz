@@ -37,11 +37,14 @@ export function getDiffFileLabel(
   file: FileData,
   fallbackFilePath?: string,
 ): string {
-  if (file.oldPath && file.newPath && file.oldPath !== file.newPath) {
-    return `${file.oldPath} -> ${file.newPath}`;
+  const oldPath = file.oldPath === "/dev/null" ? undefined : file.oldPath;
+  const newPath = file.newPath === "/dev/null" ? undefined : file.newPath;
+
+  if (oldPath && newPath && oldPath !== newPath) {
+    return `${oldPath} -> ${newPath}`;
   }
 
-  return file.newPath || file.oldPath || fallbackFilePath || "diff";
+  return newPath || oldPath || fallbackFilePath || "diff";
 }
 
 export function countDiffFileChanges(file: FileData) {
