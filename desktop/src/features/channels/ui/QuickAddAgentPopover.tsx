@@ -304,7 +304,6 @@ export function QuickAddAgentPopover({
       <PopoverContent align="end" className="w-72 p-0" sideOffset={6}>
         <div
           className="flex max-h-80 flex-col"
-          role="menu"
           onKeyDown={(e) => {
             const container = e.currentTarget;
             const buttons = Array.from(
@@ -345,11 +344,7 @@ export function QuickAddAgentPopover({
                 No agents available.
               </div>
             ) : (
-              <div
-                aria-label="Available agents"
-                className="py-1"
-                role="listbox"
-              >
+              <div aria-label="Available agents" className="py-1" role="listbox">
                 {items.map((item) => {
                   const itemKey = getItemKey(item);
                   const isInChannel = item.kind === "running-in-channel";

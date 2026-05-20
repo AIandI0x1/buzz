@@ -89,6 +89,25 @@ export function ChannelMembersBar({
   return (
     <React.Fragment>
       <div className="flex items-center gap-1">
+        <QuickAddAgentPopover
+          channelId={channel.id}
+          open={isQuickAddOpen}
+          onOpenChange={setIsQuickAddOpen}
+          onMoreOptions={() => setIsAddBotOpen(true)}
+        >
+          <Button
+            aria-label="Add agent"
+            className="h-7 w-7 rounded-full"
+            data-testid="channel-add-bot-trigger"
+            disabled={!canAddAgents}
+            size="icon"
+            type="button"
+            variant="outline"
+          >
+            <Plus className="h-3 w-3" />
+          </Button>
+        </QuickAddAgentPopover>
+
         <HuddleIndicator
           className="h-7 w-7"
           channelId={channel.id}
@@ -118,25 +137,6 @@ export function ChannelMembersBar({
             {memberCount}
           </span>
         </Button>
-
-        <QuickAddAgentPopover
-          channelId={channel.id}
-          open={isQuickAddOpen}
-          onOpenChange={setIsQuickAddOpen}
-          onMoreOptions={() => setIsAddBotOpen(true)}
-        >
-          <Button
-            aria-label="Add agent"
-            className="h-7 w-7 rounded-full"
-            data-testid="channel-add-bot-trigger"
-            disabled={!canAddAgents}
-            size="icon"
-            type="button"
-            variant="outline"
-          >
-            <Plus className="h-3 w-3" />
-          </Button>
-        </QuickAddAgentPopover>
 
         <Button
           aria-label="Manage channel"
