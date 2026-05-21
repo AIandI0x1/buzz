@@ -610,21 +610,6 @@ export function QuickAddAgentPopover({
                       tabIndex={isInChannel ? -1 : 0}
                       type="button"
                     >
-                      {selectMode && !isInChannel ? (
-                        <motion.div
-                          className={cn(
-                            "flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors",
-                            isSelected
-                              ? "border-primary bg-primary text-primary-foreground"
-                              : "border-muted-foreground/40",
-                          )}
-                          initial={{ opacity: 0, scale: 0.5 }}
-                          animate={{ opacity: 1, scale: 1 }}
-                          transition={{ duration: 0.15 }}
-                        >
-                          {isSelected ? <Check className="h-3 w-3" /> : null}
-                        </motion.div>
-                      ) : null}
                       <QuickAddAgentAvatar
                         avatarUrl={item.avatarUrl}
                         label={item.label}
