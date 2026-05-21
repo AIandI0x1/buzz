@@ -311,6 +311,34 @@ export function QuickAddAgentPopover({
       } else {
         next.add(key);
       }
+
+      // Deselect any team whose members are no longer all selected
+      setSelectedTeamIds((prevTeams) => {
+        const nextTeams = new Set(prevTeams);
+        for (const team of usableTeams) {
+          if (!nextTeams.has(team.id)) continue;
+          const resolution = resolveTeamPersonas(team, personas);
+          const allSelected = resolution.resolvedPersonas.every((persona) => {
+            const runningItem = items.find(
+              (i) => i.kind === "running-available" && i.agent.personaId === persona.id,
+            );
+            const itemKey = runningItem
+              ? getItemKey(runningItem)
+              : (() => {
+                  const personaItem = items.find(
+                    (i) => i.kind === "persona" && i.persona.id === persona.id,
+                  );
+                  return personaItem ? getItemKey(personaItem) : null;
+                })();
+            return itemKey ? next.has(itemKey) : true;
+          });
+          if (!allSelected) {
+            nextTeams.delete(team.id);
+          }
+        }
+        return nextTeams;
+      });
+
       return next;
     });
   }
