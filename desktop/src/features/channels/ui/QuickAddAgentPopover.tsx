@@ -225,6 +225,39 @@ export function QuickAddAgentPopover({
     return result;
   }, [managedAgents, personas, channelMemberPubkeys, recentIds]);
 
+  // Snapshot item order when popover opens — don't reorder while open
+  const [stableItems, setStableItems] = React.useState<QuickAddAgentItem[]>([]);
+  React.useEffect(() => {
+    if (open) {
+      setStableItems(items);
+    }
+  }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Merge live data (kind changes) into stable order while keeping positions
+  const displayItems = React.useMemo(() => {
+    if (!open) return items;
+    const liveMap = new Map(items.map((item) => [getItemKey(item), item]));
+    // Keep stable order, update each item with live data, add new items at end
+    const result: QuickAddAgentItem[] = [];
+    const seen = new Set<string>();
+    for (const stableItem of stableItems) {
+      const key = getItemKey(stableItem);
+      const liveItem = liveMap.get(key);
+      if (liveItem) {
+        result.push(liveItem);
+        seen.add(key);
+      }
+    }
+    // Append any new items that weren't in the snapshot
+    for (const item of items) {
+      const key = getItemKey(item);
+      if (!seen.has(key)) {
+        result.push(item);
+      }
+    }
+    return result;
+  }, [open, stableItems, items]);
+
   // Reset state when popover closes
   React.useEffect(() => {
     if (!open) {
@@ -247,7 +280,7 @@ export function QuickAddAgentPopover({
     try {
       await attachMutation.mutateAsync({ agent, ensureRunning: true });
       if (agent.personaId) pushRecent(agent.personaId);
-      onOpenChange(false);
+      setPendingKey(null);
     } catch (err) {
       setErrorMessage(
         err instanceof Error ? err.message : "Failed to add agent.",
@@ -287,7 +320,7 @@ export function QuickAddAgentPopover({
         model: persona.model ?? undefined,
       });
       pushRecent(persona.id);
-      onOpenChange(false);
+      setPendingKey(null);
     } catch (err) {
       setErrorMessage(
         err instanceof Error ? err.message : "Failed to add agent.",
@@ -447,7 +480,10 @@ export function QuickAddAgentPopover({
         }
       }
 
-      onOpenChange(false);
+      setPendingKey(null);
+      setSelectMode(false);
+      setSelectedKeys(new Set());
+      setSelectedTeamIds(new Set());
     } catch (err) {
       setErrorMessage(
         err instanceof Error ? err.message : "Failed to add agents.",
@@ -603,7 +639,7 @@ export function QuickAddAgentPopover({
               <div className="flex items-center justify-center py-6">
                 <Spinner className="h-4 w-4 text-muted-foreground" />
               </div>
-            ) : items.length === 0 ? (
+            ) : displayItems.length === 0 ? (
               <div className="px-3 py-4 text-center text-sm text-muted-foreground">
                 No agents available.
               </div>
@@ -613,7 +649,7 @@ export function QuickAddAgentPopover({
                 className="py-1"
                 role="listbox"
               >
-                {items.map((item) => {
+                {displayItems.map((item) => {
                   const itemKey = getItemKey(item);
                   const isInChannel = item.kind === "running-in-channel";
                   const isItemPending =
