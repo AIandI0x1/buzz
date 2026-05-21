@@ -465,7 +465,7 @@ export function QuickAddAgentPopover({
         sideOffset={6}
       >
         <div
-          className="flex flex-col"
+          className="relative flex flex-col"
           role="menu"
           onKeyDown={(e) => {
             const container = e.currentTarget;
@@ -496,16 +496,6 @@ export function QuickAddAgentPopover({
           <div className="flex min-h-10 items-center gap-2 border-b pl-3 pr-1.5 py-1.5">
             <h3 className="shrink-0 text-sm font-semibold text-foreground">
               Add agent
-              {selectMode ? (
-                <motion.span
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  exit={{ opacity: 0 }}
-                  transition={{ duration: 0.3 }}
-                >
-                  s
-                </motion.span>
-              ) : null}
             </h3>
 
             {usableTeams.length > 0 ? (
@@ -601,7 +591,8 @@ export function QuickAddAgentPopover({
                   const isSelected = selectedKeys.has(itemKey);
 
                   return (
-                    <button
+                    <motion.button
+                      layout
                       aria-selected={isInChannel || isSelected}
                       className={cn(
                         "flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-sm transition-colors",
@@ -617,28 +608,42 @@ export function QuickAddAgentPopover({
                       onClick={() => handleItemClick(item)}
                       role="option"
                       tabIndex={isInChannel ? -1 : 0}
+                      transition={{ duration: 0.15 }}
                       type="button"
                     >
-                      {selectMode && !isInChannel ? (
-                        <div
-                          className={cn(
-                            "flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors",
-                            isSelected
-                              ? "border-primary bg-primary text-primary-foreground"
-                              : "border-muted-foreground/40",
-                          )}
-                        >
-                          {isSelected ? <Check className="h-3 w-3" /> : null}
-                        </div>
-                      ) : null}
-                      <QuickAddAgentAvatar
-                        avatarUrl={item.avatarUrl}
-                        label={item.label}
-                        isRunning={item.kind !== "persona"}
-                      />
-                      <span className="min-w-0 flex-1 truncate font-medium">
+                      <AnimatePresence>
+                        {selectMode && !isInChannel ? (
+                          <motion.div
+                            key="checkbox"
+                            initial={{ width: 0, opacity: 0 }}
+                            animate={{ width: 16, opacity: 1 }}
+                            exit={{ width: 0, opacity: 0 }}
+                            transition={{ duration: 0.15 }}
+                            className="shrink-0 overflow-hidden"
+                          >
+                            <div
+                              className={cn(
+                                "flex h-4 w-4 items-center justify-center rounded border transition-colors",
+                                isSelected
+                                  ? "border-primary bg-primary text-primary-foreground"
+                                  : "border-muted-foreground/40",
+                              )}
+                            >
+                              {isSelected ? <Check className="h-3 w-3" /> : null}
+                            </div>
+                          </motion.div>
+                        ) : null}
+                      </AnimatePresence>
+                      <motion.div layout="position" transition={{ duration: 0.15 }} className="shrink-0">
+                        <QuickAddAgentAvatar
+                          avatarUrl={item.avatarUrl}
+                          label={item.label}
+                          isRunning={item.kind !== "persona"}
+                        />
+                      </motion.div>
+                      <motion.span layout="position" transition={{ duration: 0.15 }} className="min-w-0 flex-1 truncate font-medium">
                         {item.label}
-                      </span>
+                      </motion.span>
                       {isInChannel ? (
                         <Check className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                       ) : item.kind === "running-available" && !selectMode ? (
@@ -649,7 +654,7 @@ export function QuickAddAgentPopover({
                       {isItemPending ? (
                         <Spinner className="h-3.5 w-3.5 shrink-0 text-primary" />
                       ) : null}
-                    </button>
+                    </motion.button>
                   );
                 })}
               </div>
@@ -678,23 +683,32 @@ export function QuickAddAgentPopover({
             </button>
           </div>
 
-          {multiSelectActive ? (
-            <div className="border-t px-3 py-2">
-              <Button
-                className="w-full"
-                data-testid="quick-add-batch-confirm"
-                disabled={Boolean(pendingKey)}
-                onClick={() => void handleBatchAdd()}
-                size="sm"
-                type="button"
+          <AnimatePresence>
+            {multiSelectActive ? (
+              <motion.div
+                key="batch-add"
+                className="pointer-events-none absolute bottom-0 left-0 right-0 px-3 pb-2 pt-8 bg-gradient-to-t from-popover to-transparent"
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: 8 }}
+                transition={{ duration: 0.15 }}
               >
-                {pendingKey === "batch" ? (
-                  <Spinner className="h-3 w-3" />
-                ) : null}
-                Add ({selectedKeys.size})
-              </Button>
-            </div>
-          ) : null}
+                <Button
+                  className="pointer-events-auto w-full"
+                  data-testid="quick-add-batch-confirm"
+                  disabled={Boolean(pendingKey)}
+                  onClick={() => void handleBatchAdd()}
+                  size="sm"
+                  type="button"
+                >
+                  {pendingKey === "batch" ? (
+                    <Spinner className="h-3 w-3" />
+                  ) : null}
+                  Add ({selectedKeys.size})
+                </Button>
+              </motion.div>
+            ) : null}
+          </AnimatePresence>
         </div>
       </PopoverContent>
     </Popover>
