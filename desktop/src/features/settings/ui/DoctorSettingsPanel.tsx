@@ -60,14 +60,15 @@ function InstallActions({
           {isInstalling ? "Installing..." : "Install"}
         </Button>
       ) : null}
-      <button
+      <a
         className="inline-flex items-center gap-1 text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
-        onClick={() => window.open(provider.installInstructionsUrl, "_blank")}
-        type="button"
+        href={provider.installInstructionsUrl}
+        rel="noopener noreferrer"
+        target="_blank"
       >
         <ExternalLink className="h-3 w-3" />
         View instructions
-      </button>
+      </a>
     </div>
   );
 }

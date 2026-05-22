@@ -105,6 +105,12 @@ fn run_install_command(step: &str, command: &str) -> InstallStepResult {
     let mut cmd = std::process::Command::new(shell);
     cmd.args(["-l", "-c", command]);
 
+    // Strip hermit env vars so npm/node use the user's normal registry and
+    // global prefix rather than the project-local hermit-managed paths.
+    cmd.env_remove("NPM_CONFIG_PREFIX");
+    cmd.env_remove("NPM_CONFIG_CACHE");
+    cmd.env_remove("COREPACK_HOME");
+
     if let Some(ref path) = shell_path {
         cmd.env("PATH", path);
     }
