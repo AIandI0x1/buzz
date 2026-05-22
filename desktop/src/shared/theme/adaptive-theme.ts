@@ -259,7 +259,7 @@ export function createThemeVars(
       "--status-modified": accentOrange,
 
       // Terminal
-      "--terminal-background": hexToHsl(syntaxBg),
+      "--terminal-background": hexToHsl(chromeColor),
       "--terminal-foreground": hexToHsl(syntaxFg),
 
       // Warning
