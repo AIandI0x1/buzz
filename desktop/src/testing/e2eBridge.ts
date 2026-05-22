@@ -15,15 +15,6 @@ type TestIdentity = {
   username: string;
 };
 
-type MockAcpProvider = {
-  id: string;
-  label: string;
-  command: string;
-  binaryPath: string;
-  defaultArgs: string[];
-  mcpCommand?: string | null;
-};
-
 type MockCommandAvailability = {
   available?: boolean;
   command?: string;
@@ -33,7 +24,6 @@ type MockCommandAvailability = {
 type E2eConfig = {
   mode?: "mock" | "relay";
   mock?: {
-    acpProviders?: MockAcpProvider[];
     acpProvidersCatalog?: RawAcpProviderCatalogEntry[];
     installAcpRuntimeResult?: RawInstallRuntimeResult;
     managedAgentPrereqs?: {

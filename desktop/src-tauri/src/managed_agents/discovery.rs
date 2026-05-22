@@ -596,4 +596,12 @@ mod tests {
         assert!(cmd.is_none());
         assert!(path.is_none());
     }
+
+    #[test]
+    fn classifies_not_installed_when_no_underlying_cli() {
+        let (status, cmd, path) = classify_provider(None, None, false);
+        assert_eq!(status, AcpAvailabilityStatus::NotInstalled);
+        assert!(cmd.is_none());
+        assert!(path.is_none());
+    }
 }

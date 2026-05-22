@@ -39,6 +39,7 @@ import type {
   CreateManagedAgentInput,
   AgentModelsResponse,
   UpdateManagedAgentInput,
+  AcpAvailabilityStatus,
   AcpProviderCatalogEntry,
   CommandAvailability,
   InstallRuntimeResult,

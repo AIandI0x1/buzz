@@ -45,14 +45,12 @@ const overrides = new Map([
   ["src/features/settings/ui/SettingsView.tsx", 600],
   ["src/features/sidebar/ui/AppSidebar.tsx", 860], // channels + forums creation forms + Pulse nav
   ["src/shared/api/relayClientSession.ts", 1040], // durable websocket session manager with reconnect/replay/recovery state + sendTypingIndicator + fetchChannelHistoryBefore + subscribeToChannelLive (huddle TTS) + subscribeToHuddleEvents (huddle indicator) + disconnect() for workspace switch teardown + fetchEvents/subscribeLive/publishEvent for NIP-RS read state + publishUserStatus/subscribeToUserStatusUpdates (NIP-38) + ConnectionState plumbing & stall-watchdog wiring for half-open WS detection (Warp orange-icon case) + terminal session latch (auth rejection no longer racing back to reconnecting) — emitter + watchdog + reconnect policy logic extracted to relayConnectionStateEmitter.ts / relayStallWatchdog.ts / relayReconnectPolicy.ts
-  ["src/shared/api/tauri.ts", 1100], // remote agent provider API bindings + canvas API functions
-  ["src-tauri/src/lib.rs", 710], // sprout-media:// proxy + Range headers + Sprout nest init (ensure_nest) in setup() + huddle command registration + PTT global shortcut handler + persona pack commands + app_handle storage for event emission
   ["src-tauri/src/commands/media.rs", 730], // ffmpeg video transcode + poster frame extraction + run_ffmpeg_with_timeout (find_ffmpeg via resolve_command, is_video_file, transcode_to_mp4, extract_poster_frame, transcode_and_extract_poster) + spawn_blocking wrappers + tests
   ["src-tauri/src/commands/agents.rs", 881], // remote agent lifecycle routing (local + provider branches) + scope enforcement + persona pack metadata wiring + mcp_toolsets field + NIP-OA auth_tag in deploy payload
   ["src-tauri/src/commands/messages.rs", 510], // feed multi-query + NIP-50 search + forum thread resolution + thread ref + reactions via REQ
   ["src-tauri/src/nostr_convert.rs", 1150], // 12 Nostr event→model converters (channels, profiles, members, notes, search, agents, relay members) + rank_user_search_results helper for NIP-50 user search + 33 unit tests
   ["src-tauri/src/managed_agents/runtime.rs", 1110], // ... + respond-to gate env (SPROUT_ACP_RESPOND_TO[_ALLOWLIST]) + per-mode env builder + tests + persona/agent env_vars spawn merge (helper + tests now in env_vars.rs)
-  ["src-tauri/src/managed_agents/discovery.rs", 600], // KNOWN_ACP_PROVIDERS catalog + resolve_command cache + login_shell_path + classify_provider + discover_acp_providers (three-state: Available/AdapterMissing/NotInstalled) + known_acp_provider/known_acp_provider_exact + normalize_agent_args + 13 unit tests
+  ["src-tauri/src/managed_agents/discovery.rs", 610], // KNOWN_ACP_PROVIDERS catalog + resolve_command cache + login_shell_path + classify_provider + discover_acp_providers (three-state: Available/AdapterMissing/NotInstalled) + known_acp_provider/known_acp_provider_exact + normalize_agent_args + 14 unit tests
   ["src-tauri/src/managed_agents/types.rs", 745], // ManagedAgentRecord/Summary + Create/Update request structs + AcpProviderCatalogEntry + InstallRuntimeResult + RespondTo enum + validate_respond_to_allowlist + tests + persona/agent env_vars field
   ["src-tauri/src/managed_agents/backend.rs", 700], // provider IPC, validation, discovery, binary resolution + tests + redact_secrets_with for user env values + env_secrets_from_request + redact_env_values_in (shared with model discovery)
   ["src/features/huddle/HuddleContext.tsx", 650], // huddle lifecycle context + joinHuddle + connectAndSetupMedia shared helper + activeSpeakers/isReconnecting state + PTT (reusable AudioContext) + TTS subscription + mic level analyser (10fps throttle) + agent pubkey refresh
@@ -79,7 +77,7 @@ const overrides = new Map([
   ["src-tauri/src/relay.rs", 510], // +4 lines for NIP-OA auth tag injection in profile sync (build_profile_event) + verification test
   ["src-tauri/src/commands/pairing.rs", 600], // NIP-AB pairing actor: 3 Tauri commands + background WS task + NIP-42 auth + NIP-43 probe + event parsing helpers
   ["src-tauri/src/lib.rs", 715], // +4 lines for PairingHandle managed state + 3 pairing command registrations
-  ["src/shared/api/tauri.ts", 1212], // pairing command wrappers + applyWorkspace + NIP-44 encrypt/decrypt wrappers + observer_url field + relay member API functions (list/get/add/remove/change-role) + prevent sleep
+  ["src/shared/api/tauri.ts", 1212], // pairing command wrappers + applyWorkspace + NIP-44 encrypt/decrypt wrappers + observer_url field + relay member API functions (list/get/add/remove/change-role) + prevent sleep + AcpProviderCatalogEntry raw types + fromRawAcpProviderCatalogEntry converter + installAcpRuntime
 ]);
 
 async function walkFiles(directory) {

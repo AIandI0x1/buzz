@@ -28,6 +28,8 @@ pub async fn install_acp_runtime(provider_id: String) -> Result<InstallRuntimeRe
         .map_err(|e| format!("install task panicked: {e}"))?
 }
 
+/// Err(_) = infrastructure failure (panic, concurrency guard).
+/// Ok({success: false}) = an install step failed (stderr captured in steps).
 fn install_acp_runtime_blocking(provider_id: &str) -> Result<InstallRuntimeResult, String> {
     // Prevent concurrent installs.
     INSTALL_IN_PROGRESS
@@ -144,11 +146,14 @@ fn run_install_command(step: &str, command: &str) -> InstallStepResult {
         buf
     });
 
+    // Save the PID before moving `child` into the wait thread so we can
+    // kill the process on timeout.
+    let child_pid = child.id();
+
     let (tx, rx) = std::sync::mpsc::channel();
     let wait_thread = std::thread::spawn(move || {
         let status = child.wait();
         let _ = tx.send(status);
-        // Return child so the caller can kill it on timeout.
     });
 
     // 5-minute timeout for install commands.
@@ -156,16 +161,16 @@ fn run_install_command(step: &str, command: &str) -> InstallStepResult {
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            // Timeout: the wait_thread still holds the child; signal via the
-            // channel being dropped and use a sentinel. We cannot kill here
-            // since `child` was moved. Instead, we drop the receiver and join
-            // the threads, letting them finish naturally, then report timeout.
+            // Timeout: kill the child process via its PID, then join all
+            // threads so nothing leaks.
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(child_pid as i32, libc::SIGTERM);
+            }
             drop(rx);
             let _ = wait_thread.join();
-            let stdout = stdout_thread.join().unwrap_or_default();
-            let stderr = stderr_thread.join().unwrap_or_default();
-            let _ = stdout; // discard; timed out
-            let _ = stderr;
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
             return InstallStepResult {
                 step: step.to_string(),
                 command: command.to_string(),
