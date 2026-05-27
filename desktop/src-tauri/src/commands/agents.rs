@@ -403,18 +403,32 @@ pub async fn create_managed_agent(
                 .parallelism
                 .filter(|count| (1..=32).contains(count))
                 .unwrap_or(DEFAULT_AGENT_PARALLELISM),
-            system_prompt: input
-                .system_prompt
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string),
-            model: input
-                .model
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string),
+            // When persona_id is set, do NOT snapshot the persona's system_prompt
+            // or model onto the agent record. These fields are reserved for explicit
+            // per-agent overrides set via the Edit Agent dialog. At spawn time,
+            // resolve_effective_prompt_and_model() reads the live persona values as
+            // the default and only uses agent-record values when they're Some (i.e.
+            // the user explicitly set an override).
+            system_prompt: if requested_persona_id.is_some() {
+                None
+            } else {
+                input
+                    .system_prompt
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            },
+            model: if requested_persona_id.is_some() {
+                None
+            } else {
+                input
+                    .model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            },
             mcp_toolsets: input
                 .mcp_toolsets
                 .as_deref()

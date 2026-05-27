@@ -187,17 +187,32 @@ fn persona_fixture(id: &str, prompt: &str, model: Option<&str>) -> PersonaRecord
 }
 
 #[test]
-fn resolve_prompt_reads_fresh_persona_when_id_matches() {
-    let personas = vec![persona_fixture("custom:bot", "Fresh prompt", Some("gpt-5"))];
+fn resolve_prompt_agent_override_wins_over_persona() {
+    // Option A: when the agent record has explicit values (set via Edit dialog),
+    // they take priority over the persona's live values.
+    let personas = vec![persona_fixture("custom:bot", "Persona prompt", Some("gpt-5"))];
 
     let (prompt, model) = resolve_effective_prompt_and_model(
         Some("custom:bot"),
         &personas,
-        Some("Stale prompt"),
-        Some("gpt-4"),
+        Some("Agent override prompt"),
+        Some("gpt-4-override"),
     );
 
-    assert_eq!(prompt.as_deref(), Some("Fresh prompt"));
+    assert_eq!(prompt.as_deref(), Some("Agent override prompt"));
+    assert_eq!(model.as_deref(), Some("gpt-4-override"));
+}
+
+#[test]
+fn resolve_prompt_reads_persona_when_no_agent_override() {
+    // When agent record fields are None (the default for persona-backed agents
+    // after creation), the persona's live values are used.
+    let personas = vec![persona_fixture("custom:bot", "Fresh persona prompt", Some("gpt-5"))];
+
+    let (prompt, model) =
+        resolve_effective_prompt_and_model(Some("custom:bot"), &personas, None, None);
+
+    assert_eq!(prompt.as_deref(), Some("Fresh persona prompt"));
     assert_eq!(model.as_deref(), Some("gpt-5"));
 }
 
@@ -250,18 +265,32 @@ fn resolve_prompt_returns_none_when_no_persona_and_no_record_prompt() {
 }
 
 #[test]
-fn resolve_prompt_persona_model_none_passes_through() {
-    // Persona exists but has no model set — should return None for model,
-    // not fall back to the record's model.
+fn resolve_prompt_persona_model_none_falls_through_when_no_override() {
+    // Persona exists but has no model set. Agent record also has no model
+    // override (None). Result: model is None.
+    let personas = vec![persona_fixture("custom:bot", "Persona prompt", None)];
+
+    let (prompt, model) =
+        resolve_effective_prompt_and_model(Some("custom:bot"), &personas, None, None);
+
+    assert_eq!(prompt.as_deref(), Some("Persona prompt"));
+    assert_eq!(model, None);
+}
+
+#[test]
+fn resolve_prompt_agent_model_override_wins_even_when_persona_model_none() {
+    // Persona has no model, but agent record has an explicit override.
+    // Agent override wins.
     let personas = vec![persona_fixture("custom:bot", "Persona prompt", None)];
 
     let (prompt, model) = resolve_effective_prompt_and_model(
         Some("custom:bot"),
         &personas,
-        Some("Record prompt"),
-        Some("record-model"),
+        None,
+        Some("agent-model-override"),
     );
 
+    // Prompt comes from persona (no agent override), model from agent override.
     assert_eq!(prompt.as_deref(), Some("Persona prompt"));
-    assert_eq!(model, None);
+    assert_eq!(model.as_deref(), Some("agent-model-override"));
 }

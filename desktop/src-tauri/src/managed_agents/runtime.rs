@@ -502,11 +502,15 @@ pub(crate) fn build_respond_to_env(
 
 /// Resolve the effective system prompt and model for a managed agent.
 ///
-/// When `persona_id` is set, looks up the persona in the provided list and
-/// returns its current `system_prompt` and `model`. Falls back to the
-/// agent record's stale snapshot (`record_prompt`, `record_model`) when:
-/// - `persona_id` is `None`
-/// - the persona can't be found in the store (e.g. deleted)
+/// Precedence (Option A — agent override wins when explicitly set):
+/// 1. If the agent record has an explicit `system_prompt` / `model` → use it.
+///    These are only populated when a user explicitly sets an override via the
+///    Edit Agent dialog (persona-backed agents have these fields cleared at
+///    creation time to avoid stale snapshots).
+/// 2. Else if `persona_id` resolves to a persona → use the persona's live values.
+/// 3. Else → None (no prompt / no model).
+///
+/// This matches how env_vars work: per-agent overrides persona on collision.
 ///
 /// Extracted from `spawn_agent_child` for testability.
 pub(crate) fn resolve_effective_prompt_and_model(
@@ -515,20 +519,32 @@ pub(crate) fn resolve_effective_prompt_and_model(
     record_prompt: Option<&str>,
     record_model: Option<&str>,
 ) -> (Option<String>, Option<String>) {
-    let from_persona: Option<(String, Option<String>)> = persona_id.and_then(|pid| {
-        personas
-            .iter()
-            .find(|p| p.id == pid)
-            .map(|p| (p.system_prompt.clone(), p.model.clone()))
-    });
+    // Agent-record values win when explicitly set (user override via Edit dialog).
+    let effective_prompt = if record_prompt.is_some() {
+        record_prompt.map(|s| s.to_owned())
+    } else {
+        // Fall back to persona's live value.
+        persona_id.and_then(|pid| {
+            personas
+                .iter()
+                .find(|p| p.id == pid)
+                .map(|p| p.system_prompt.clone())
+        })
+    };
 
-    match from_persona {
-        Some((prompt, model)) => (Some(prompt), model),
-        None => (
-            record_prompt.map(|s| s.to_owned()),
-            record_model.map(|s| s.to_owned()),
-        ),
-    }
+    let effective_model = if record_model.is_some() {
+        record_model.map(|s| s.to_owned())
+    } else {
+        // Fall back to persona's live value.
+        persona_id.and_then(|pid| {
+            personas
+                .iter()
+                .find(|p| p.id == pid)
+                .and_then(|p| p.model.clone())
+        })
+    };
+
+    (effective_prompt, effective_model)
 }
 
 /// Spawn an agent process without holding any locks on records or runtimes.
