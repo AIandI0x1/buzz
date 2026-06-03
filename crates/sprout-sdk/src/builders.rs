@@ -2162,7 +2162,7 @@ mod tests {
         // get_channels `#p:[me]` membership query ("join to participate" bug).
         let keys = nostr::Keys::generate();
         let me = keys.public_key().to_hex();
-        let ev = build_channel_members_serverless("chan-self", &[me.clone()])
+        let ev = build_channel_members_serverless("chan-self", std::slice::from_ref(&me))
             .unwrap()
             .sign_with_keys(&keys)
             .unwrap();
@@ -2182,7 +2182,7 @@ mod tests {
             "private",
             "dm",
             None,
-            &[me.clone()],
+            std::slice::from_ref(&me),
         )
         .unwrap()
         .sign_with_keys(&keys)
