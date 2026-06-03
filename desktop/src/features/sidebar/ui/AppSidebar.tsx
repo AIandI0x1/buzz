@@ -138,6 +138,7 @@ type AppSidebarProps = {
   onSelectSettings: (section?: "profile" | "appearance") => void;
   onSetPresenceStatus?: (status: "online" | "away" | "offline") => void;
   onSetUserStatus: (text: string, emoji: string) => void;
+  onClearUserStatus: () => void;
   onSwitchWorkspace: (id: string) => void;
   selfUserStatus?: UserStatus;
   isPresencePending?: boolean;
@@ -192,6 +193,7 @@ export function AppSidebar({
   onSelectSettings,
   onSetPresenceStatus,
   onSetUserStatus,
+  onClearUserStatus,
   onSwitchWorkspace,
   selfUserStatus,
   isPresencePending,
@@ -665,6 +667,7 @@ export function AppSidebar({
                 onRemoveWorkspace={onRemoveWorkspace}
                 onSetPresenceStatus={onSetPresenceStatus}
                 onSetUserStatus={onSetUserStatus}
+                onClearUserStatus={onClearUserStatus}
                 onSwitchWorkspace={onSwitchWorkspace}
                 onUpdateWorkspace={onUpdateWorkspace}
                 profile={profile}

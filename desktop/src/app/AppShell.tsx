@@ -780,6 +780,9 @@ export function AppShell() {
                   onSetUserStatus={(text, emoji) =>
                     setUserStatusMutation.mutate({ text, emoji })
                   }
+                  onClearUserStatus={() =>
+                    setUserStatusMutation.mutate({ text: "", emoji: "" })
+                  }
                   profile={profileQuery.data}
                   selfUserStatus={
                     deferredPubkey

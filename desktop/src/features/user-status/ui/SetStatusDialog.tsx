@@ -1,9 +1,8 @@
 import * as React from "react";
-import Picker from "@emoji-mart/react";
-import data from "@emoji-mart/data";
 import * as PopoverPrimitive from "@radix-ui/react-popover";
-import { X } from "lucide-react";
 
+import { EmojiPicker } from "@/features/custom-emoji/ui/EmojiPicker";
+import { StatusEmoji } from "@/features/user-status/ui/StatusEmoji";
 import {
   Dialog,
   DialogContent,
@@ -33,6 +32,7 @@ type SetStatusDialogProps = {
   initialText?: string;
   initialEmoji?: string;
   onSave: (text: string, emoji: string) => void;
+  onClear: () => void;
   hasExistingStatus: boolean;
 };
 
@@ -46,6 +46,7 @@ export function SetStatusDialog({
   initialText = "",
   initialEmoji = "",
   onSave,
+  onClear,
   hasExistingStatus,
 }: SetStatusDialogProps) {
   const [text, setText] = React.useState(initialText);
@@ -64,8 +65,8 @@ export function SetStatusDialog({
     setEmoji(preset.emoji);
   }
 
-  function handleEmojiSelect(selectedEmoji: { native: string }) {
-    setEmoji(selectedEmoji.native);
+  function handleEmojiSelect(selectedEmoji: string) {
+    setEmoji(selectedEmoji);
     setPickerOpen(false);
   }
 
@@ -74,9 +75,9 @@ export function SetStatusDialog({
     onOpenChange(false);
   }
 
-  function handleClearDraft() {
-    setText("");
-    setEmoji("");
+  function handleClear() {
+    onClear();
+    onOpenChange(false);
   }
 
   function handleKeyDown(event: React.KeyboardEvent) {
@@ -100,54 +101,52 @@ export function SetStatusDialog({
         </DialogHeader>
 
         <div className="flex flex-col gap-4 pt-2">
-          <div className="relative">
+          <div className="flex items-center gap-2">
             <Popover onOpenChange={setPickerOpen} open={pickerOpen}>
-              <PopoverTrigger asChild>
-                <button
-                  aria-label="Choose status emoji"
-                  className="absolute left-1.5 top-1/2 z-10 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-md text-lg transition-colors hover:bg-accent"
-                  type="button"
-                >
-                  {emoji || "\uD83D\uDCAC"}
-                </button>
-              </PopoverTrigger>
+              <div className="relative shrink-0">
+                <PopoverTrigger asChild>
+                  <button
+                    aria-label="Choose status emoji"
+                    className="flex h-9 w-9 items-center justify-center rounded-md border border-input text-lg transition-colors hover:bg-accent"
+                    type="button"
+                  >
+                    {emoji ? (
+                      <StatusEmoji className="h-5 w-5" value={emoji} />
+                    ) : (
+                      "\uD83D\uDCAC"
+                    )}
+                  </button>
+                </PopoverTrigger>
+                {emoji ? (
+                  <button
+                    aria-label="Clear status emoji"
+                    className="absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full border border-background bg-muted text-[10px] leading-none text-muted-foreground hover:bg-accent hover:text-foreground"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setEmoji("");
+                    }}
+                    type="button"
+                  >
+                    ×
+                  </button>
+                ) : null}
+              </div>
               <PopoverPrimitive.Content
                 align="start"
-                className="z-50 w-auto overflow-hidden rounded-2xl bg-transparent shadow-none outline-hidden"
                 sideOffset={4}
+                className="z-50 w-auto overflow-hidden rounded-2xl shadow-md outline-hidden data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95"
               >
-                <Picker
-                  data={data}
-                  maxFrequentRows={2}
-                  onEmojiSelect={handleEmojiSelect}
-                  perLine={8}
-                  previewPosition="none"
-                  set="native"
-                  skinTonePosition="search"
-                  theme="auto"
-                />
+                <EmojiPicker autoFocus onSelect={handleEmojiSelect} />
               </PopoverPrimitive.Content>
             </Popover>
             <Input
               autoFocus
-              className="pl-10 pr-9"
               data-testid="set-status-input"
               onChange={(event) => setText(event.target.value)}
               onKeyDown={handleKeyDown}
               placeholder="What's your status?"
               value={text}
             />
-            {hasExistingStatus || text || emoji ? (
-              <button
-                aria-label="Clear status"
-                className="absolute right-1.5 top-1/2 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                data-testid="set-status-clear"
-                onClick={handleClearDraft}
-                type="button"
-              >
-                <X className="h-4 w-4" />
-              </button>
-            ) : null}
           </div>
 
           <div className="flex flex-wrap gap-1.5">
@@ -164,7 +163,20 @@ export function SetStatusDialog({
             ))}
           </div>
 
-          <div className="flex items-center justify-end gap-2 pt-1">
+          <div className="flex items-center justify-between gap-2 pt-1">
+            <div>
+              {hasExistingStatus ? (
+                <Button
+                  data-testid="set-status-clear"
+                  onClick={handleClear}
+                  size="sm"
+                  type="button"
+                  variant="ghost"
+                >
+                  Clear status
+                </Button>
+              ) : null}
+            </div>
             <div className="flex items-center gap-2">
               <Button
                 data-testid="set-status-cancel"
@@ -177,7 +189,7 @@ export function SetStatusDialog({
               </Button>
               <Button
                 data-testid="set-status-save"
-                disabled={!hasExistingStatus && !text.trim() && !emoji}
+                disabled={!text.trim() && !emoji}
                 onClick={handleSave}
                 size="sm"
                 type="button"

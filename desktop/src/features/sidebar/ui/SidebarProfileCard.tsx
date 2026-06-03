@@ -4,6 +4,7 @@ import { getPresenceLabel } from "@/features/presence/lib/presence";
 import { PresenceDot } from "@/features/presence/ui/PresenceBadge";
 import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
 import { ProfilePopover } from "@/features/profile/ui/ProfilePopover";
+import { StatusEmoji } from "@/features/user-status/ui/StatusEmoji";
 import type { Workspace } from "@/features/workspaces/types";
 import { WorkspaceSwitcher } from "@/features/workspaces/ui/WorkspaceSwitcher";
 import type { PresenceStatus, Profile, UserStatus } from "@/shared/api/types";
@@ -17,6 +18,7 @@ type SidebarProfileCardProps = {
   onRemoveWorkspace: (id: string) => void;
   onSetPresenceStatus?: (status: PresenceStatus) => void;
   onSetUserStatus: (text: string, emoji: string) => void;
+  onClearUserStatus: () => void;
   onSwitchWorkspace: (id: string) => void;
   onUpdateWorkspace: (
     id: string,
@@ -37,6 +39,7 @@ export function SidebarProfileCard({
   onRemoveWorkspace,
   onSetPresenceStatus,
   onSetUserStatus,
+  onClearUserStatus,
   onSwitchWorkspace,
   onUpdateWorkspace,
   profile,
@@ -116,6 +119,7 @@ export function SidebarProfileCard({
             open={profilePopoverOpen}
             onOpenChange={setProfilePopoverOpen}
             displayName={resolvedDisplayName}
+            nip05={profile?.nip05Handle}
             avatarUrl={profile?.avatarUrl ?? null}
             currentStatus={selfPresenceStatus}
             isStatusPending={isPresencePending}
@@ -123,6 +127,7 @@ export function SidebarProfileCard({
             userStatusEmoji={selfUserStatus?.emoji}
             onSetStatus={onSetPresenceStatus ?? (() => {})}
             onSetUserStatus={onSetUserStatus}
+            onClearUserStatus={onClearUserStatus}
             onOpenSettings={onOpenSettings}
             triggerContainerRef={profileCardRef}
             workspaceSwitcherSlot={
@@ -171,7 +176,10 @@ export function SidebarProfileCard({
                 type="button"
               >
                 {selfUserStatus?.emoji ? (
-                  <span className="mr-1">{selfUserStatus.emoji}</span>
+                  <StatusEmoji
+                    className="mr-1 h-3.5 w-3.5"
+                    value={selfUserStatus.emoji}
+                  />
                 ) : null}
                 <span className="truncate">{selfUserStatus?.text}</span>
               </button>

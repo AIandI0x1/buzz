@@ -6,6 +6,7 @@ import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
 import { PresenceDot } from "@/features/presence/ui/PresenceBadge";
 import { getPresenceLabel } from "@/features/presence/lib/presence";
 import { SetStatusDialog } from "@/features/user-status/ui/SetStatusDialog";
+import { StatusEmoji } from "@/features/user-status/ui/StatusEmoji";
 import type { PresenceStatus } from "@/shared/api/types";
 import { isMacPlatform } from "@/shared/lib/platform";
 
@@ -17,6 +18,7 @@ interface ProfilePopoverProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   displayName: string;
+  nip05?: string | null;
   avatarUrl: string | null;
   currentStatus: PresenceStatus;
   isStatusPending?: boolean;
@@ -24,6 +26,7 @@ interface ProfilePopoverProps {
   userStatusEmoji?: string;
   onSetStatus: (status: PresenceStatus) => void;
   onSetUserStatus: (text: string, emoji: string) => void;
+  onClearUserStatus: () => void;
   onOpenSettings: (section?: "profile" | "appearance") => void;
   children: React.ReactNode;
   // Optional outer container whose clicks should NOT close the popover.
@@ -53,6 +56,7 @@ export function ProfilePopover({
   open,
   onOpenChange,
   displayName,
+  nip05,
   avatarUrl,
   currentStatus,
   isStatusPending,
@@ -60,6 +64,7 @@ export function ProfilePopover({
   userStatusEmoji,
   onSetStatus,
   onSetUserStatus,
+  onClearUserStatus,
   onOpenSettings,
   children,
   triggerContainerRef,
@@ -150,13 +155,31 @@ export function ProfilePopover({
                 <p className="truncate text-sm font-semibold leading-tight text-popover-foreground">
                   {displayName}
                 </p>
-                <p
-                  className="mt-0.5 flex items-center gap-1.5 truncate text-xs leading-snug text-muted-foreground"
-                  data-testid="profile-popover-current-status"
-                >
-                  <PresenceDot className="h-2 w-2" status={currentStatus} />
-                  <span>{getPresenceLabel(currentStatus)}</span>
-                </p>
+                <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                  {nip05 ? <span className="truncate">@{nip05}</span> : null}
+                  {nip05 ? <span aria-hidden="true">·</span> : null}
+                  <span
+                    className="inline-flex items-center gap-1.5"
+                    data-testid="profile-popover-current-status"
+                  >
+                    <PresenceDot status={currentStatus} />
+                    <span>{getPresenceLabel(currentStatus)}</span>
+                  </span>
+                </div>
+                {hasUserStatus ? (
+                  <p
+                    className="mt-0.5 truncate text-xs text-muted-foreground"
+                    data-testid="profile-popover-user-status"
+                  >
+                    {userStatusEmoji ? (
+                      <StatusEmoji
+                        className="mr-1 h-3.5 w-3.5"
+                        value={userStatusEmoji}
+                      />
+                    ) : null}
+                    {userStatusText}
+                  </p>
+                ) : null}
               </div>
             </div>
 
@@ -299,6 +322,7 @@ export function ProfilePopover({
         hasExistingStatus={hasUserStatus}
         initialEmoji={userStatusEmoji}
         initialText={userStatusText}
+        onClear={onClearUserStatus}
         onOpenChange={setStatusDialogOpen}
         onSave={onSetUserStatus}
         open={statusDialogOpen}
