@@ -7,6 +7,7 @@ import { PresenceDot } from "@/features/presence/ui/PresenceBadge";
 import { getPresenceLabel } from "@/features/presence/lib/presence";
 import { SetStatusDialog } from "@/features/user-status/ui/SetStatusDialog";
 import type { PresenceStatus } from "@/shared/api/types";
+import { isMacPlatform } from "@/shared/lib/platform";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -68,6 +69,8 @@ export function ProfilePopover({
   const [presenceMenuOpen, setPresenceMenuOpen] = React.useState(false);
   const presenceHoverTimer = React.useRef<number | null>(null);
   const hasUserStatus = Boolean(userStatusText || userStatusEmoji);
+  const profileShortcutLabel = isMacPlatform() ? "⌘U" : "Ctrl+U";
+  const preferencesShortcutLabel = isMacPlatform() ? "⌘," : "Ctrl+,";
 
   function clearPresenceHoverTimer() {
     if (presenceHoverTimer.current !== null) {
@@ -255,7 +258,9 @@ export function ProfilePopover({
               type="button"
             >
               <span className="flex-1">Profile</span>
-              <kbd className="text-xs text-muted-foreground">⌘U</kbd>
+              <kbd className="text-xs text-muted-foreground">
+                {profileShortcutLabel}
+              </kbd>
             </button>
             <button
               className={MENU_ITEM_CLASS}
@@ -270,7 +275,9 @@ export function ProfilePopover({
               type="button"
             >
               <span className="flex-1">Preferences</span>
-              <kbd className="text-xs text-muted-foreground">⌘,</kbd>
+              <kbd className="text-xs text-muted-foreground">
+                {preferencesShortcutLabel}
+              </kbd>
             </button>
 
             {workspaceSwitcherSlot ? (
