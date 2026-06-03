@@ -46,15 +46,21 @@ async fn encrypted_recipients(
         return Ok(None);
     }
 
-    // Members come from the kind:39002 list; always include ourselves so we can
-    // read back our own sent messages.
+    // Members come from the kind:39002 list. 39002 is ADDRESSABLE: different
+    // relays may hold different versions (and a multi-relay merge returns them
+    // all), so pick the NEWEST by created_at — never an arbitrary `.first()`,
+    // which could be a stale/empty copy and silently drop real members.
+    // (No `limit:1`: we want every relay's copy so the merge can pick the
+    // latest; capping at 1 per relay is fine but selection must be by recency.)
     let member_events = query_relay(
         state,
-        &[serde_json::json!({"kinds":[39002],"#d":[channel_id],"limit":1})],
+        &[serde_json::json!({"kinds":[39002],"#d":[channel_id]})],
     )
     .await?;
-    let mut members: Vec<String> = member_events
-        .first()
+    let newest = member_events
+        .iter()
+        .max_by_key(|ev| ev.created_at.as_secs());
+    let mut members: Vec<String> = newest
         .map(|ev| {
             ev.tags
                 .iter()
@@ -74,6 +80,21 @@ async fn encrypted_recipients(
         let keys = state.keys.lock().map_err(|e| e.to_string())?;
         keys.public_key().to_hex()
     };
+
+    // Fail LOUDLY rather than silently encrypting to only ourselves. An
+    // encrypted channel with no other members means the 39002 lookup came back
+    // empty (relay hiccup / propagation lag) — encrypting to just `me` would
+    // make the message undeliverable to everyone else (e.g. the agent) with no
+    // visible error. Surface it so the caller can retry instead of dropping it.
+    let others: Vec<&String> = members.iter().filter(|p| *p != &me).collect();
+    if others.is_empty() {
+        return Err(format!(
+            "could not resolve members for encrypted channel {channel_id} \
+             (kind:39002 lookup returned no other participants — relay may be \
+             lagging; try again)"
+        ));
+    }
+
     if !members.contains(&me) {
         members.push(me);
     }
