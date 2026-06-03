@@ -16,7 +16,10 @@
 
 set -euo pipefail
 
-reply_sent=0
+# Reply to EVERY prompt with a distinct marker (`<marker>-1`, `-2`, …) so the
+# test can prove the harness dispatches a fresh turn per message — including the
+# cancel/redispatch path when a second message arrives (OwnerInterrupt).
+prompt_count=0
 
 send_response() {
   # $1 = id, $2 = result json
@@ -36,15 +39,19 @@ while IFS= read -r line; do
       send_response "$id" '{"sessionId":"stub-session-1"}'
       ;;
     session/prompt)
-      if [ "$reply_sent" -eq 0 ]; then
-        reply_sent=1
-        # Post the reply to the channel using the sprout CLI — the real reply
-        # mechanism per base_prompt.md. Auth env is inherited from the harness.
-        "${STUB_AGENT_SPROUT_BIN}" messages send \
-          --channel "${STUB_AGENT_CHANNEL}" \
-          --content "${STUB_AGENT_REPLY}" >/dev/null 2>>"${STUB_AGENT_LOG:-/dev/stderr}" || \
-          echo "stub: sprout messages send failed" >>"${STUB_AGENT_LOG:-/dev/stderr}"
+      prompt_count=$((prompt_count + 1))
+      # Optional delay BEFORE replying so the turn stays in-flight long enough
+      # for the harness typing-indicator loop (3s tick) to fire — proves the
+      # "agent is typing…" cue works in serverless.
+      if [ -n "${STUB_AGENT_PROMPT_DELAY:-}" ]; then
+        sleep "${STUB_AGENT_PROMPT_DELAY}"
       fi
+      # Post a distinct reply per prompt using the sprout CLI — the real reply
+      # mechanism per base_prompt.md. Auth env is inherited from the harness.
+      "${STUB_AGENT_SPROUT_BIN}" messages send \
+        --channel "${STUB_AGENT_CHANNEL}" \
+        --content "${STUB_AGENT_REPLY}-${prompt_count}" >/dev/null 2>>"${STUB_AGENT_LOG:-/dev/stderr}" || \
+        echo "stub: sprout messages send failed" >>"${STUB_AGENT_LOG:-/dev/stderr}"
       send_response "$id" '{"stopReason":"end_turn"}'
       ;;
     "")

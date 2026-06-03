@@ -1273,7 +1273,9 @@ impl HarnessRelay {
             // block; dropping on error is acceptable for typing indicators.
             let pool = backend.pool();
             tokio::spawn(async move {
-                let _ = pool.send_event(&event).await;
+                if let Err(e) = pool.send_event(&event).await {
+                    tracing::debug!("serverless ephemeral publish failed: {e}");
+                }
             });
             return Ok(());
         }
