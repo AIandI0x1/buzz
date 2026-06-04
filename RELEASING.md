@@ -24,11 +24,9 @@ This creates a `version-bump/<version>` PR that bumps all version manifests, reg
 
 1. **`just release`** runs locally on `main` — computes the next version, creates a `version-bump/<version>` branch, bumps versions in all manifests, regenerates lockfiles, generates a changelog entry, commits, pushes, and opens a PR.
 
-2. **The release PR stays in sync** — if other PRs merge to `main` while the release PR is open, the `sync-release-changelog` workflow automatically updates the changelog on the release PR branch so the final release notes reflect everything that will be in the binary. No manual action needed.
+2. **Merge the PR** — the `auto-tag-on-release-pr-merge` workflow detects the `version-bump/*` branch merge, pushes a `v<version>` tag, and triggers both the OSS release build and the internal Buildkite pipeline automatically.
 
-3. **Merge the PR** — the `auto-tag-on-release-pr-merge` workflow detects the `version-bump/*` branch merge, pushes a `v<version>` tag, and triggers both the OSS release build and the internal Buildkite pipeline automatically.
-
-4. **Builds run in parallel** — `release.yml` builds, signs, notarizes, and publishes the OSS desktop app. The `sprout-releases` Buildkite pipeline produces Block-signed macOS and iOS builds with the `-block` version suffix.
+3. **Builds run in parallel** — `release.yml` builds, signs, notarizes, and publishes the OSS desktop app. The `sprout-releases` Buildkite pipeline produces Block-signed macOS and iOS builds with the `-block` version suffix.
 
 ---
 
@@ -111,8 +109,6 @@ Each release produces two GitHub releases:
   | `SPROUT_UPDATER_PUBLIC_KEY` | Tauri updater public key (minisign) |
   | `TAURI_SIGNING_PRIVATE_KEY` | Tauri updater private key |
   | `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Password for the private key |
-  | `SPROUT_RELEASE_BOT_CLIENT_ID` (variable) | GitHub App client ID for release automation |
-  | `SPROUT_RELEASE_BOT_PRIVATE_KEY` (secret) | GitHub App private key for release automation |
   | `BUILDKITE_API_TOKEN` | Runway Buildkite API token (`write_builds` scope) |
 
 ---
@@ -130,9 +126,6 @@ The version string must be valid semver: `MAJOR.MINOR.PATCH` with an optional pr
 
 ### Auto-updater reports "no update available"
 Verify that the `sprout-desktop-latest` release exists and contains a valid `latest.json`.
-
-### `sync-release-changelog` workflow fails with "Multiple open release PRs"
-More than one `version-bump/*` PR is open. Close or merge the stale one before the sync can resume.
 
 ### Internal Buildkite build didn't trigger after release PR merge
 Check the `auto-tag-on-release-pr-merge` workflow run for errors in the "Trigger internal release build" step. Common causes: expired `BUILDKITE_API_TOKEN`, pipeline slug changed, or the token lacks `BUILD_AND_READ` access on the pipeline. Fall back to a [manual Buildkite trigger](#manual-buildkite-trigger-fallback).
