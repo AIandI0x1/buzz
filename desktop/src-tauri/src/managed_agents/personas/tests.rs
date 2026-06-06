@@ -699,7 +699,7 @@ fn sync_packs_from_dir_adds_persona_from_symlinked_pack() {
     std::os::unix::fs::symlink(source_dir.path(), &link).unwrap();
 
     let mut records: Vec<PersonaRecord> = vec![];
-    let changed = sync_packs_from_dir(&mut records, packs_dir.path(), &[], NOW);
+    let changed = sync_packs_from_dir(&mut records, packs_dir.path(), || vec![], NOW);
 
     assert!(changed);
     assert_eq!(records.len(), 1);
@@ -729,7 +729,7 @@ fn sync_packs_from_dir_ignores_non_symlinked_packs() {
     }
 
     let mut records: Vec<PersonaRecord> = vec![];
-    let changed = sync_packs_from_dir(&mut records, packs_dir.path(), &[], NOW);
+    let changed = sync_packs_from_dir(&mut records, packs_dir.path(), || vec![], NOW);
 
     // Non-symlinked pack must not be synced.
     assert!(!changed);
@@ -746,14 +746,14 @@ fn sync_packs_from_dir_handles_broken_symlink_gracefully() {
 
     let mut records: Vec<PersonaRecord> = vec![];
     // Must not panic.
-    let changed = sync_packs_from_dir(&mut records, packs_dir.path(), &[], NOW);
+    let changed = sync_packs_from_dir(&mut records, packs_dir.path(), || vec![], NOW);
 
     assert!(!changed);
     assert!(records.is_empty());
 }
 
 #[test]
-fn sync_packs_from_dir_mtime_short_circuit_skips_unchanged_pack() {
+fn sync_packs_from_dir_no_change_returns_false() {
     let source_dir = TempDir::new().unwrap();
     let packs_dir = TempDir::new().unwrap();
 
@@ -761,14 +761,70 @@ fn sync_packs_from_dir_mtime_short_circuit_skips_unchanged_pack() {
     let link = packs_dir.path().join("my-pack");
     std::os::unix::fs::symlink(source_dir.path(), &link).unwrap();
 
-    // First call — populates mtime cache and adds berry.
+    // First call — adds berry.
     let mut records: Vec<PersonaRecord> = vec![];
-    let changed = sync_packs_from_dir(&mut records, packs_dir.path(), &[], NOW);
+    let changed = sync_packs_from_dir(&mut records, packs_dir.path(), || vec![], NOW);
     assert!(changed);
     assert_eq!(records.len(), 1);
 
-    // Second call without any filesystem changes — mtime unchanged, should be a no-op.
-    let changed2 = sync_packs_from_dir(&mut records, packs_dir.path(), &[], NOW);
+    // Second call with no filesystem changes — should be a no-op.
+    let changed2 = sync_packs_from_dir(&mut records, packs_dir.path(), || vec![], NOW);
     assert!(!changed2);
     assert_eq!(records.len(), 1);
+}
+
+#[test]
+fn sync_packs_from_dir_detects_persona_file_content_edit() {
+    let source_dir = TempDir::new().unwrap();
+    let packs_dir = TempDir::new().unwrap();
+
+    make_pack_dir(&source_dir, "my-pack", &[("berry", "Berry", "Original prompt.")]);
+    let link = packs_dir.path().join("my-pack");
+    std::os::unix::fs::symlink(source_dir.path(), &link).unwrap();
+
+    // First call — adds berry with original prompt.
+    let mut records: Vec<PersonaRecord> = vec![];
+    sync_packs_from_dir(&mut records, packs_dir.path(), || vec![], NOW);
+    assert!(records[0].system_prompt.contains("Original prompt."));
+
+    // Edit the persona file content (simulates developer editing .persona.md).
+    fs::write(
+        source_dir.path().join("personas/berry.persona.md"),
+        "---\nname: berry\ndisplay_name: Berry\ndescription: Test.\n---\nUpdated prompt.\n",
+    )
+    .unwrap();
+
+    // Second call — must detect the content change and update the record.
+    let changed2 = sync_packs_from_dir(&mut records, packs_dir.path(), || vec![], NOW);
+    assert!(changed2, "content edit must be detected on next sync");
+    assert!(records[0].system_prompt.contains("Updated prompt."));
+}
+
+#[test]
+fn sync_packs_from_dir_agents_not_loaded_when_no_removals() {
+    let source_dir = TempDir::new().unwrap();
+    let packs_dir = TempDir::new().unwrap();
+
+    make_pack_dir(&source_dir, "my-pack", &[("berry", "Berry", "You are Berry.")]);
+    let link = packs_dir.path().join("my-pack");
+    std::os::unix::fs::symlink(source_dir.path(), &link).unwrap();
+
+    let mut records: Vec<PersonaRecord> = vec![];
+    let mut agents_loaded = false;
+
+    sync_packs_from_dir(
+        &mut records,
+        packs_dir.path(),
+        || {
+            agents_loaded = true;
+            vec![]
+        },
+        NOW,
+    );
+
+    // No removals — agents loader must NOT have been called.
+    assert!(
+        !agents_loaded,
+        "managed_agents.json must not be read when there are no removals"
+    );
 }
