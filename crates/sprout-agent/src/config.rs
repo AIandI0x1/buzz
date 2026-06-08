@@ -108,15 +108,21 @@ impl Config {
         let (api_key, model, base_url, openai_api) = match provider {
             Provider::Anthropic => (
                 req("ANTHROPIC_API_KEY")?,
-                resolve_model(env("ANTHROPIC_MODEL").as_deref(), sprout_agent_model.as_deref())
-                    .ok_or_else(|| "config: ANTHROPIC_MODEL required".to_string())?,
+                resolve_model(
+                    env("ANTHROPIC_MODEL").as_deref(),
+                    sprout_agent_model.as_deref(),
+                )
+                .ok_or_else(|| "config: ANTHROPIC_MODEL required".to_string())?,
                 env_or("ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
                 OpenAiApi::Auto, // unused for Anthropic
             ),
             Provider::OpenAi => (
                 req("OPENAI_COMPAT_API_KEY")?,
-                resolve_model(env("OPENAI_COMPAT_MODEL").as_deref(), sprout_agent_model.as_deref())
-                    .ok_or_else(|| "config: OPENAI_COMPAT_MODEL required".to_string())?,
+                resolve_model(
+                    env("OPENAI_COMPAT_MODEL").as_deref(),
+                    sprout_agent_model.as_deref(),
+                )
+                .ok_or_else(|| "config: OPENAI_COMPAT_MODEL required".to_string())?,
                 env_or("OPENAI_COMPAT_BASE_URL", "https://api.openai.com/v1"),
                 parse_openai_api(env("OPENAI_COMPAT_API").as_deref())?,
             ),
@@ -247,7 +253,6 @@ fn req(k: &str) -> Result<String, String> {
 fn resolve_model(provider_model: Option<&str>, universal_fallback: Option<&str>) -> Option<String> {
     provider_model.or(universal_fallback).map(str::to_owned)
 }
-
 
 fn present_nonempty(v: Option<&str>) -> bool {
     v.map(str::trim).is_some_and(|s| !s.is_empty())
