@@ -812,8 +812,6 @@ mod tests {
         assert!(err.contains("exceeds 100MB"));
     }
 
-    // --- JSON persona tests ---
-
     #[test]
     fn parse_json_round_trip() {
         let bytes = encode_persona_json(
