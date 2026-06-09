@@ -316,7 +316,7 @@
   text-decoration: line-through;
 }
 .rich-text-composer .tiptap a {
-  @apply font-medium text-primary underline underline-offset-4 cursor-pointer;
+  @apply font-medium text-primary underline underline-offset-4 transition-colors hover:text-primary/80 cursor-pointer;
 }
 
 /* Inline code. */
@@ -329,7 +329,9 @@
   @apply max-h-[400px] overflow-x-auto overflow-y-auto rounded-xl border border-border/70 bg-muted/60 px-3 py-1.5 shadow-xs;
 }
 .rich-text-composer .tiptap pre code {
-  @apply bg-transparent p-0 rounded-none text-[13px] leading-6;
+  /* Mirrors CODE_BLOCK_CLASS in markdown.tsx so a pasted/markdown-rendered
+   * code block looks identical in the composer and in the timeline. */
+  @apply block min-w-full whitespace-pre rounded-none bg-transparent p-0 font-mono text-[13px] leading-6 text-foreground;
 }
 
 /* Blockquote. */
