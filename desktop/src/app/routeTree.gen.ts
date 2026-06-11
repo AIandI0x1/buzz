@@ -166,18 +166,18 @@ declare module "@tanstack/react-router" {
       preLoaderRoute: typeof workflowsRouteImport;
       parentRoute: typeof rootRouteImport;
     };
-    "/pulse": {
-      id: "/pulse";
-      path: "/pulse";
-      fullPath: "/pulse";
-      preLoaderRoute: typeof pulseRouteImport;
-      parentRoute: typeof rootRouteImport;
-    };
     "/reminders": {
       id: "/reminders";
       path: "/reminders";
       fullPath: "/reminders";
       preLoaderRoute: typeof remindersRouteImport;
+      parentRoute: typeof rootRouteImport;
+    };
+    "/pulse": {
+      id: "/pulse";
+      path: "/pulse";
+      fullPath: "/pulse";
+      preLoaderRoute: typeof pulseRouteImport;
       parentRoute: typeof rootRouteImport;
     };
     "/projects": {
