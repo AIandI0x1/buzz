@@ -15,6 +15,7 @@ import {
   formatToolTitle,
   getBuzzToolInfo,
   getToolStatusDisplay,
+  normalizeToolNameText,
 } from "./agentSessionToolCatalog";
 import {
   asRecord,
@@ -45,6 +46,8 @@ export function ToolItem({
   const ToolIcon = buzzTool?.icon ?? Wrench;
   const showStatus = status.state !== "output-available";
   const toolTitle = formatToolTitle(canonicalToolName, item.title);
+  const isCommandTool = isShellCommandTool(item);
+  const duration = getToolDuration(item);
   const handleToggle = React.useCallback(
     (event: React.SyntheticEvent<HTMLDetailsElement>) => {
       setIsExpanded(event.currentTarget.open);
@@ -58,7 +61,7 @@ export function ToolItem({
         "not-prose w-full",
         compact ? "px-0" : "px-1",
         isActive &&
-          "rounded-lg border border-primary/15 bg-primary/[0.03] px-2 py-1",
+          "rounded-lg border border-primary/15 bg-primary/3 px-2 py-1",
       )}
       data-testid="transcript-tool-item"
     >
@@ -67,43 +70,56 @@ export function ToolItem({
         onToggle={handleToggle}
         open={isExpanded}
       >
-        <summary className="inline-flex max-w-full cursor-pointer list-none items-center gap-1.5 py-px">
-          {ToolIcon ? (
-            <ToolIcon
-              className={cn(
-                "h-4 w-4 shrink-0",
-                buzzTool || isActive ? "text-primary" : "text-muted-foreground",
-              )}
-            />
-          ) : null}
-          <span className="min-w-0 truncate text-sm font-medium">
-            {toolTitle}
-          </span>
-          {isActive ? (
-            <Badge
-              className="h-4 gap-0.5 px-1 text-xs font-normal"
-              variant="default"
-            >
-              <CircleDot className="h-2 w-2" />
-              Live
-            </Badge>
-          ) : null}
-          {buzzTool ? (
-            <BuzzToolInlineAction args={item.args} result={item.result} />
-          ) : null}
-          {showStatus ? (
-            <span className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground">
-              <status.Icon
-                className={cn(
-                  "h-4 w-4",
-                  item.status === "executing" && "animate-pulse",
-                )}
-              />
-              {status.label}
-            </span>
-          ) : null}
-          <ToolTimestamp item={item} />
-          <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
+        <summary
+          className={cn(
+            "inline-flex max-w-full cursor-pointer list-none items-center gap-1.5 py-px",
+            isCommandTool && "text-muted-foreground",
+          )}
+        >
+          {isCommandTool ? (
+            <CommandToolSummary item={item} duration={duration} />
+          ) : (
+            <>
+              {ToolIcon ? (
+                <ToolIcon
+                  className={cn(
+                    "h-4 w-4 shrink-0",
+                    buzzTool || isActive
+                      ? "text-primary"
+                      : "text-muted-foreground",
+                  )}
+                />
+              ) : null}
+              <span className="min-w-0 truncate text-sm font-medium">
+                {toolTitle}
+              </span>
+              {isActive ? (
+                <Badge
+                  className="h-4 gap-0.5 px-1 text-xs font-normal"
+                  variant="default"
+                >
+                  <CircleDot className="h-2 w-2" />
+                  Live
+                </Badge>
+              ) : null}
+              {buzzTool ? (
+                <BuzzToolInlineAction args={item.args} result={item.result} />
+              ) : null}
+              {showStatus ? (
+                <span className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground">
+                  <status.Icon
+                    className={cn(
+                      "h-4 w-4",
+                      item.status === "executing" && "animate-pulse",
+                    )}
+                  />
+                  {status.label}
+                </span>
+              ) : null}
+              <ToolTimestamp item={item} duration={duration} />
+              <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
+            </>
+          )}
         </summary>
 
         <ToolDetailBlocks
@@ -117,6 +133,92 @@ export function ToolItem({
       </details>
     </div>
   );
+}
+
+function CommandToolSummary({
+  duration,
+  item,
+}: {
+  duration: string | null;
+  item: Extract<TranscriptItem, { type: "tool" }>;
+}) {
+  const command = getToolString(item.args, ["command"]);
+  const label =
+    item.status === "failed" || item.isError
+      ? "Command failed"
+      : item.status === "executing" || item.status === "pending"
+        ? "Running command"
+        : "Ran command";
+
+  return (
+    <>
+      <span className="shrink-0 text-sm font-semibold">{label}</span>
+      {command ? (
+        <span
+          className="min-w-0 max-w-48 truncate text-sm text-muted-foreground/70"
+          title={command}
+        >
+          {command}
+        </span>
+      ) : null}
+      {duration ? (
+        <span className="shrink-0 text-xs text-muted-foreground/70">
+          {duration}
+        </span>
+      ) : null}
+      <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
+    </>
+  );
+}
+
+function isShellCommandTool(item: Extract<TranscriptItem, { type: "tool" }>) {
+  return [item.buzzToolName, item.toolName, item.title].some((value) => {
+    if (!value) return false;
+    const normalized = normalizeToolNameText(value);
+    return normalized === "shell" || normalized.endsWith("_shell");
+  });
+}
+
+function getToolDuration(item: Extract<TranscriptItem, { type: "tool" }>) {
+  if (item.startedAt && item.completedAt) {
+    return formatDuration(item.startedAt, item.completedAt);
+  }
+
+  const resultRecord = asRecord(parseToolResultValue(item.result));
+  const durationMs =
+    getToolNumber(resultRecord, ["duration_ms", "durationMs"]) ??
+    getToolNumber(resultRecord, ["elapsed_ms", "elapsedMs"]);
+  return durationMs == null ? null : formatDurationMs(durationMs);
+}
+
+function getToolNumber(
+  record: Record<string, unknown>,
+  keys: string[],
+): number | null {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function formatDurationMs(ms: number) {
+  if (ms < 0) return null;
+  const totalSeconds = ms / 1000;
+  if (totalSeconds < 60) {
+    return totalSeconds < 10
+      ? `${totalSeconds.toFixed(1)}s`
+      : `${Math.round(totalSeconds)}s`;
+  }
+  let minutes = Math.floor(totalSeconds / 60);
+  let seconds = Math.round(totalSeconds % 60);
+  if (seconds === 60) {
+    minutes += 1;
+    seconds = 0;
+  }
+  return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
 }
 
 function ToolDetailBlocks({
@@ -180,7 +282,7 @@ function ToolCodeBlock({
       </h4>
       <pre
         className={cn(
-          "max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md px-3 py-2 font-mono text-xs leading-5",
+          "max-h-64 overflow-auto whitespace-pre-wrap wrap-break-word rounded-md px-3 py-2 font-mono text-xs leading-5",
           tone === "error"
             ? "bg-destructive/10 text-destructive"
             : "bg-muted/50 text-foreground",
@@ -203,16 +305,14 @@ const toolFullDateTimeFormat = new Intl.DateTimeFormat(undefined, {
 });
 
 function ToolTimestamp({
+  duration,
   item,
 }: {
+  duration: string | null;
   item: Extract<TranscriptItem, { type: "tool" }>;
 }) {
   const time = formatTranscriptTime(item.timestamp);
   if (!time) return null;
-  const duration =
-    item.startedAt && item.completedAt
-      ? formatDuration(item.startedAt, item.completedAt)
-      : null;
   const date = new Date(item.timestamp);
   const fullDateTime = Number.isNaN(date.getTime())
     ? item.timestamp
@@ -282,7 +382,7 @@ function BuzzToolInlineAction({
   if (action.onClick) {
     return (
       <button
-        className="inline-flex max-w-[14rem] shrink min-w-0 items-center gap-1 rounded-full border border-primary/20 bg-primary/[0.05] px-1.5 py-0.5 text-xs font-normal leading-none text-primary/90 transition-colors hover:border-primary/35 hover:bg-primary/10 hover:text-primary"
+        className="inline-flex max-w-56 shrink min-w-0 items-center gap-1 rounded-full border border-primary/20 bg-primary/5 px-1.5 py-0.5 text-xs font-normal leading-none text-primary/90 transition-colors hover:border-primary/35 hover:bg-primary/10 hover:text-primary"
         onClick={(event) => {
           event.preventDefault();
           event.stopPropagation();
@@ -301,7 +401,7 @@ function BuzzToolInlineAction({
 
   return (
     <span
-      className="inline-flex max-w-[14rem] shrink min-w-0 items-center gap-1 rounded-full border border-border/60 bg-muted/40 px-1.5 py-0.5 text-xs font-normal leading-none text-muted-foreground"
+      className="inline-flex max-w-56 shrink min-w-0 items-center gap-1 rounded-full border border-border/60 bg-muted/40 px-1.5 py-0.5 text-xs font-normal leading-none text-muted-foreground"
       title={action.title}
     >
       {action.avatar}
