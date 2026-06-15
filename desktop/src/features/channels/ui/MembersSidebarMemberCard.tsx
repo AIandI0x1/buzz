@@ -10,6 +10,7 @@ import {
   Trash2,
 } from "lucide-react";
 
+import { useCanViewAgentActivity } from "@/features/agents/hooks/useCanViewAgentActivity";
 import {
   getManagedAgentPrimaryActionLabel,
   isManagedAgentActive,
@@ -110,13 +111,13 @@ export function MembersSidebarMemberCard({
 }: MembersSidebarMemberCardProps) {
   const roleLabel = formatRoleLabel(member, memberIsBot);
   const disabled = isActionPending || isArchived;
-  const canViewActivity =
-    memberIsBot &&
-    managedAgent?.backend.type === "local" &&
-    Boolean(onViewActivity);
+  const { canView: canViewActivity } = useCanViewAgentActivity(member.pubkey, {
+    enabled: Boolean(onViewActivity),
+  });
+  const canShowActivity = canViewActivity && Boolean(onViewActivity);
   const hasActions = memberIsBot
-    ? Boolean(managedAgent) || canRemoveMember || canViewActivity
-    : canRemoveMember || canChangeRole;
+    ? Boolean(managedAgent) || canRemoveMember || canShowActivity
+    : canRemoveMember || canChangeRole || canShowActivity;
 
   const memberIdentity = (
     <div className="pointer-events-none relative z-10 flex min-w-0 flex-1 items-center gap-3">
@@ -207,7 +208,7 @@ export function MembersSidebarMemberCard({
         <MemberActionsMenu
           canChangeRole={canChangeRole}
           canRemoveMember={canRemoveMember}
-          canViewActivity={canViewActivity}
+          canViewActivity={canShowActivity}
           disabled={disabled}
           managedAgent={managedAgent}
           member={member}
