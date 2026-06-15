@@ -294,24 +294,24 @@ function PromptUserMessage({
 
   return (
     <div
-      className="flex flex-row"
+      className="flex flex-row items-start justify-end"
       data-role="user-message"
       data-testid="transcript-user-message"
     >
       <UserAvatar
         avatarUrl={authorProfile?.avatarUrl ?? null}
-        className="mr-2 mt-1 shrink-0"
+        className="order-last ml-2 mt-1 shrink-0"
         displayName={authorLabel}
         size="xs"
       />
-      <div className="group relative min-w-0 max-w-[85%] flex flex-col items-start gap-1">
+      <div className="group relative flex max-w-[85%] min-w-0 flex-col items-end gap-1">
         <div
           className={cn(
             "w-full min-w-0 rounded-2xl bg-muted p-3 text-sm leading-relaxed text-foreground",
             compact && "p-2.5",
           )}
         >
-          <p className="whitespace-pre-wrap break-words">{text}</p>
+          <p className="whitespace-pre-wrap wrap-break-word">{text}</p>
           {contextOpen && context ? (
             <PromptContextSections sections={context.sections} />
           ) : null}
@@ -343,7 +343,7 @@ function PromptContextSections({ sections }: { sections: PromptSection[] }) {
             <span className="truncate">{section.title}</span>
             <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform group-open/section:rotate-180" />
           </summary>
-          <pre className="mt-1.5 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-md bg-background/40 px-2 py-1.5 font-mono text-xs leading-5 text-muted-foreground">
+          <pre className="mt-1.5 max-h-56 overflow-auto whitespace-pre-wrap wrap-break-word rounded-md bg-background/40 px-2 py-1.5 font-mono text-xs leading-5 text-muted-foreground">
             {section.body.trim() || "No metadata."}
           </pre>
         </details>
@@ -558,11 +558,12 @@ function MessageItem({
   return (
     <div
       className={cn(
-        "flex flex-row animate-in fade-in duration-200 motion-reduce:animate-none",
+        "flex animate-in fade-in duration-200 motion-reduce:animate-none",
+        isAssistant ? "flex-row" : "flex-row items-start justify-end",
         compact ? "px-0 py-0.5" : "px-1 py-1",
         isAssistant &&
           isActive &&
-          "rounded-lg border border-primary/15 bg-primary/[0.03] px-2 py-1.5",
+          "rounded-lg border border-primary/15 bg-primary/3 px-2 py-1.5",
       )}
       data-role={isAssistant ? "assistant-message" : "user-message"}
       data-testid={
@@ -572,15 +573,15 @@ function MessageItem({
       {!isAssistant ? (
         <UserAvatar
           avatarUrl={authorProfile?.avatarUrl ?? null}
-          className="mr-2 mt-1 shrink-0"
+          className="order-last ml-2 mt-1 shrink-0"
           displayName={authorLabel}
           size="xs"
         />
       ) : null}
       <div
         className={cn(
-          "group relative min-w-0 flex flex-col items-start gap-1",
-          isAssistant ? "w-full" : "max-w-[85%]",
+          "group relative flex min-w-0 flex-col gap-1",
+          isAssistant ? "w-full items-start" : "max-w-[85%] items-end",
         )}
       >
         {isAssistant ? (
@@ -617,7 +618,7 @@ function MessageItem({
             <Markdown compact content={text || " "} />
           ) : (
             <>
-              <p className="whitespace-pre-wrap break-words">{text}</p>
+              <p className="whitespace-pre-wrap wrap-break-word">{text}</p>
               <TranscriptTimestamp timestamp={item.timestamp} />
             </>
           )}
@@ -641,7 +642,7 @@ function ThoughtItem({
       className={cn(
         "group not-prose w-full rounded-md border border-transparent",
         compact ? "px-0" : "px-1",
-        isActive && "border-primary/15 bg-primary/[0.03] px-2 py-1",
+        isActive && "border-primary/15 bg-primary/3 px-2 py-1",
       )}
       data-testid="transcript-thought-item"
     >
@@ -710,7 +711,7 @@ function MetadataItem({
               <span className="truncate">{section.title}</span>
               <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground transition-transform group-open/section:rotate-180" />
             </summary>
-            <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-md bg-muted/50 px-3 py-2 font-mono text-xs leading-5 text-muted-foreground">
+            <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap wrap-break-word rounded-md bg-muted/50 px-3 py-2 font-mono text-xs leading-5 text-muted-foreground">
               {section.body.trim() || "No metadata."}
             </pre>
           </details>
