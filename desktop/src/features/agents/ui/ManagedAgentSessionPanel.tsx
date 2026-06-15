@@ -30,7 +30,6 @@ type ManagedAgentSessionPanelProps = {
   };
   channelId?: string | null;
   className?: string;
-  compact?: boolean;
   emptyDescription?: string;
   isWorking?: boolean;
   rawLayout?: "responsive" | "exclusive";
@@ -43,7 +42,6 @@ export function ManagedAgentSessionPanel({
   agent,
   channelId = null,
   className,
-  compact = false,
   emptyDescription = "Mention this agent in a channel to watch the next turn.",
   isWorking = false,
   rawLayout = "responsive",
@@ -104,7 +102,6 @@ export function ManagedAgentSessionPanel({
         agentAvatarUrl={agent.avatarUrl ?? null}
         agentName={agent.name}
         agentPubkey={agent.pubkey}
-        compact={compact}
         connectionState={connectionState}
         emptyDescription={emptyDescription}
         errorMessage={errorMessage}
@@ -159,7 +156,6 @@ function SessionBody({
   agentAvatarUrl,
   agentName,
   agentPubkey,
-  compact,
   connectionState,
   emptyDescription,
   errorMessage,
@@ -174,7 +170,6 @@ function SessionBody({
   agentAvatarUrl: string | null;
   agentName: string;
   agentPubkey: string;
-  compact: boolean;
   connectionState: ConnectionState;
   emptyDescription: string;
   errorMessage: string | null;
@@ -219,7 +214,6 @@ function SessionBody({
             agentAvatarUrl={agentAvatarUrl}
             agentName={agentName}
             agentPubkey={agentPubkey}
-            compact={compact}
             emptyDescription={emptyDescription}
             isWorking={isWorking}
             items={transcript}

@@ -68,12 +68,10 @@ export function AgentSessionTranscriptList({
   agentAvatarUrl,
   agentName,
   agentPubkey,
-  compact = false,
   emptyDescription,
   items,
   profiles,
 }: AgentTranscriptIdentityProps & {
-  compact?: boolean;
   emptyDescription: string;
   isWorking?: boolean;
   items: TranscriptItem[];
@@ -86,12 +84,7 @@ export function AgentSessionTranscriptList({
 
   if (items.length === 0) {
     return (
-      <div
-        className={cn(
-          "flex flex-col items-center justify-center px-6 py-10 text-center",
-          compact ? "min-h-40" : "min-h-56",
-        )}
-      >
+      <div className="flex min-h-40 flex-col items-center justify-center px-6 py-10 text-center">
         <Radio className="mx-auto h-4 w-4 text-muted-foreground" />
         <p className="mt-3 text-sm font-medium">No ACP activity yet</p>
         <p className="mt-1 text-sm text-muted-foreground">{emptyDescription}</p>
@@ -104,7 +97,7 @@ export function AgentSessionTranscriptList({
       <div
         aria-label="Live ACP transcript"
         aria-live="polite"
-        className={cn("w-full", compact ? "py-0.5" : "py-1")}
+        className="w-full py-0.5"
         role="log"
       >
         {displayBlocks.map((block) => (
@@ -113,7 +106,6 @@ export function AgentSessionTranscriptList({
             agentName={agentName}
             agentPubkey={agentPubkey}
             block={block}
-            compact={compact}
             key={getDisplayBlockKey(block)}
             profiles={profiles}
           />
@@ -147,28 +139,17 @@ function TranscriptDisplayBlockView({
   agentName,
   agentPubkey,
   block,
-  compact,
   profiles,
 }: AgentTranscriptIdentityProps & {
   block: TranscriptDisplayBlock;
-  compact: boolean;
   profiles?: UserProfileLookup;
 }) {
   if (block.kind === "single") {
-    if (block.item.type === "tool") {
-      return (
-        <div className={cn("first:mt-0", compact ? "mt-3" : "mt-3.5")}>
-          <ToolCallGroup compact={compact} items={[block.item]} />
-        </div>
-      );
-    }
-
     return (
       <TranscriptItemRow
         agentAvatarUrl={agentAvatarUrl}
         agentName={agentName}
         agentPubkey={agentPubkey}
-        compact={compact}
         item={block.item}
         profiles={profiles}
       />
@@ -177,49 +158,22 @@ function TranscriptDisplayBlockView({
 
   return (
     <div
-      className={cn("first:mt-0", compact ? "mt-2.5" : "mt-3.5")}
+      className="first:mt-0 mt-2.5"
       data-testid="transcript-turn-group"
       data-turn-id={block.turnId}
     >
-      {block.segments.map((segment, index) => (
-        <div
-          className={getTurnSegmentSpacing(
-            block.segments[index - 1],
-            segment,
-            compact,
-          )}
+      {block.segments.map((segment) => (
+        <TranscriptTurnSegmentView
+          agentAvatarUrl={agentAvatarUrl}
+          agentName={agentName}
+          agentPubkey={agentPubkey}
           key={getTurnSegmentKey(block.turnId, segment)}
-        >
-          <TranscriptTurnSegmentView
-            agentAvatarUrl={agentAvatarUrl}
-            agentName={agentName}
-            agentPubkey={agentPubkey}
-            compact={compact}
-            profiles={profiles}
-            segment={segment}
-          />
-        </div>
+          profiles={profiles}
+          segment={segment}
+        />
       ))}
     </div>
   );
-}
-
-function getTurnSegmentSpacing(
-  previous: TranscriptTurnSegment | undefined,
-  segment: TranscriptTurnSegment,
-  compact: boolean,
-): string | undefined {
-  if (!previous) {
-    return undefined;
-  }
-
-  const involvesTool =
-    previous.kind === "tool_group" || segment.kind === "tool_group";
-  if (involvesTool) {
-    return compact ? "mt-3" : "mt-3.5";
-  }
-
-  return compact ? "mt-2" : "mt-2.5";
 }
 
 function getTurnSegmentKey(turnId: string, segment: TranscriptTurnSegment) {
@@ -229,9 +183,6 @@ function getTurnSegmentKey(turnId: string, segment: TranscriptTurnSegment) {
   if (segment.kind === "prompt") {
     return `turn:${turnId}:prompt`;
   }
-  if (segment.kind === "tool_group") {
-    return `turn:${turnId}:tools:${segment.items.map((item) => item.id).join("+")}`;
-  }
   return segment.item.id;
 }
 
@@ -239,18 +190,15 @@ function TranscriptTurnSegmentView({
   agentAvatarUrl,
   agentName,
   agentPubkey,
-  compact,
   profiles,
   segment,
 }: AgentTranscriptIdentityProps & {
-  compact: boolean;
   profiles?: UserProfileLookup;
   segment: TranscriptTurnSegment;
 }) {
   if (segment.kind === "prompt") {
     return (
       <TurnPromptBlock
-        compact={compact}
         context={segment.context}
         profiles={profiles}
         setup={segment.setup}
@@ -260,11 +208,7 @@ function TranscriptTurnSegmentView({
   }
 
   if (segment.kind === "setup") {
-    return <TurnSetupStatus compact={compact} items={segment.items} />;
-  }
-
-  if (segment.kind === "tool_group") {
-    return <ToolCallGroup compact={compact} items={segment.items} />;
+    return <TurnSetupStatus items={segment.items} />;
   }
 
   return (
@@ -272,8 +216,6 @@ function TranscriptTurnSegmentView({
       agentAvatarUrl={agentAvatarUrl}
       agentName={agentName}
       agentPubkey={agentPubkey}
-      compact={compact}
-      embedded
       item={segment.item}
       profiles={profiles}
     />
@@ -281,13 +223,11 @@ function TranscriptTurnSegmentView({
 }
 
 function TurnPromptBlock({
-  compact,
   context,
   profiles,
   setup,
   user,
 }: {
-  compact: boolean;
   context: Extract<TranscriptItem, { type: "metadata" }> | null;
   profiles?: UserProfileLookup;
   setup: Extract<TranscriptItem, { type: "lifecycle" }>[];
@@ -304,7 +244,6 @@ function TurnPromptBlock({
         </div>
       ) : null}
       <PromptUserMessage
-        compact={compact}
         context={context}
         item={user}
         profiles={profiles}
@@ -315,13 +254,11 @@ function TurnPromptBlock({
 }
 
 function PromptUserMessage({
-  compact,
   context = null,
   item,
   profiles,
   setup = [],
 }: {
-  compact: boolean;
   context?: Extract<TranscriptItem, { type: "metadata" }> | null;
   item: Extract<TranscriptItem, { type: "message" }>;
   profiles?: UserProfileLookup;
@@ -353,12 +290,7 @@ function PromptUserMessage({
         size="xs"
       />
       <div className="group relative flex max-w-[85%] min-w-0 flex-col items-end gap-1">
-        <div
-          className={cn(
-            "w-full min-w-0 rounded-2xl bg-muted p-3 text-sm leading-relaxed text-foreground",
-            compact && "p-2.5",
-          )}
-        >
+        <div className="w-full min-w-0 rounded-2xl bg-muted p-2.5 text-sm leading-relaxed text-foreground">
           <p className="whitespace-pre-wrap wrap-break-word">{text}</p>
           {contextOpen && context ? (
             <PromptContextSections sections={context.sections} setup={setup} />
@@ -503,43 +435,19 @@ function TurnSetupFooter({
   );
 }
 
-function ToolCallGroup({
-  compact,
-  items,
-}: {
-  compact: boolean;
-  items: Extract<TranscriptItem, { type: "tool" }>[];
-}) {
-  return (
-    <div className="flex flex-col gap-0" data-testid="transcript-tool-group">
-      {items.map((item) => (
-        <ToolItem compact={compact} grouped key={item.id} item={item} />
-      ))}
-    </div>
-  );
-}
-
 function TranscriptItemRow({
   agentAvatarUrl,
   agentName,
   agentPubkey,
-  compact,
-  embedded = false,
   item,
   profiles,
 }: AgentTranscriptIdentityProps & {
-  compact: boolean;
-  embedded?: boolean;
   item: TranscriptItem;
   profiles?: UserProfileLookup;
 }) {
   return (
     <div
-      className={cn(
-        !embedded && "first:mt-0",
-        !embedded && (compact ? "mt-2" : "mt-2.5"),
-        !embedded && getItemSpacingClass(item),
-      )}
+      className={cn("first:mt-0", getTranscriptItemRowSpacing(item))}
       key={item.id}
     >
       {SHOW_TRANSCRIPT_ACP_SOURCE && item.acpSource ? (
@@ -549,7 +457,6 @@ function TranscriptItemRow({
         agentAvatarUrl={agentAvatarUrl}
         agentName={agentName}
         agentPubkey={agentPubkey}
-        compact={compact}
         item={item}
         profiles={profiles}
       />
@@ -558,10 +465,8 @@ function TranscriptItemRow({
 }
 
 function TurnSetupStatus({
-  compact,
   items,
 }: {
-  compact: boolean;
   items: Extract<TranscriptItem, { type: "lifecycle" }>[];
 }) {
   const timestamp = turnSetupTimestamp(items);
@@ -570,31 +475,29 @@ function TurnSetupStatus({
   }
 
   return (
-    <div className={cn("rounded-md px-2 py-1.5", compact ? "mt-1.5" : "mt-2")}>
+    <div className="mt-1.5 rounded-md px-2 py-1.5">
       <TurnSetupFooter items={items} timestamp={timestamp} />
     </div>
   );
 }
 
-function getItemSpacingClass(item: TranscriptItem) {
-  if (item.type === "lifecycle") {
-    return "mt-1.5 first:mt-0";
+function getTranscriptItemRowSpacing(item: TranscriptItem): string {
+  if (item.type === "message") {
+    return "my-2.5";
   }
-  if (item.type === "metadata" || item.type === "thought") {
-    return "mt-1.5 first:mt-0";
+  if (item.type === "tool") {
+    return "my-1";
   }
-  return undefined;
+  return "my-2";
 }
 
 const TranscriptItemView = React.memo(function TranscriptItemView({
   agentAvatarUrl,
   agentName,
   agentPubkey,
-  compact,
   item,
   profiles,
 }: AgentTranscriptIdentityProps & {
-  compact: boolean;
   item: TranscriptItem;
   profiles?: UserProfileLookup;
 }) {
@@ -604,20 +507,19 @@ const TranscriptItemView = React.memo(function TranscriptItemView({
         agentAvatarUrl={agentAvatarUrl}
         agentName={agentName}
         agentPubkey={agentPubkey}
-        compact={compact}
         item={item}
         profiles={profiles}
       />
     );
   }
   if (item.type === "tool") {
-    return <ToolItem compact={compact} item={item} />;
+    return <ToolItem item={item} />;
   }
   if (item.type === "thought") {
-    return <ThoughtItem compact={compact} item={item} />;
+    return <ThoughtItem item={item} />;
   }
   if (item.type === "metadata") {
-    return <MetadataItem compact={compact} item={item} />;
+    return <MetadataItem item={item} />;
   }
   return <LifecycleItem item={item} />;
 });
@@ -626,11 +528,9 @@ function MessageItem({
   agentAvatarUrl,
   agentName,
   agentPubkey,
-  compact,
   item,
   profiles,
 }: AgentTranscriptIdentityProps & {
-  compact: boolean;
   item: Extract<TranscriptItem, { type: "message" }>;
   profiles?: UserProfileLookup;
 }) {
@@ -659,14 +559,9 @@ function MessageItem({
     <div
       className={cn(
         "flex animate-in fade-in duration-200 motion-reduce:animate-none",
-        isAssistant ? "flex-row" : "flex-row items-start justify-end",
         isAssistant
-          ? compact
-            ? "px-0 py-0"
-            : "px-1 py-0"
-          : compact
-            ? "px-0 py-0.5"
-            : "px-1 py-1",
+          ? "flex-row px-0 py-1.5"
+          : "flex-row items-start justify-end px-0 py-0.5",
       )}
       data-role={isAssistant ? "assistant-message" : "user-message"}
       data-testid={
@@ -723,18 +618,13 @@ function MessageItem({
 }
 
 function ThoughtItem({
-  compact,
   item,
 }: {
-  compact: boolean;
   item: Extract<TranscriptItem, { type: "thought" }>;
 }) {
   return (
     <details
-      className={cn(
-        "group not-prose w-full rounded-md border border-transparent",
-        compact ? "px-0" : "px-1",
-      )}
+      className="group not-prose w-full rounded-md border border-transparent px-0"
       data-testid="transcript-thought-item"
     >
       <summary className="inline-flex max-w-full cursor-pointer list-none items-center gap-1.5 py-px text-muted-foreground">
@@ -751,27 +641,13 @@ function ThoughtItem({
 }
 
 function MetadataItem({
-  compact,
-  embedded = false,
   item,
 }: {
-  compact: boolean;
-  embedded?: boolean;
   item: Extract<TranscriptItem, { type: "metadata" }>;
 }) {
   return (
     <details
-      className={cn(
-        "group not-prose w-full",
-        embedded
-          ? compact
-            ? "px-2 py-1"
-            : "px-2.5 py-1.5"
-          : cn(
-              "rounded-md border border-border/50 bg-muted/20",
-              compact ? "px-2 py-1" : "px-2 py-1.5",
-            ),
-      )}
+      className="group not-prose w-full rounded-md border border-border/50 bg-muted/20 px-2 py-1"
       data-testid="transcript-metadata-item"
     >
       <summary className="inline-flex max-w-full cursor-pointer list-none items-center gap-1.5 py-px text-muted-foreground">

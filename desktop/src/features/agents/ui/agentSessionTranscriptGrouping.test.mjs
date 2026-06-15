@@ -124,32 +124,7 @@ test("buildTranscriptDisplayBlocks bundles user prompt, setup, and context toget
   assert.equal(promptSegment.context?.id, "context");
   assert.equal(promptSegment.setup.length, 2);
   assert.equal(turnBlock.segments[1]?.kind, "item");
-  assert.equal(turnBlock.segments[2]?.kind, "tool_group");
-});
-
-test("buildTranscriptDisplayBlocks groups consecutive tool calls", () => {
-  const rawItems = [
-    userPrompt("prompt", "run these", "turn-1"),
-    toolCall("tool-1", "turn-1"),
-    toolCall("tool-2", "turn-1"),
-    assistantMessage("assistant", "Done.", "turn-1"),
-    toolCall("tool-3", "turn-1"),
-  ];
-
-  const blocks = buildTranscriptDisplayBlocks(rawItems);
-  const turnBlock = blocks[0];
-  assert.equal(turnBlock?.kind, "turn");
-  assert.equal(turnBlock.segments[1]?.kind, "tool_group");
-  assert.deepEqual(
-    turnBlock.segments[1]?.items?.map((item) => item.id),
-    ["tool-1", "tool-2"],
-  );
   assert.equal(turnBlock.segments[2]?.kind, "item");
-  assert.equal(turnBlock.segments[3]?.kind, "tool_group");
-  assert.deepEqual(
-    turnBlock.segments[3]?.items?.map((item) => item.id),
-    ["tool-3"],
-  );
 });
 
 test("buildTranscriptDisplayBlocks collapses setup lifecycle inside prompt bundle", () => {
