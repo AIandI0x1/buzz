@@ -23,6 +23,10 @@ function relayStatusToManagedStatus(
   return status === "offline" ? "stopped" : "deployed";
 }
 
+function isAgentChannelMember(member: ChannelMember) {
+  return member.role === "bot" || member.isAgent;
+}
+
 export function buildChannelAgentSessionCandidates({
   channelMembers,
   managedAgents,
@@ -63,7 +67,7 @@ export function buildChannelAgentSessionCandidates({
 
   for (const member of channelMembers ?? []) {
     const key = normalizePubkey(member.pubkey);
-    if (member.role !== "bot" || byPubkey.has(key)) {
+    if (!isAgentChannelMember(member) || byPubkey.has(key)) {
       continue;
     }
 
@@ -100,7 +104,7 @@ export function getChannelAgentSessionAgents({
   const botMemberPubkeys = channelMembers
     ? new Set(
         channelMembers
-          .filter((member) => member.role === "bot")
+          .filter(isAgentChannelMember)
           .map((member) => normalizePubkey(member.pubkey)),
       )
     : null;
