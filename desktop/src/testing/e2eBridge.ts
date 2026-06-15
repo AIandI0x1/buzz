@@ -8,6 +8,8 @@ import { relayClient } from "@/shared/api/relayClient";
 import type { ConnectionState } from "@/shared/api/relayClientShared";
 import type { RelayEvent } from "@/shared/api/types";
 import { syncAgentTurnsFromEvents } from "@/features/agents/activeAgentTurnsStore";
+import { seedAgentObserverEvents } from "@/features/agents/observerRelayStore";
+import type { ObserverEvent } from "@/features/agents/ui/agentSessionTypes";
 import {
   CUSTOM_EMOJI_SET_D_TAG,
   KIND_EMOJI_SET,
@@ -610,6 +612,10 @@ declare global {
       agentPubkey: string;
       channelId: string;
       turnId: string;
+    }) => void;
+    __BUZZ_E2E_SEED_OBSERVER_FRAMES__?: (input: {
+      agentPubkey: string;
+      events: ObserverEvent[];
     }) => void;
     __BUZZ_E2E_EMIT_MOCK_READ_STATE__?: (input: {
       clientId: string;
@@ -5946,6 +5952,12 @@ export function maybeInstallE2eTauriMocks() {
         payload: null,
       },
     ]);
+  };
+  // Seeds populated observer transcript frames for an agent so the Activity
+  // panel renders live-style states (prompts, assistant messages, tool/shell
+  // summaries, view_image thumbnails) without a running agent or a relay.
+  window.__BUZZ_E2E_SEED_OBSERVER_FRAMES__ = ({ agentPubkey, events }) => {
+    seedAgentObserverEvents(agentPubkey, events);
   };
   const meshNodeStatus = (
     state: "off" | "running",

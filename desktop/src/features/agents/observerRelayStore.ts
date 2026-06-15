@@ -318,6 +318,31 @@ export function useManagedAgentObserverBridge(
   }, [hasActiveAgent]);
 }
 
+// E2E-only seam. Injects already-decrypted observer events for an agent
+// straight into the store, bypassing the relay subscription and the decrypt
+// command. The events flow through the exact same `appendAgentEvent` →
+// `processTranscriptEvent` pipeline as production frames, so the rendered
+// transcript is faithful to live decrypted output (avatars, grouped prompts,
+// tool/shell summaries, view_image thumbnails) without a running agent. The
+// agent is registered as known + the connection is flipped to "open" so the
+// panel renders the populated state rather than an empty/error placeholder.
+//
+// Guarded behind an explicit caller (the `__BUZZ_E2E_SEED_OBSERVER_FRAMES__`
+// bridge hook) — never reachable from production code paths.
+export function seedAgentObserverEvents(
+  agentPubkey: string,
+  events: ObserverEvent[],
+) {
+  const key = normalizePubkey(agentPubkey);
+  knownAgentPubkeys.add(key);
+  if (connectionState !== "open") {
+    setConnectionState("open", null);
+  }
+  for (const event of events) {
+    appendAgentEvent(agentPubkey, event);
+  }
+}
+
 export function resetAgentObserverStore() {
   generation += 1;
   const unsubscribe = unsubscribeRelay;
