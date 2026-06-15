@@ -291,7 +291,7 @@ function PromptUserMessage({
       />
       <div className="group relative flex max-w-[85%] min-w-0 flex-col items-end gap-1">
         <div className="w-full min-w-0 rounded-2xl bg-muted p-2.5 text-sm leading-relaxed text-foreground">
-          <p className="whitespace-pre-wrap wrap-break-word">{text}</p>
+          <Markdown content={text || " "} tight />
           {contextOpen && context ? (
             <PromptContextSections sections={context.sections} setup={setup} />
           ) : null}
@@ -607,7 +607,7 @@ function MessageItem({
             <Markdown compact content={text || " "} />
           ) : (
             <>
-              <p className="whitespace-pre-wrap wrap-break-word">{text}</p>
+              <Markdown content={text || " "} tight />
               <TranscriptTimestamp timestamp={item.timestamp} />
             </>
           )}
