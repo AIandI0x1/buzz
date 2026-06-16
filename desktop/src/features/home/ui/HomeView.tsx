@@ -53,7 +53,6 @@ type HomeViewProps = {
   currentPubkey?: string;
   availableChannelIds: ReadonlySet<string>;
   onOpenChannel: (channelId: string) => void;
-  onOpenContext: (channelId: string, messageId: string) => void;
   onRefresh: () => void;
 };
 
@@ -64,7 +63,6 @@ export function HomeView({
   currentPubkey,
   availableChannelIds,
   onOpenChannel,
-  onOpenContext,
   onRefresh,
 }: HomeViewProps) {
   const [homeInboxRef, homeInboxWidthPx] = useElementWidth<HTMLDivElement>();
@@ -433,7 +431,6 @@ export function HomeView({
                 });
             }}
             onOpenChannel={onOpenChannel}
-            onOpenContext={onOpenContext}
             onSendReply={async ({
               content,
               mediaTags,

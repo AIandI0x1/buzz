@@ -102,6 +102,9 @@ export function AppShell() {
 
   const [isChannelManagementOpen, setIsChannelManagementOpen] =
     React.useState(false);
+  const [managedChannelId, setManagedChannelId] = React.useState<string | null>(
+    null,
+  );
   const [searchFocusRequest, setSearchFocusRequest] = React.useState(0);
   const [topbarSearchHidden, setTopbarSearchHidden] = React.useState(false);
   const [topbarSearchLoading, setTopbarSearchLoading] = React.useState(false);
@@ -223,6 +226,12 @@ export function AppShell() {
         : null,
     [channels, selectedChannelId],
   );
+  const managedChannel = React.useMemo(() => {
+    const targetChannelId = managedChannelId ?? selectedChannelId;
+    return targetChannelId
+      ? (channels.find((channel) => channel.id === targetChannelId) ?? null)
+      : null;
+  }, [channels, managedChannelId, selectedChannelId]);
 
   const handleThreadReplyDesktopNotification = React.useEffectEvent(
     (channelId: string, event: RelayEvent) => {
@@ -665,7 +674,10 @@ export function AppShell() {
             markChannelRead,
             markChannelUnread,
             openCreateChannel: handleOpenCreateChannel,
-            openChannelManagement: () => {
+            openChannelManagement: (channelId?: string) => {
+              setManagedChannelId(
+                typeof channelId === "string" ? channelId : null,
+              );
               setIsChannelManagementOpen(true);
             },
             getChannelReadAt,
@@ -887,16 +899,22 @@ export function AppShell() {
                   )}
 
                   <AppShellOverlays
-                    activeChannel={activeChannel}
+                    activeChannel={managedChannel}
                     browseDialogType={browseDialogType}
                     channels={channels}
                     currentPubkey={identityQuery.data?.pubkey}
                     isChannelManagementOpen={isChannelManagementOpen}
                     onBrowseChannelJoin={handleBrowseChannelJoin}
                     onBrowseDialogOpenChange={handleBrowseDialogOpenChange}
-                    onChannelManagementOpenChange={setIsChannelManagementOpen}
+                    onChannelManagementOpenChange={(open) => {
+                      setIsChannelManagementOpen(open);
+                      if (!open) {
+                        setManagedChannelId(null);
+                      }
+                    }}
                     onDeleteActiveChannel={() => {
                       setIsChannelManagementOpen(false);
+                      setManagedChannelId(null);
                       void goHome({ replace: true });
                     }}
                     onSelectChannel={(channelId) => {

@@ -60,7 +60,6 @@ type InboxDetailPaneProps = {
   onBack?: () => void;
   onDelete: () => void;
   onOpenChannel: (channelId: string) => void;
-  onOpenContext?: (channelId: string, messageId: string) => void;
   onSendReply: (input: {
     content: string;
     mediaTags?: string[][];
@@ -94,7 +93,6 @@ export function InboxDetailPane({
   onBack,
   onDelete,
   onOpenChannel,
-  onOpenContext,
   onSendReply,
   onToggleReaction,
   onToggleDone,
@@ -256,10 +254,10 @@ export function InboxDetailPane({
                   </Button>
                 ) : null}
                 <div className="min-w-0">
-                  {canOpenChannel && contextChannelId && onOpenContext ? (
+                  {canOpenChannel && contextChannelId ? (
                     <button
                       className="flex min-w-0 items-center gap-[4px] text-left text-sm font-semibold leading-5 tracking-tight text-foreground hover:underline focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-                      onClick={() => onOpenContext(contextChannelId, item.id)}
+                      onClick={() => onOpenChannel(contextChannelId)}
                       title={item.fullTimestampLabel}
                       type="button"
                     >

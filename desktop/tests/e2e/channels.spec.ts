@@ -3,7 +3,22 @@ import { expect, test } from "@playwright/test";
 import { KIND_TYPING_INDICATOR } from "../../src/shared/constants/kinds";
 import { TEST_IDENTITIES, installMockBridge } from "../helpers/bridge";
 
+const GENERAL_CHANNEL_ID = "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50";
 const MOCK_IDENTITY_PUBKEY = "deadbeef".repeat(8);
+
+type MockFeedWindow = Window & {
+  __BUZZ_E2E_PUSH_MOCK_FEED_ITEM__?: (item: {
+    category: "mention" | "needs_action" | "activity" | "agent_activity";
+    channel_id: string | null;
+    channel_name: string;
+    content: string;
+    created_at: number;
+    id: string;
+    kind: number;
+    pubkey: string;
+    tags: string[][];
+  }) => unknown;
+};
 
 async function openChannelManagement(
   page: import("@playwright/test").Page,
@@ -1240,6 +1255,64 @@ test("manage channel keeps canvas near the top of the sheet", async ({
   expect(canvasBox).not.toBeNull();
   expect(nameBox).not.toBeNull();
   expect(canvasBox?.y).toBeLessThan(nameBox?.y);
+});
+
+test("home inbox channel label opens management without leaving home", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await expect(page.getByTestId("home-inbox-list")).toBeVisible();
+  await page.waitForFunction(
+    () =>
+      typeof (window as MockFeedWindow).__BUZZ_E2E_PUSH_MOCK_FEED_ITEM__ ===
+      "function",
+  );
+
+  await page.evaluate(
+    ({ channelId, createdAt, currentPubkey, senderPubkey }) => {
+      const pushFeedItem = (window as MockFeedWindow)
+        .__BUZZ_E2E_PUSH_MOCK_FEED_ITEM__;
+      if (!pushFeedItem) {
+        throw new Error("Mock feed injection helper is not installed.");
+      }
+
+      pushFeedItem({
+        id: "mock-feed-home-channel-panel",
+        kind: 9,
+        pubkey: senderPubkey,
+        content: "Please review the home panel routing.",
+        created_at: createdAt,
+        channel_id: channelId,
+        channel_name: "general",
+        tags: [
+          ["e", channelId],
+          ["p", currentPubkey],
+        ],
+        category: "mention",
+      });
+    },
+    {
+      channelId: GENERAL_CHANNEL_ID,
+      createdAt: Math.floor(Date.now() / 1000),
+      currentPubkey: TEST_IDENTITIES.tyler.pubkey,
+      senderPubkey: TEST_IDENTITIES.alice.pubkey,
+    },
+  );
+
+  await page
+    .getByTestId("home-inbox-item-mock-feed-home-channel-panel")
+    .click();
+  await page
+    .getByTestId("home-inbox-detail")
+    .getByRole("button", { exact: true, name: "general" })
+    .click();
+
+  await expect(page.getByTestId("channel-management-sheet")).toBeVisible();
+  await expect(page.getByTestId("channel-management-name-row")).toContainText(
+    "general",
+  );
+  await expect(page.getByTestId("home-inbox-list")).toBeVisible();
+  await expect(page).not.toHaveURL(/#\/channels\//);
 });
 
 test("members sidebar can invite and remove members", async ({ page }) => {

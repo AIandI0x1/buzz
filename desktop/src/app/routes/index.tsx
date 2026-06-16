@@ -1,6 +1,7 @@
 import * as React from "react";
 import { createFileRoute } from "@tanstack/react-router";
 
+import { useAppShell } from "@/app/AppShellContext";
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { useChannelsQuery } from "@/features/channels/hooks";
 import { HomeScreen } from "@/features/home/ui/HomeScreen";
@@ -16,6 +17,7 @@ export const Route = createFileRoute("/")({
 
 function HomeRouteComponent() {
   const { goChannel } = useAppNavigation();
+  const { openChannelManagement } = useAppShell();
   const channelsQuery = useChannelsQuery();
   const identityQuery = useIdentityQuery();
   const channels = channelsQuery.data ?? [];
@@ -65,12 +67,7 @@ function HomeRouteComponent() {
     <HomeScreen
       availableChannelIds={availableChannelIds}
       currentPubkey={identityQuery.data?.pubkey}
-      onOpenChannel={(channelId) => {
-        void goChannel(channelId);
-      }}
-      onOpenContext={(channelId, messageId) => {
-        void goChannel(channelId, { messageId });
-      }}
+      onOpenChannel={openChannelManagement}
     />
   );
 }
