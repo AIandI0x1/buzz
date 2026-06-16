@@ -16,6 +16,7 @@ import { SkeletonReveal } from "@/shared/ui/skeleton";
 import { TooltipProvider } from "@/shared/ui/tooltip";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
 import { TimelineSkeleton, useTimelineSkeletonRows } from "./TimelineSkeleton";
+import { TimelineDebugOverlay } from "./TimelineDebugOverlay";
 import {
   renderTimelineEntry,
   type TimelineEntryRenderContext,
@@ -529,6 +530,20 @@ export const MessageTimeline = React.memo(function MessageTimeline({
                 : "Jump to latest"}
             </Button>
           </div>
+        ) : null}
+
+        {showMessageList ? (
+          <TimelineDebugOverlay
+            highlightedMessageId={highlightedMessageId}
+            isAtBottom={isAtBottom}
+            newMessageCount={newMessageCount}
+            overscan={overscan}
+            rows={rows}
+            scrollContainerRef={scrollContainerRef}
+            searchActiveMessageId={searchActiveMessageId}
+            targetMessageId={targetMessageId}
+            virtualizer={virtualizer}
+          />
         ) : null}
       </div>
     </TooltipProvider>
