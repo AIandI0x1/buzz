@@ -28,18 +28,23 @@ function message(
 }
 
 // Records scrollToIndex calls so we can assert the virtualizer is driven
-// correctly. The hook never reads layout off the virtualizer directly.
-function makeVirtualizer() {
+// correctly. `getTotalSize` is controllable so we can simulate the document
+// growing during first-load settle (estimate→measured heights, streaming rows).
+function makeVirtualizer(initialTotalSize = 100) {
+  let totalSize = initialTotalSize;
   const scrollToIndex =
     mock.fn<
       (index: number, opts?: { align?: string; behavior?: string }) => void
     >();
   return {
     scrollToIndex,
-    virtualizer: { scrollToIndex } as unknown as Virtualizer<
-      HTMLDivElement,
-      Element
-    >,
+    setTotalSize(next: number) {
+      totalSize = next;
+    },
+    virtualizer: {
+      scrollToIndex,
+      getTotalSize: () => totalSize,
+    } as unknown as Virtualizer<HTMLDivElement, Element>,
   };
 }
 
@@ -140,4 +145,97 @@ test("a deep-link target scrolls to that message's flat row and centers it", () 
   assert.equal(centerCall?.arguments[0], 2);
   assert.equal(onTargetReached.mock.calls.length, 1);
   assert.equal(onTargetReached.mock.calls[0].arguments[0], "b");
+});
+
+test("first-load settle: re-pins to bottom as total size grows while pinned", () => {
+  // First load: rows paint with estimated heights, then measured heights /
+  // streaming rows grow getTotalSize(). While pinned, each growth re-anchors to
+  // the bottom so the viewport holds at the newest message.
+  const messages = [message({ id: "a" }), message({ id: "b" })];
+  const rows = buildVirtualTimelineRows(messages);
+  const harness = makeVirtualizer(100);
+
+  const { rerender } = renderHook(
+    ({ totalSizeTick }: { totalSizeTick: number }) =>
+      useVirtualTimelineScroll({
+        channelId: "c1",
+        isLoading: false,
+        messages,
+        rows,
+        // Pinned at bottom (default scroll metrics read as at-bottom).
+        scrollContainerRef: makeContainerRef(true),
+        virtualizer: harness.virtualizer,
+        // totalSizeTick is unused by the hook — it just forces a re-render after
+        // we bump the fake's total size, mirroring react-virtual's onChange.
+        ...({ totalSizeTick } as Record<string, never>),
+      }),
+    { initialProps: { totalSizeTick: 0 } },
+  );
+
+  const endPinsBefore = harness.scrollToIndex.mock.calls.filter(
+    (c) => c.arguments[1]?.align === "end",
+  ).length;
+
+  // Document grows (measured heights settle / more rows stream in).
+  act(() => {
+    harness.setTotalSize(900);
+    rerender({ totalSizeTick: 1 });
+  });
+
+  const endPinsAfter = harness.scrollToIndex.mock.calls.filter(
+    (c) => c.arguments[1]?.align === "end",
+  ).length;
+  assert.ok(
+    endPinsAfter > endPinsBefore,
+    "expected a re-pin to bottom when total size grew while pinned",
+  );
+  const lastEnd = harness.scrollToIndex.mock.calls
+    .filter((c) => c.arguments[1]?.align === "end")
+    .at(-1);
+  assert.equal(lastEnd?.arguments[0], rows.length - 1);
+});
+
+test("first-load settle: does NOT re-pin after the user scrolls away", () => {
+  const messages = [message({ id: "a" }), message({ id: "b" })];
+  const rows = buildVirtualTimelineRows(messages);
+  const harness = makeVirtualizer(100);
+  // Container reads as NOT at bottom — the initial syncScrollState/scroll state
+  // leaves stickToBottom false, so the settle effect must not yank back down.
+  const containerRef = makeContainerRef(false);
+
+  const { result, rerender } = renderHook(
+    ({ totalSizeTick }: { totalSizeTick: number }) =>
+      useVirtualTimelineScroll({
+        channelId: "c1",
+        isLoading: false,
+        messages,
+        rows,
+        scrollContainerRef: containerRef,
+        virtualizer: harness.virtualizer,
+        ...({ totalSizeTick } as Record<string, never>),
+      }),
+    { initialProps: { totalSizeTick: 0 } },
+  );
+
+  // User has scrolled up — reflect that through syncScrollState.
+  act(() => {
+    result.current.syncScrollState();
+  });
+  const endPinsBefore = harness.scrollToIndex.mock.calls.filter(
+    (c) => c.arguments[1]?.align === "end",
+  ).length;
+
+  act(() => {
+    harness.setTotalSize(900);
+    rerender({ totalSizeTick: 1 });
+  });
+
+  const endPinsAfter = harness.scrollToIndex.mock.calls.filter(
+    (c) => c.arguments[1]?.align === "end",
+  ).length;
+  assert.equal(
+    endPinsAfter,
+    endPinsBefore,
+    "must not re-pin to bottom once the user has scrolled away",
+  );
 });

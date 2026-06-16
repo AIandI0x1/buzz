@@ -60,6 +60,10 @@ export function useVirtualTimelineScroll({
   const previousMessageCountRef = React.useRef(0);
   const handledTargetMessageIdRef = React.useRef<string | null>(null);
   const handledSearchActiveIdRef = React.useRef<string | null>(null);
+  // Total virtual size at the last time we pinned to bottom — lets the
+  // settle-pin effect below re-anchor only when the size actually changed,
+  // instead of looping on its own scroll-induced re-renders.
+  const lastPinnedTotalSizeRef = React.useRef(-1);
 
   const [isAtBottom, setIsAtBottom] = React.useState(true);
   const [newMessageCount, setNewMessageCount] = React.useState(0);
@@ -78,6 +82,9 @@ export function useVirtualTimelineScroll({
       setNewMessageCount(0);
       setIsAtBottom(true);
       virtualizer.scrollToIndex(lastRowIndex, { align: "end", behavior });
+      // Mark the current size as pinned so the settle effect doesn't redundantly
+      // re-fire for this same commit.
+      lastPinnedTotalSizeRef.current = virtualizer.getTotalSize();
     },
     [lastRowIndex, virtualizer],
   );
@@ -91,6 +98,7 @@ export function useVirtualTimelineScroll({
     previousMessageCountRef.current = 0;
     handledTargetMessageIdRef.current = null;
     handledSearchActiveIdRef.current = null;
+    lastPinnedTotalSizeRef.current = -1;
     setIsAtBottom(true);
     setNewMessageCount(0);
     setHighlightedMessageId(null);
@@ -169,6 +177,33 @@ export function useVirtualTimelineScroll({
     scrollToBottom,
     targetMessageId,
   ]);
+
+  // Keep pinned to the bottom while the document settles. On first load the
+  // virtualizer paints with ESTIMATED row heights and the deferred snapshot
+  // streams in over several commits, so the true bottom keeps moving after the
+  // one-shot init pin above. As `getTotalSize()` grows (estimate→measured
+  // heights, more rows, container resize), re-anchor to the bottom — but ONLY
+  // while still pinned and not chasing a deep-link, so a user who scrolled up is
+  // never yanked back down. Guarded on a real size change so the pin's own
+  // scroll-induced re-render can't loop. This is what makes first-load "land and
+  // hold at the bottom" instead of anchoring up top as content fills in.
+  const totalSize = virtualizer.getTotalSize();
+  React.useLayoutEffect(() => {
+    if (
+      isLoading ||
+      targetMessageId ||
+      !hasInitializedRef.current ||
+      !stickToBottomRef.current ||
+      lastRowIndex < 0
+    ) {
+      return;
+    }
+    if (totalSize === lastPinnedTotalSizeRef.current) {
+      return;
+    }
+    lastPinnedTotalSizeRef.current = totalSize;
+    virtualizer.scrollToIndex(lastRowIndex, { align: "end" });
+  }, [totalSize, isLoading, targetMessageId, lastRowIndex, virtualizer]);
 
   // Deep-link jump-to-message. Drives the virtualizer to mount and center the
   // target row, replacing the bespoke querySelector + scrollIntoView path that
