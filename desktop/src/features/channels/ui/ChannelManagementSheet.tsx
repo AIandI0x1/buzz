@@ -160,7 +160,7 @@ export function ChannelManagementSheet({
     "summary",
   );
 
-  // Sync drafts from server only when the sheet opens or the channel changes —
+  // Sync drafts from server only when the sheet opens or the channel changes -
   // not on every background refetch, which would clobber in-flight edits.
   const syncedForRef = React.useRef<string | null>(null);
   React.useEffect(() => {
