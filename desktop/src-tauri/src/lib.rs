@@ -695,6 +695,33 @@ pub fn run() {
                 }
             });
 
+            // Drain persona events the retention store flagged `pending_sync`
+            // (UI create/edit, delete tombstones, launch reconcile) to the
+            // relay. One loop is the sole publisher for all four writers; a
+            // relay-unreachable tick leaves rows pending for the next sweep.
+            let flush_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                use std::time::Duration;
+                use tauri::Manager;
+                let Ok(db_path) = managed_agents::managed_agents_base_dir(&flush_handle)
+                    .map(|d| d.join("retention.db"))
+                else {
+                    eprintln!("buzz-desktop: persona-flush: cannot resolve retention db path");
+                    return;
+                };
+                loop {
+                    let state = flush_handle.state::<AppState>();
+                    if let Err(e) = managed_agents::persona_events::flush_pending_persona_events(
+                        &db_path, &state,
+                    )
+                    .await
+                    {
+                        eprintln!("buzz-desktop: persona-flush: {e}");
+                    }
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
