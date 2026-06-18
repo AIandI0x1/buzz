@@ -146,11 +146,12 @@ export const TimelineMessageList = React.memo(function TimelineMessageList({
 
   // Day-divider decision delegated to a pure, lib-tested helper: a new group
   // starts at index 0 and whenever a message falls on a different calendar day
-  // than the one before it. We index the boundary start positions so the render
-  // loop below stays a straight walk while the grouping logic lives in `lib/`.
-  const dayGroupStartIndices = new Set(
+  // than the one before it. We index the boundaries by start position so the
+  // render loop below stays a straight walk while the grouping logic — and the
+  // prepend-stable section key — lives in `lib/`.
+  const dayGroupBoundariesByStartIndex = new Map(
     buildDayGroupBoundaries(entries.map((entry) => entry.message)).map(
-      (boundary) => boundary.startIndex,
+      (boundary) => [boundary.startIndex, boundary],
     ),
   );
 
@@ -158,9 +159,10 @@ export const TimelineMessageList = React.memo(function TimelineMessageList({
     const { message, summary } = entries[i];
     const messageRenderKey = message.renderKey ?? message.id;
 
-    if (dayGroupStartIndices.has(i)) {
+    const dayBoundary = dayGroupBoundariesByStartIndex.get(i);
+    if (dayBoundary) {
       currentDayGroup = {
-        key: `day-${message.createdAt}`,
+        key: dayBoundary.key,
         label: formatDayHeading(message.createdAt),
         elements: [],
       };
