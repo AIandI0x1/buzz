@@ -232,7 +232,17 @@ pub async fn restore_managed_agents_on_launch(
                 crate::commands::reconcile_agent_profile(&state, &reconcile_app, &pubkey, &data)
                     .await
             {
-                eprintln!("buzz-desktop: profile reconciliation failed for agent {pubkey}: {e}");
+                // A local agent may deliberately target a relay that isn't
+                // running (e.g. ws://localhost:3000 between boots); the relay
+                // helper marks every such case with the "relay unreachable:"
+                // prefix (see relay.rs). That's expected, not a failure worth
+                // a per-agent line every boot — only genuine reconcile errors
+                // surface loudly.
+                if !e.starts_with("relay unreachable:") {
+                    eprintln!(
+                        "buzz-desktop: profile reconciliation failed for agent {pubkey}: {e}"
+                    );
+                }
             }
         });
     }
