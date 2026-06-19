@@ -321,7 +321,7 @@ export function ProfileSummaryView({
         <UserProfileAgentActions
           isPending={isAgentActionPending}
           managedAgent={managedAgent}
-          onDelete={handleDeleteAgent}
+          onDelete={persona ? handleDeletePersona : handleDeleteAgent}
           onDuplicatePersona={handleDuplicatePersona}
           onExportPersona={handleExportPersona}
           personaActionKey={personaActionKey}

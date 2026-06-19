@@ -31,7 +31,6 @@ import { AddAgentToChannelDialog } from "@/features/agents/ui/AddAgentToChannelD
 import { useActiveAgentTurnsBridge } from "@/features/agents/activeAgentTurnsStore";
 import { resolvePersonaRuntime } from "@/features/agents/lib/resolvePersonaRuntime";
 import {
-  deleteManagedAgentWithRules,
   isManagedAgentActive,
   startManagedAgentWithRules,
   stopManagedAgentWithRules,
@@ -63,12 +62,12 @@ import {
   ModelFocusedView,
   ProfileSummaryView,
 } from "@/features/profile/ui/UserProfilePanelSections";
+import { useProfileAgentDeletion } from "@/features/profile/ui/UserProfilePanelDeletion";
 import { useProfileFieldBuckets } from "@/features/profile/ui/UserProfilePanelFields";
 import { UserProfilePersonaDialogs } from "@/features/profile/ui/UserProfilePersonaDialogs";
 import {
   buildPersonaDraftProfile,
   deriveProfileChannels,
-  getRelayAgentChannelIds,
   PROFILE_PANEL_VIEW_TITLES,
   type ProfilePanelView,
   resolveAgentInstruction,
@@ -82,7 +81,6 @@ import { useAgentSession } from "@/shared/context/AgentSessionContext";
 import { useEscapeKey } from "@/shared/hooks/useEscapeKey";
 import { useIsThreadPanelOverlay } from "@/shared/hooks/use-mobile";
 import { THREAD_PANEL_MIN_WIDTH_PX } from "@/shared/hooks/useThreadPanelWidth";
-import { removeChannelMember } from "@/shared/api/tauri";
 import {
   AuxiliaryPanelHeader,
   AuxiliaryPanelHeaderGroup,
@@ -327,21 +325,18 @@ export function UserProfilePanel({
     setEditAgentOpen(true);
   }, [resolvedPersona]);
 
-  const removeAgentFromAllChannels = React.useCallback(
-    async (agentPubkey: string) => {
-      const channelIds = getRelayAgentChannelIds(
-        relayAgentsQuery.data,
-        agentPubkey,
-      );
-      if (channelIds.length === 0) return;
-      await Promise.allSettled(
-        channelIds.map((channelId) =>
-          removeChannelMember(channelId, agentPubkey),
-        ),
-      );
-    },
-    [relayAgentsQuery.data],
-  );
+  const {
+    deleteManagedAgentRecord,
+    deleteManagedAgentsForPersona,
+    removeAgentFromAllChannels,
+  } = useProfileAgentDeletion({
+    channels: channelsQuery.data,
+    deleteManagedAgent: deleteAgentMutation.mutateAsync,
+    managedAgent,
+    managedAgents: managedAgentsQuery.data,
+    presenceLookup: presenceQuery.data,
+    relayAgents: relayAgentsQuery.data,
+  });
 
   const handleAgentPrimaryAction = React.useCallback(async () => {
     if (!managedAgent) return;
@@ -480,16 +475,9 @@ export function UserProfilePanel({
     if (!managedAgent) return;
 
     try {
-      const result = await deleteManagedAgentWithRules({
-        agent: managedAgent,
-        channels: channelsQuery.data ?? [],
-        deleteManagedAgent: deleteAgentMutation.mutateAsync,
-        presenceLookup: presenceQuery.data,
-        relayAgents: relayAgentsQuery.data ?? [],
-      });
+      const result = await deleteManagedAgentRecord(managedAgent);
       if (result.cancelled) return;
 
-      await removeAgentFromAllChannels(managedAgent.pubkey);
       toast.success(`Deleted ${managedAgent.name}.`);
       onClose();
     } catch (error) {
@@ -497,15 +485,7 @@ export function UserProfilePanel({
         error instanceof Error ? error.message : "Failed to delete agent.",
       );
     }
-  }, [
-    channelsQuery.data,
-    deleteAgentMutation.mutateAsync,
-    managedAgent,
-    onClose,
-    presenceQuery.data,
-    relayAgentsQuery.data,
-    removeAgentFromAllChannels,
-  ]);
+  }, [deleteManagedAgentRecord, managedAgent, onClose]);
 
   const handleSubmitPersona = React.useCallback(
     async (input: CreatePersonaInput | UpdatePersonaInput) => {
@@ -563,6 +543,10 @@ export function UserProfilePanel({
 
     if (resolvedPersona.isBuiltIn) {
       try {
+        const deletedInstances =
+          await deleteManagedAgentsForPersona(resolvedPersona);
+        if (!deletedInstances) return;
+
         await setPersonaActiveMutation.mutateAsync({
           id: resolvedPersona.id,
           active: false,
@@ -583,11 +567,20 @@ export function UserProfilePanel({
     }
 
     setPersonaToDelete(resolvedPersona);
-  }, [onClose, resolvedPersona, setPersonaActiveMutation.mutateAsync]);
+  }, [
+    deleteManagedAgentsForPersona,
+    onClose,
+    resolvedPersona,
+    setPersonaActiveMutation.mutateAsync,
+  ]);
 
   const handleConfirmDeletePersona = React.useCallback(
     async (personaToConfirm: AgentPersona) => {
       try {
+        const deletedInstances =
+          await deleteManagedAgentsForPersona(personaToConfirm);
+        if (!deletedInstances) return;
+
         await deletePersonaMutation.mutateAsync(personaToConfirm.id);
         toast.success(`Deleted ${personaToConfirm.displayName}.`);
         setPersonaToDelete(null);
@@ -598,7 +591,7 @@ export function UserProfilePanel({
         );
       }
     },
-    [deletePersonaMutation.mutateAsync, onClose],
+    [deleteManagedAgentsForPersona, deletePersonaMutation.mutateAsync, onClose],
   );
 
   const handleAddedToChannel = React.useCallback(
