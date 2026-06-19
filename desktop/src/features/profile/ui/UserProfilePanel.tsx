@@ -325,18 +325,15 @@ export function UserProfilePanel({
     setEditAgentOpen(true);
   }, [resolvedPersona]);
 
-  const {
-    deleteManagedAgentRecord,
-    deleteManagedAgentsForPersona,
-    removeAgentFromAllChannels,
-  } = useProfileAgentDeletion({
-    channels: channelsQuery.data,
-    deleteManagedAgent: deleteAgentMutation.mutateAsync,
-    managedAgent,
-    managedAgents: managedAgentsQuery.data,
-    presenceLookup: presenceQuery.data,
-    relayAgents: relayAgentsQuery.data,
-  });
+  const { deleteManagedAgentRecord, deleteManagedAgentsForPersona } =
+    useProfileAgentDeletion({
+      channels: channelsQuery.data,
+      deleteManagedAgent: deleteAgentMutation.mutateAsync,
+      managedAgent,
+      managedAgents: managedAgentsQuery.data,
+      presenceLookup: presenceQuery.data,
+      relayAgents: relayAgentsQuery.data,
+    });
 
   const handleAgentPrimaryAction = React.useCallback(async () => {
     if (!managedAgent) return;
@@ -349,15 +346,6 @@ export function UserProfilePanel({
           relayAgents: relayAgentsQuery.data ?? [],
           stopManagedAgent: stopAgentMutation.mutateAsync,
         });
-        if (managedAgent.backend.type === "local") {
-          await deleteAgentMutation.mutateAsync({
-            pubkey: managedAgent.pubkey,
-          });
-          await removeAgentFromAllChannels(managedAgent.pubkey);
-          void managedAgentsQuery.refetch();
-          void relayAgentsQuery.refetch();
-          return;
-        }
         toast.success(result.noticeMessage ?? `Stopped ${managedAgent.name}.`);
         return;
       }
@@ -378,12 +366,8 @@ export function UserProfilePanel({
     }
   }, [
     channelsQuery.data,
-    deleteAgentMutation.mutateAsync,
     managedAgent,
-    managedAgentsQuery.refetch,
     relayAgentsQuery.data,
-    relayAgentsQuery.refetch,
-    removeAgentFromAllChannels,
     startAgentMutation.mutateAsync,
     stopAgentMutation.mutateAsync,
   ]);

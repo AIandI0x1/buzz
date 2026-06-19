@@ -156,10 +156,7 @@ export function useManagedAgentActions() {
     try {
       const agent = managedAgents.find((a) => a.pubkey === pubkey);
       if (!agent) return;
-      const result = await stopAndRemoveLocalAgent(agent);
-      if (agent.backend.type === "local" && logAgentPubkey === pubkey) {
-        setLogAgentPubkey(null);
-      }
+      const result = await stopManagedAgent(agent);
       if (result.noticeMessage) {
         setActionNoticeMessage(result.noticeMessage);
       }
@@ -283,7 +280,7 @@ export function useManagedAgentActions() {
       targets,
       "Stop",
       "stop",
-      stopAndRemoveLocalAgent,
+      stopManagedAgent,
     );
     if (
       executed &&
@@ -327,18 +324,13 @@ export function useManagedAgentActions() {
     });
   }
 
-  async function stopAndRemoveLocalAgent(agent: ManagedAgent) {
-    const result = await stopManagedAgentWithRules({
+  async function stopManagedAgent(agent: ManagedAgent) {
+    return stopManagedAgentWithRules({
       agent,
       channels: channelsQuery.data ?? [],
       relayAgents: relayAgentsQuery.data ?? [],
       stopManagedAgent: stopMutation.mutateAsync,
     });
-    if (agent.backend.type === "local") {
-      await deleteManagedAgent(agent);
-      await removeAgentFromAllChannels(agent.pubkey);
-    }
-    return result;
   }
 
   const isPending =

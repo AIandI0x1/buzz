@@ -1074,7 +1074,10 @@ test("clicking author name opens user profile panel", async ({ page }) => {
   // Click now opens the full profile panel instead of the popover
   const panel = page.getByTestId("user-profile-panel");
   await expect(panel).toBeVisible();
-  await expect(panel).toContainText("deadbeef");
+  await expect(panel).toContainText("npub1mock...");
+  await expect(
+    panel.getByTestId("user-profile-agent-info-ingress"),
+  ).toBeVisible();
 });
 
 test("hovering avatar opens popover, clicking opens profile panel", async ({

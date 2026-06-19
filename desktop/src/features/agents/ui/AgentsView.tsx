@@ -111,6 +111,9 @@ export function AgentsView() {
               onExport={teamActions.handleExportTeam}
               onSync={teamActions.handleSyncTeam}
               onRevealInFinder={teamActions.handleRevealInFinder}
+              onImportTeamFile={(fileBytes, fileName) => {
+                void teamActions.handleImportFile(fileBytes, fileName);
+              }}
               onAddToChannel={teamActions.setTeamToAddToChannel}
               personas={personas.libraryPersonas}
               teams={teamActions.teams}
@@ -169,10 +172,7 @@ export function AgentsView() {
         isImportPending={
           personas.personaImportActions.isApplyingPersonaImportUpdate
         }
-        isPending={
-          personas.createPersonaMutation.isPending ||
-          personas.updatePersonaMutation.isPending
-        }
+        isPending={personas.isPending}
         runtimes={personas.acpRuntimesQuery.data ?? []}
         runtimesLoading={personas.acpRuntimesQuery.isLoading}
         onImportUpdateFile={

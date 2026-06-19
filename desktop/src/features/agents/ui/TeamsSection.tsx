@@ -11,6 +11,7 @@ import {
 
 import { resolveTeamPersonas } from "@/features/agents/lib/teamPersonas";
 import type { AgentPersona, AgentTeam } from "@/shared/api/types";
+import { useFileImportZone } from "@/shared/hooks/useFileImportZone";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -40,6 +41,7 @@ type TeamsSectionProps = {
   onAddToChannel: (team: AgentTeam) => void;
   onSync: (team: AgentTeam) => void;
   onRevealInFinder: (team: AgentTeam) => void;
+  onImportTeamFile: (fileBytes: number[], fileName: string) => void;
 };
 
 export function TeamsSection({
@@ -56,9 +58,37 @@ export function TeamsSection({
   onAddToChannel,
   onSync,
   onRevealInFinder,
+  onImportTeamFile,
 }: TeamsSectionProps) {
+  const {
+    fileInputRef,
+    isDragOver,
+    dropHandlers,
+    handleFileChange,
+    openFilePicker,
+  } = useFileImportZone({ onImportFile: onImportTeamFile });
+
   return (
-    <section className="space-y-4" data-testid="agents-library-teams">
+    <section
+      className="relative space-y-4"
+      data-testid="agents-library-teams"
+      {...dropHandlers}
+    >
+      {isDragOver ? (
+        <div className="pointer-events-none absolute -inset-1 z-10 flex items-center justify-center rounded-2xl border-2 border-dashed border-primary/50 bg-background/80 backdrop-blur-sm">
+          <p className="text-sm font-medium text-primary">
+            Drop .team.json or .zip to import
+          </p>
+        </div>
+      ) : null}
+      <input
+        accept=".json,.zip"
+        className="hidden"
+        onChange={handleFileChange}
+        ref={fileInputRef}
+        type="file"
+      />
+
       <div
         className={`${TEAM_CARD_COLUMN_CLASS} flex items-center justify-between gap-3`}
       >
@@ -196,11 +226,10 @@ export function TeamsSection({
               </TeamIdentityCard>
             );
           })}
-          <CreateIdentityCard
-            ariaLabel="Create team"
-            dataTestId="new-team-card"
-            label="New team"
-            onClick={onCreate}
+          <NewTeamCard
+            isPending={isPending}
+            onCreate={onCreate}
+            onImport={openFilePicker}
           />
         </div>
       ) : null}
@@ -213,5 +242,38 @@ export function TeamsSection({
         </p>
       ) : null}
     </section>
+  );
+}
+
+function NewTeamCard({
+  isPending,
+  onCreate,
+  onImport,
+}: {
+  isPending: boolean;
+  onCreate: () => void;
+  onImport: () => void;
+}) {
+  return (
+    <DropdownMenu modal={false}>
+      <DropdownMenuTrigger asChild>
+        <CreateIdentityCard
+          ariaLabel="New team"
+          dataTestId="new-team-card"
+          label="New team"
+        />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent
+        align="start"
+        onCloseAutoFocus={(event) => event.preventDefault()}
+      >
+        <DropdownMenuItem disabled={isPending} onClick={onCreate}>
+          Create team
+        </DropdownMenuItem>
+        <DropdownMenuItem disabled={isPending} onClick={onImport}>
+          Import team file
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }

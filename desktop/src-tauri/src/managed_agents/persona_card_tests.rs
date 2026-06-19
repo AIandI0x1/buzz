@@ -1,4 +1,3 @@
-
 use super::*;
 use png::{BitDepth, ColorType, Encoder};
 use std::io::Write;
