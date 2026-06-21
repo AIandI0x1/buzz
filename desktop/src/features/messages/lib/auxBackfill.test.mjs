@@ -6,6 +6,8 @@ import {
   collectMessageIdsForAuxBackfill,
   mergeAuxEventsWithDeletionBackfill,
 } from "./auxBackfill.ts";
+import { formatTimelineMessages } from "./formatTimelineMessages.ts";
+import { buildChannelAuxFilter } from "@/shared/api/relayChannelFilters.ts";
 
 const CHANNEL_ID = "36411e44-0e2d-4cfe-bd6e-567eb169db9f";
 
@@ -124,5 +126,84 @@ test("merges deletion markers that target cached or fetched auxiliary event ids"
   assert.deepEqual(
     merged.map((cachedEvent) => cachedEvent.id),
     [fetchedReactionId, cachedReactionDeletionId, fetchedReactionDeletionId],
+  );
+});
+
+// Regression for the "duplicate: reaction already exists" report: a reaction
+// older than the content-kinds history window never rendered, because the old
+// single-filter history fetch (all CHANNEL_EVENT_KINDS under one `limit`) let
+// reactions/deletions evict older reactions from the window. The fix (#1153)
+// fetches history with content kinds only and backfills reactions by `#e`
+// reference over the loaded message ids — recency-independent. This test pins
+// that path end-to-end: a loaded message whose only reaction is NOT in the
+// history window still renders that reaction after the `#e` backfill.
+//
+// Would fail pre-#1153: the reaction was never fetched, so the message
+// rendered with no reactions and re-reacting hit the relay's duplicate guard.
+test("old reaction outside the history window is backfilled by #e and renders", async () => {
+  const messageId = hex("1");
+  const reactionId = hex("2");
+  const currentUser = hex("c");
+
+  // The cold-load history window: the message, but NOT its (older) reaction.
+  const history = [
+    event(messageId, 9, {
+      pubkey: hex("a"),
+      content: "ship it?",
+      created_at: 1_700_001_000,
+    }),
+  ];
+
+  // Step 1: backfill keys off the loaded content message ids.
+  const messageIds = collectMessageIdsForAuxBackfill(history);
+  assert.deepEqual(messageIds, [messageId]);
+
+  // Step 2: the aux filter references those ids by `#e`, with no time window —
+  // so an old reaction is reachable regardless of when it was created.
+  const auxFilter = buildChannelAuxFilter(CHANNEL_ID, messageIds);
+  assert.deepEqual(auxFilter["#e"], [messageId]);
+  assert.equal("since" in auxFilter, false);
+  assert.equal("until" in auxFilter, false);
+
+  // Step 3: the relay returns the old reaction for that `#e` filter. Its
+  // created_at predates the loaded message — the exact case the old window
+  // dropped.
+  const oldReaction = event(reactionId, 7, {
+    pubkey: currentUser,
+    content: "✅",
+    created_at: 1_700_000_000,
+    tags: [["e", messageId]],
+  });
+
+  const merged = await mergeAuxEventsWithDeletionBackfill({
+    channelId: CHANNEL_ID,
+    cachedEvents: history,
+    fetchedAuxEvents: [oldReaction],
+    // No deletions target the reaction.
+    fetchAuxEventsForMessages: async () => [],
+  });
+  assert.deepEqual(
+    merged.map((e) => e.id),
+    [reactionId],
+  );
+
+  // Step 4: the reaction merged into the timeline renders on its target
+  // message, attributed to the current user (so the UI shows it as already
+  // reacted and won't prompt a duplicate add).
+  const timeline = formatTimelineMessages(
+    [...history, ...merged],
+    null,
+    currentUser,
+    null,
+  );
+  const row = timeline.find((m) => m.id === messageId);
+  assert.ok(row, "loaded message should render a timeline row");
+  assert.deepEqual(
+    row.reactions?.map((r) => ({
+      emoji: r.emoji,
+      count: r.count,
+      mine: r.reactedByCurrentUser,
+    })),
+    [{ emoji: "✅", count: 1, mine: true }],
   );
 });
