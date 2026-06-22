@@ -38,6 +38,21 @@ export const PROFILE_PANEL_VIEW_TITLES: Record<ProfilePanelView, string> = {
   logs: "Harness log",
 };
 
+const PROFILE_PANEL_VIEWS = new Set<ProfilePanelView>(
+  Object.keys(PROFILE_PANEL_VIEW_TITLES) as ProfilePanelView[],
+);
+
+export function parseProfilePanelView(value: unknown): ProfilePanelView | null {
+  return typeof value === "string" &&
+    PROFILE_PANEL_VIEWS.has(value as ProfilePanelView)
+    ? (value as ProfilePanelView)
+    : null;
+}
+
+export function profilePanelViewFromSearch(value: unknown): ProfilePanelView {
+  return parseProfilePanelView(value) ?? "summary";
+}
+
 export type UserProfilePanelProps = {
   canResetWidth?: boolean;
   currentPubkey?: string;

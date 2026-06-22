@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { personaManagedAgentUpdate } from "./UserProfilePanelUtils.ts";
+import {
+  parseProfilePanelView,
+  personaManagedAgentUpdate,
+  profilePanelViewFromSearch,
+} from "./UserProfilePanelUtils.ts";
 
 function agent(overrides = {}) {
   return {
@@ -147,4 +151,26 @@ test("personaManagedAgentUpdate leaves runtime fields alone when runtime is unch
     ),
     null,
   );
+});
+
+test("parseProfilePanelView accepts all profile panel subviews", () => {
+  for (const view of [
+    "summary",
+    "info",
+    "settings",
+    "diagnostics",
+    "model",
+    "instructions",
+    "memories",
+    "channels",
+    "logs",
+  ]) {
+    assert.equal(parseProfilePanelView(view), view);
+  }
+});
+
+test("profilePanelViewFromSearch falls back to summary for invalid values", () => {
+  assert.equal(parseProfilePanelView("missing"), null);
+  assert.equal(profilePanelViewFromSearch("missing"), "summary");
+  assert.equal(profilePanelViewFromSearch(null), "summary");
 });

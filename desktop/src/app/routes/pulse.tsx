@@ -1,6 +1,10 @@
 import * as React from "react";
 import { createFileRoute } from "@tanstack/react-router";
 
+import {
+  parseProfilePanelView,
+  type ProfilePanelView,
+} from "@/features/profile/ui/UserProfilePanelUtils";
 import { usePreviewFeatureWarning } from "@/shared/features";
 import { ViewLoadingFallback } from "@/shared/ui/ViewLoadingFallback";
 
@@ -11,8 +15,15 @@ const PulseScreen = React.lazy(async () => {
 
 type PulseRouteSearch = {
   profile?: string;
-  profileView?: "memories" | "channels";
+  profileView?: Exclude<ProfilePanelView, "summary">;
 };
+
+function profileViewValue(
+  value: unknown,
+): Exclude<ProfilePanelView, "summary"> | undefined {
+  const view = parseProfilePanelView(value);
+  return view && view !== "summary" ? view : undefined;
+}
 
 function validatePulseSearch(
   search: Record<string, unknown>,
@@ -22,10 +33,7 @@ function validatePulseSearch(
       typeof search.profile === "string" && search.profile.length > 0
         ? search.profile
         : undefined,
-    profileView:
-      search.profileView === "memories" || search.profileView === "channels"
-        ? search.profileView
-        : undefined,
+    profileView: profileViewValue(search.profileView),
   };
 }
 

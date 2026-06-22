@@ -1,6 +1,7 @@
 import * as React from "react";
 
 import type { ProfilePanelView } from "@/features/profile/ui/UserProfilePanel";
+import { profilePanelViewFromSearch } from "@/features/profile/ui/UserProfilePanelUtils";
 import {
   type HistorySearchSetterOptions,
   useHistorySearchState,
@@ -33,7 +34,7 @@ const CHANNEL_SEARCH_KEYS = [
 ] as const;
 
 function asProfilePanelView(value: string | null): ProfilePanelView {
-  return value === "memories" || value === "channels" ? value : "summary";
+  return profilePanelViewFromSearch(value);
 }
 
 export function useChannelPanelHistoryState() {
