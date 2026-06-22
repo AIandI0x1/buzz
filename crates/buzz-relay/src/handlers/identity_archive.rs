@@ -248,7 +248,8 @@ async fn verify_owner_consent(
     target_hex: &str,
     actor_hex: &str,
 ) -> Result<(), String> {
-    let request_auth = extract_single_auth_tag_json(event)?;
+    let request_auth = buzz_sdk::nip_oa::extract_single_auth_tag_json(event)
+        .map_err(|e| e.to_string())?;
     let request_owner = verify_auth_tag_owner(&request_auth, target_hex)
         .map_err(|e| format!("invalid request auth tag: {e}"))?;
     if request_owner != actor_hex {
@@ -278,7 +279,8 @@ async fn verify_owner_consent(
         return Err("live kind:0 author did not match target".to_string());
     }
 
-    let live_auth = extract_single_auth_tag_json(&profile.event)?;
+    let live_auth = buzz_sdk::nip_oa::extract_single_auth_tag_json(&profile.event)
+        .map_err(|e| e.to_string())?;
     let live_owner = verify_auth_tag_owner(&live_auth, target_hex)
         .map_err(|e| format!("invalid live kind:0 auth tag: {e}"))?;
     if live_owner != actor_hex {
@@ -286,26 +288,6 @@ async fn verify_owner_consent(
     }
 
     Ok(())
-}
-
-fn extract_single_auth_tag_json(event: &Event) -> Result<String, String> {
-    let mut found: Option<Vec<String>> = None;
-    for tag in event.tags.iter() {
-        let parts = tag.as_slice();
-        if parts.first().map(|s| s.as_str()) != Some("auth") {
-            continue;
-        }
-        if parts.len() != 4 {
-            return Err("auth tag must have exactly four elements".to_string());
-        }
-        if found.is_some() {
-            return Err("multiple auth tags".to_string());
-        }
-        found = Some(parts.iter().map(|s| s.to_string()).collect());
-    }
-
-    let parts = found.ok_or_else(|| "missing auth tag".to_string())?;
-    serde_json::to_string(&parts).map_err(|e| format!("failed to encode auth tag: {e}"))
 }
 
 fn verify_auth_tag_owner(auth_tag_json: &str, target_hex: &str) -> Result<String, String> {

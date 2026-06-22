@@ -23,7 +23,7 @@ use nostr::hashes::sha256::Hash as Sha256Hash;
 use nostr::hashes::Hash;
 use nostr::secp256k1::schnorr::Signature;
 use nostr::secp256k1::Message;
-use nostr::{Keys, PublicKey, Tag, SECP256K1};
+use nostr::{Event, Keys, PublicKey, Tag, SECP256K1};
 use serde_json::Value;
 
 use crate::SdkError;
@@ -300,6 +300,48 @@ pub fn parse_auth_tag(json_str: &str) -> Result<Tag, SdkError> {
 
     Tag::parse(["auth", owner_pubkey_hex, conditions, sig_hex])
         .map_err(|e| SdkError::InvalidInput(format!("failed to construct Tag: {e}")))
+}
+
+/// Extract exactly one well-formed NIP-OA `auth` tag from an event's tag list,
+/// returning it as a JSON-encoded 4-element array string.
+///
+/// This is the shared, strict extractor used by both the relay (event ingress,
+/// observer-frame delivery gate, identity-archive consent) and desktop's
+/// ownership resolution, so they enforce identical structure:
+///
+/// - **Exactly one** `auth` tag must be present (zero or more than one is an error).
+/// - That tag must have **exactly four** elements (`["auth", owner, conditions, sig]`).
+///
+/// No cryptographic verification is performed here — pass the returned JSON to
+/// [`verify_auth_tag`] for that. Keeping extraction and verification separate
+/// lets callers fail fast on malformed input before doing Schnorr work.
+///
+/// # Errors
+///
+/// Returns [`SdkError::InvalidInput`] if there are zero `auth` tags, more than
+/// one `auth` tag, an `auth` tag without exactly four elements, or the result
+/// cannot be JSON-encoded.
+pub fn extract_single_auth_tag_json(event: &Event) -> Result<String, SdkError> {
+    let mut found: Option<Vec<String>> = None;
+    for tag in event.tags.iter() {
+        let parts = tag.as_slice();
+        if parts.first().map(|s| s.as_str()) != Some("auth") {
+            continue;
+        }
+        if parts.len() != 4 {
+            return Err(SdkError::InvalidInput(
+                "auth tag must have exactly four elements".into(),
+            ));
+        }
+        if found.is_some() {
+            return Err(SdkError::InvalidInput("multiple auth tags".into()));
+        }
+        found = Some(parts.iter().map(|s| s.to_string()).collect());
+    }
+
+    let parts = found.ok_or_else(|| SdkError::InvalidInput("missing auth tag".into()))?;
+    serde_json::to_string(&parts)
+        .map_err(|e| SdkError::InvalidInput(format!("failed to encode auth tag: {e}")))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -599,5 +641,74 @@ mod tests {
         let bad =
             serde_json::json!(["auth", OWNER_PUBKEY_HEX, "kind=1&", "a".repeat(128)]).to_string();
         assert!(parse_auth_tag(&bad).is_err());
+    }
+
+    // ── Single auth-tag extraction ────────────────────────────────────────
+
+    use nostr::{EventBuilder, Kind};
+
+    /// Build a signed kind:0 event carrying the given raw tags.
+    fn event_with_tags(tags: Vec<Tag>) -> Event {
+        let keys = Keys::generate();
+        EventBuilder::new(Kind::Custom(0), "{}")
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .expect("event must sign")
+    }
+
+    fn auth_tag(owner: &str, conditions: &str, sig: &str) -> Tag {
+        Tag::parse(["auth", owner, conditions, sig]).expect("auth tag must parse")
+    }
+
+    #[test]
+    fn test_extract_single_auth_tag_happy_path() {
+        let sig = "a".repeat(128);
+        let event = event_with_tags(vec![auth_tag(OWNER_PUBKEY_HEX, "kind=0", &sig)]);
+
+        let json = extract_single_auth_tag_json(&event).expect("exactly one auth tag");
+        let parts: Vec<String> = serde_json::from_str(&json).expect("valid JSON array");
+        assert_eq!(parts, vec!["auth", OWNER_PUBKEY_HEX, "kind=0", &sig]);
+    }
+
+    #[test]
+    fn test_extract_single_auth_tag_ignores_other_tags() {
+        let sig = "b".repeat(128);
+        let event = event_with_tags(vec![
+            Tag::parse(["p", AGENT_PUBKEY_HEX]).unwrap(),
+            auth_tag(OWNER_PUBKEY_HEX, "", &sig),
+            Tag::parse(["t", "hashtag"]).unwrap(),
+        ]);
+
+        let json = extract_single_auth_tag_json(&event).expect("exactly one auth tag");
+        assert!(json.contains(OWNER_PUBKEY_HEX));
+    }
+
+    #[test]
+    fn test_extract_missing_auth_tag_is_error() {
+        let event = event_with_tags(vec![Tag::parse(["p", AGENT_PUBKEY_HEX]).unwrap()]);
+        let err = extract_single_auth_tag_json(&event).expect_err("no auth tag must error");
+        assert!(matches!(err, SdkError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn test_extract_multiple_auth_tags_is_error() {
+        let sig = "c".repeat(128);
+        let event = event_with_tags(vec![
+            auth_tag(OWNER_PUBKEY_HEX, "kind=0", &sig),
+            auth_tag(AGENT_PUBKEY_HEX, "kind=0", &sig),
+        ]);
+        let err =
+            extract_single_auth_tag_json(&event).expect_err("two auth tags must error");
+        assert!(matches!(err, SdkError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn test_extract_wrong_arity_auth_tag_is_error() {
+        // An `auth` tag with three elements (missing signature) must be rejected.
+        let event =
+            event_with_tags(vec![Tag::parse(["auth", OWNER_PUBKEY_HEX, "kind=0"]).unwrap()]);
+        let err = extract_single_auth_tag_json(&event)
+            .expect_err("malformed auth tag arity must error");
+        assert!(matches!(err, SdkError::InvalidInput(_)));
     }
 }
