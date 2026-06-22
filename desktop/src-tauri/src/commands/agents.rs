@@ -910,6 +910,17 @@ fn resolve_legacy_avatar(
         .unwrap_or_default()
 }
 
+fn should_skip_legacy_command_avatar(
+    stored_avatar_was_retired_fizz: bool,
+    relay_picture_was_retired_fizz: bool,
+    persona_avatar: Option<&str>,
+    relay_picture: Option<&str>,
+) -> bool {
+    (stored_avatar_was_retired_fizz || relay_picture_was_retired_fizz)
+        && persona_avatar.is_none()
+        && relay_picture.is_none()
+}
+
 /// Reconcile an agent's kind:0 profile on the relay.
 ///
 /// Queries the relay for the agent's existing profile and re-publishes if missing
@@ -965,14 +976,19 @@ pub(crate) async fn reconcile_agent_profile(
                             .avatar_url
                     }),
                 );
-                let relay_picture = filter_retired_fizz_avatar(
-                    data.persona_id.as_deref(),
-                    existing.as_ref().and_then(|info| info.picture.clone()),
-                );
+                let relay_picture_raw = existing.as_ref().and_then(|info| info.picture.clone());
+                let relay_picture_was_retired_fizz = relay_picture_raw
+                    .as_deref()
+                    .is_some_and(|url| is_retired_fizz_data_url(data.persona_id.as_deref(), url));
+                let relay_picture =
+                    filter_retired_fizz_avatar(data.persona_id.as_deref(), relay_picture_raw);
 
-                let skip_command_fallback = stored_avatar_was_retired_fizz
-                    && persona_avatar.is_none()
-                    && relay_picture.is_none();
+                let skip_command_fallback = should_skip_legacy_command_avatar(
+                    stored_avatar_was_retired_fizz,
+                    relay_picture_was_retired_fizz,
+                    persona_avatar.as_deref(),
+                    relay_picture.as_deref(),
+                );
                 let backfilled = if skip_command_fallback {
                     String::new()
                 } else {
@@ -983,6 +999,7 @@ pub(crate) async fn reconcile_agent_profile(
                 // or clear the retired built-in Fizz data URL if there is no
                 // current profile image to backfill.
                 let should_persist_avatar = stored_avatar_was_retired_fizz
+                    || relay_picture_was_retired_fizz
                     || (!backfilled.is_empty()
                         && data.avatar_url.as_deref() != Some(backfilled.as_str()));
                 if should_persist_avatar {

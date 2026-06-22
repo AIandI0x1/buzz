@@ -196,3 +196,29 @@ fn legacy_avatar_empty_when_nothing_resolves() {
 
     assert!(resolved.is_empty());
 }
+
+#[test]
+fn legacy_avatar_skips_command_icon_for_retired_stored_fizz_avatar() {
+    assert!(should_skip_legacy_command_avatar(true, false, None, None));
+}
+
+#[test]
+fn legacy_avatar_skips_command_icon_for_retired_relay_fizz_avatar() {
+    assert!(should_skip_legacy_command_avatar(false, true, None, None));
+}
+
+#[test]
+fn legacy_avatar_keeps_command_icon_when_retired_fizz_has_current_avatar_source() {
+    assert!(!should_skip_legacy_command_avatar(
+        false,
+        true,
+        Some("https://x/persona.png"),
+        None,
+    ));
+    assert!(!should_skip_legacy_command_avatar(
+        false,
+        true,
+        None,
+        Some("https://x/relay.png"),
+    ));
+}

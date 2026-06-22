@@ -158,7 +158,7 @@ export function ProfileSummaryView({
   const { goChannel } = useAppNavigation();
   const activeTurns = useActiveAgentTurns(isBot ? pubkey : null);
 
-  const showMemoriesIngress = isOwner === true;
+  const showMemoriesIngress = isOwner === true && Boolean(pubkey);
   const showInstructionIngress =
     isOwner === true &&
     (agentInstruction !== null || handleEditPersona !== undefined);
