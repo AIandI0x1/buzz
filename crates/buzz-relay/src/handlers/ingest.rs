@@ -413,12 +413,14 @@ pub(crate) fn requires_h_channel_scope(kind: u32) -> bool {
 /// silently store plaintext — the exact leak the latch exists to prevent.
 ///
 /// This is the content-bearing half of the relay's channel-scoped acceptance
-/// surface (`requires_h_channel_scope`). The two must stay in lockstep: any kind
-/// the relay accepts as channel-scoped is either gated here (free-text body) or
-/// listed as bodyless in the `e2e_drift_guard` test. That guard derives from
-/// `requires_h_channel_scope` and fails if a new channel-scoped kind is added
+/// surface. The `e2e_drift_guard` test derives the full surface directly —
+/// `required_scope_for_kind(..).is_ok() && !is_global_only_kind(..)` — and
+/// asserts every channel-scoped kind lands in exactly one bucket: gated here,
+/// bodyless, or (for kinds that short-circuit before the 15c gate) enforced at
+/// the command path. The guard fails if a new channel-scoped kind is added
 /// without classification, so this list cannot silently drift behind the
-/// acceptance surface (the bug that left 40003-40007 ungated across two passes).
+/// acceptance surface (the bug that left 40003-40007, then the command kinds,
+/// ungated across earlier passes).
 ///
 /// 40004 (pinned) and 40005 (bookmarked) are gated despite having no SDK builder
 /// or relay-side schema: they are named "a stream message that has been
@@ -2339,11 +2341,19 @@ mod tests {
     /// - NIP-29 admin (put/remove user, edit metadata, delete event/group,
     ///   leave request): membership/admin commands, empty or structured content;
     /// - huddle lifecycle (started/joined/left/ended/guidelines): structured
-    ///   session state, no message body.
+    ///   session state, no message body;
+    /// - deletion (kind:5): references targets by `e` tag; any reason text is
+    ///   not channel-display content, and gating would break deletes in a DM;
+    /// - reaction (kind:7): emoji or "+"/"-"; resolves its channel via
+    ///   `derive_reaction_channel`, and gating would break DM reactions;
+    /// - gift wrap (kind:1059): NIP-59 sealed envelope, already ciphertext;
+    /// - NIP-29 create-group (9007) / join-request (9021): channel-lifecycle
+    ///   commands, structured/empty content, no message body.
     ///
     /// This list is the test's accounting of the bodyless half of the
-    /// channel-scoped surface; `e2e_drift_guard` asserts the two halves together
-    /// cover every channel-scoped kind, so a new kind can't slip in unclassified.
+    /// channel-scoped surface; `e2e_drift_guard` asserts every channel-scoped
+    /// kind lands in exactly one classification bucket, so a new kind can't slip
+    /// in unclassified.
     const BODYLESS_CHANNEL_SCOPED_KINDS: &[u32] = &[
         KIND_FORUM_VOTE,
         KIND_NIP29_PUT_USER,
@@ -2357,30 +2367,94 @@ mod tests {
         KIND_HUDDLE_PARTICIPANT_LEFT,
         KIND_HUDDLE_ENDED,
         KIND_HUDDLE_GUIDELINES,
+        KIND_DELETION,
+        KIND_REACTION,
+        KIND_GIFT_WRAP,
+        KIND_NIP29_CREATE_GROUP,
+        KIND_NIP29_JOIN_REQUEST,
     ];
+
+    /// Command kinds whose body carries free text the relay reads in plaintext
+    /// (workflow YAML, trigger JSON inputs, approval note). They short-circuit at
+    /// the `is_command_kind` branch in `handle_event` BEFORE the 15c gate, so
+    /// they CANNOT be E2E-gated there. The latched-channel boundary is enforced
+    /// for them at the command path instead (`enforce_latched_body` /
+    /// `enforce_latched_approval_note` in `command_executor`), via the body-shape
+    /// rule "empty or NIP-44, else reject" — not a per-kind list, so it cannot
+    /// drift.
+    const COMMAND_CONTENT_BEARING_KINDS: &[u32] = &[
+        KIND_WORKFLOW_DEF,
+        KIND_WORKFLOW_TRIGGER,
+        KIND_APPROVAL_GRANT,
+        KIND_APPROVAL_DENY,
+    ];
+
+    /// Command kinds that carry no free-text body — DM management commands keyed
+    /// by tags (member pubkey, channel ref), structured/empty content. They also
+    /// short-circuit before the 15c gate; the command-path body-shape rule admits
+    /// their empty content unchanged, so they are never gated.
+    const COMMAND_EMPTY_BODY_KINDS: &[u32] = &[KIND_DM_OPEN, KIND_DM_ADD_MEMBER, KIND_DM_HIDE];
 
     #[test]
     fn e2e_drift_guard_classifies_every_channel_scoped_kind() {
         // Structural fix for the kind-set-drift bug class: the E2E gate
         // (`is_e2e_enforced_content_kind`) is a hand-written list that ran
-        // parallel to the relay's actual channel-scoped acceptance surface
-        // (`requires_h_channel_scope`) and drifted from it, leaving content kinds
-        // ungated. This guard derives directly from the acceptance surface: every
-        // kind the relay accepts as channel-scoped MUST be classified as either
-        // E2E-gated (carries a free-text body) or explicitly bodyless. Adding a
-        // new arm to `requires_h_channel_scope` without classifying it here fails
-        // this test — so the gate can't silently drift behind the surface again.
+        // parallel to a NARROWER proxy (`requires_h_channel_scope`) than the
+        // relay's actual channel-scoped acceptance surface, and drifted from it —
+        // leaving command content kinds (WORKFLOW_DEF, APPROVAL_*) ungated. This
+        // guard derives directly from the REAL surface: a kind that resolves a
+        // `channel_id` and is accepted (`required_scope_for_kind(..).is_ok()`) and
+        // is not global-only. Every such kind MUST land in exactly one bucket:
+        //   1. 15c-gated (free-text body, reaches the 15c gate);
+        //   2. bodyless (no free-text content);
+        //   3. command content-bearing (free-text body, gated at the command path);
+        //   4. command empty-body (structured command, no body).
+        // Adding a new accepted channel-scoped kind without classifying it here
+        // fails this test — so the gate can't silently drift behind the surface.
+        let dummy = make_dummy_event();
         for kind in 0u32..=50_000 {
-            if !requires_h_channel_scope(kind) {
+            let channel_scoped =
+                required_scope_for_kind(kind, &dummy).is_ok() && !is_global_only_kind(kind);
+            if !channel_scoped {
                 continue;
             }
-            let gated = is_e2e_enforced_content_kind(kind);
-            let bodyless = BODYLESS_CHANNEL_SCOPED_KINDS.contains(&kind);
+            let buckets = [
+                is_e2e_enforced_content_kind(kind),
+                BODYLESS_CHANNEL_SCOPED_KINDS.contains(&kind),
+                COMMAND_CONTENT_BEARING_KINDS.contains(&kind),
+                COMMAND_EMPTY_BODY_KINDS.contains(&kind),
+            ];
+            let matched = buckets.iter().filter(|b| **b).count();
+            assert_eq!(
+                matched, 1,
+                "channel-scoped kind {kind} must land in EXACTLY ONE classification \
+                 bucket [15c-gated, bodyless, command-content-bearing, \
+                 command-empty-body] — matched {matched}: {buckets:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn e2e_drift_guard_command_kinds_partitioned() {
+        // The 7 command kinds partition into content-bearing (latch-enforced at
+        // the command path) XOR empty-body — no overlap, full coverage. This
+        // pins the command-path side of the surface independently of the 15c
+        // gate, which command kinds never reach.
+        for kind in [
+            KIND_WORKFLOW_DEF,
+            KIND_WORKFLOW_TRIGGER,
+            KIND_APPROVAL_GRANT,
+            KIND_APPROVAL_DENY,
+            KIND_DM_OPEN,
+            KIND_DM_ADD_MEMBER,
+            KIND_DM_HIDE,
+        ] {
+            let content = COMMAND_CONTENT_BEARING_KINDS.contains(&kind);
+            let empty = COMMAND_EMPTY_BODY_KINDS.contains(&kind);
             assert!(
-                gated ^ bodyless,
-                "channel-scoped kind {kind} is unclassified: it must be either \
-                 E2E-gated (free-text body) or in BODYLESS_CHANNEL_SCOPED_KINDS, \
-                 and exactly one of the two — got gated={gated}, bodyless={bodyless}"
+                content ^ empty,
+                "command kind {kind} must be exactly one of content-bearing or \
+                 empty-body — got content={content}, empty={empty}"
             );
         }
     }
