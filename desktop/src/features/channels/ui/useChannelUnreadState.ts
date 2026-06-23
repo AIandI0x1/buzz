@@ -206,12 +206,22 @@ export function useChannelUnreadState({
   const threadOpenReadSnapshotRef = React.useRef(
     new Map<string, Map<string, number | null>>(),
   );
-  if (openThreadHeadId && !threadOpenReadSnapshotRef.current.has(openThreadHeadId)) {
-    const snapshot = new Map<string, number | null>();
-    for (const entry of threadMessages) {
-      snapshot.set(entry.message.id, getMessageReadAt(entry.message.id));
+  if (openThreadHeadId) {
+    let snapshot = threadOpenReadSnapshotRef.current.get(openThreadHeadId);
+    if (!snapshot) {
+      snapshot = new Map<string, number | null>();
+      threadOpenReadSnapshotRef.current.set(openThreadHeadId, snapshot);
     }
-    threadOpenReadSnapshotRef.current.set(openThreadHeadId, snapshot);
+    // Capture each reply's read state the first render it becomes visible —
+    // before the on-open mark-read effect advances its marker. Replies revealed
+    // later by expanding a branch are snapshotted then, so the divider anchors
+    // to "what was unread when each reply first appeared," not "what was unread
+    // at the initial open" (which would miss deeper replies revealed on expand).
+    for (const entry of threadMessages) {
+      if (!snapshot.has(entry.message.id)) {
+        snapshot.set(entry.message.id, getMessageReadAt(entry.message.id));
+      }
+    }
   }
   React.useEffect(() => {
     const rootId = openThreadHeadId;
@@ -255,7 +265,10 @@ export function useChannelUnreadState({
   // counts unread replies anywhere beneath it. Expanding a branch marks only
   // its revealed direct children read, so a collapsed grandchild keeps its
   // badge — the per-message marker distinguishes the read parent from the
-  // unread descendant with no separate expanded-subtree gate.
+  // unread descendant with no separate expanded-subtree gate. readStateVersion
+  // is an intentional recompute trigger so the counts re-read after any marker
+  // advances.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: readStateVersion is the intentional recompute trigger
   const threadReplyUnreadCounts = React.useMemo(
     () =>
       openThreadHeadId

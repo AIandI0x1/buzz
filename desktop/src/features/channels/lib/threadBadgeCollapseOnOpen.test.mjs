@@ -111,7 +111,10 @@ test("openThreadWhereOnlyUnreadIsOwnReply_neverShowsBadge", () => {
     msg("b", "a", 200, "ME", "root"),
   ];
   // Nothing revealed (never read), only "other"'s reply a could count.
-  assert.equal(rootBadge(messages, () => null, "me"), 1);
+  assert.equal(
+    rootBadge(messages, () => null, "me"),
+    1,
+  );
   // After revealing a, only the self-authored b remains — no badge.
   assert.equal(
     rootBadge(messages, openMarksRevealed(messages, ["a"]), "me"),
@@ -126,7 +129,10 @@ test("openThreadWhereEveryUnreadIsOwnReply_inertNoBadgeEver", () => {
     msg("a", "root", 100, "ME"),
     msg("b", "a", 200, "ME", "root"),
   ];
-  assert.equal(rootBadge(messages, () => null, "me"), undefined);
+  assert.equal(
+    rootBadge(messages, () => null, "me"),
+    undefined,
+  );
   assert.equal(
     rootBadge(messages, openMarksRevealed(messages, ["a", "b"]), "me"),
     undefined,
