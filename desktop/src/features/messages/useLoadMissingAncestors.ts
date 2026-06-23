@@ -3,6 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 
 import { channelMessagesKey } from "@/features/messages/lib/messageQueryKeys";
 import { mergeMessages } from "@/features/messages/hooks";
+import { makeDmIngestDecryptor } from "@/features/messages/lib/dmCrypto";
 import {
   getChannelIdFromTags,
   getThreadReference,
@@ -78,6 +79,8 @@ export function useLoadMissingAncestors(
 
     let isCancelled = false;
 
+    const decryptIngested = makeDmIngestDecryptor(activeChannel, selfPubkey);
+
     void Promise.all(
       [...missingAncestorIds].map(async (eventId) => {
         try {
@@ -90,9 +93,15 @@ export function useLoadMissingAncestors(
             return;
           }
 
+          // Decrypt before caching: a DM ancestor is a NIP-44 v2 ciphertext
+          // body, so it must route through the same decryptor as every other
+          // ingest site or it lands raw in the rendered bucket (the decryptor
+          // is a no-op outside a 2-party DM, so this is uniform/safe).
+          const [decrypted] = await decryptIngested([event]);
+
           queryClient.setQueryData<RelayEvent[]>(
             channelMessagesKey(activeChannel.id, selfPubkey),
-            (current = []) => mergeMessages(current, event),
+            (current = []) => mergeMessages(current, decrypted),
           );
         } catch (error) {
           console.error("Failed to load ancestor event", eventId, error);
