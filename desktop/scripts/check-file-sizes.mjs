@@ -44,7 +44,7 @@ const overrides = new Map([
   // Option<String> avatar field — a load-bearing state-model fix that closes
   // the clear-vs-backfill ambiguity, not generic debt growth. Approved
   // override; still queued to split with the rest of this list.
-  ["src-tauri/src/managed_agents/types.rs", 1100],
+  ["src-tauri/src/managed_agents/types.rs", 1180],
   ["src-tauri/src/managed_agents/personas.rs", 1080],
   ["src-tauri/src/managed_agents/persona_card.rs", 1050],
   // applyWorkspace reposDir parameter threaded through the Tauri invoke for

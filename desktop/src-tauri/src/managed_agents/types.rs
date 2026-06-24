@@ -834,6 +834,84 @@ mod tests {
         assert_eq!(record.auth_tag, record2.auth_tag);
     }
 
+    // ── AvatarState serde round-trip tests ───────────────────────────────
+    // These exercise all four on-disk cases directly on `AvatarState`, which
+    // is the load-bearing back-compat guarantee: every legacy record must land
+    // on a sane state, and the `Cleared` sentinel must round-trip forever.
+
+    /// A legacy bare-string avatar deserializes as an explicit `Set(url)`.
+    #[test]
+    fn avatar_state_legacy_string_deserializes_as_set() {
+        let state: AvatarState =
+            serde_json::from_str(r#""https://x/avatar.png""#).expect("string should deserialize");
+        assert_eq!(state, AvatarState::Set("https://x/avatar.png".to_string()));
+    }
+
+    /// JSON `null` maps to `Unmigrated`, preserving the legacy backfill path.
+    #[test]
+    fn avatar_state_null_deserializes_as_unmigrated() {
+        let state: AvatarState = serde_json::from_str("null").expect("null should deserialize");
+        assert_eq!(state, AvatarState::Unmigrated);
+    }
+
+    /// An absent field (via `#[serde(default)]` on the struct) yields
+    /// `Unmigrated` — same as `null`. We assert this through a record whose
+    /// `avatar_url` key is omitted entirely.
+    #[test]
+    fn avatar_state_absent_field_defaults_to_unmigrated() {
+        let record: ManagedAgentRecord = serde_json::from_str(
+            r#"{
+                "pubkey": "abcd1234",
+                "name": "test-agent",
+                "private_key_nsec": "nsec1fake",
+                "relay_url": "wss://localhost:3000",
+                "acp_command": "buzz-acp",
+                "agent_command": "goose",
+                "agent_args": [],
+                "mcp_command": "",
+                "turn_timeout_seconds": 320,
+                "system_prompt": null,
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "last_started_at": null,
+                "last_stopped_at": null,
+                "last_exit_code": null,
+                "last_error": null
+            }"#,
+        )
+        .expect("record with absent avatar_url should deserialize");
+        assert_eq!(record.avatar_url, AvatarState::Unmigrated);
+    }
+
+    /// The forward-only case that matters most: `Cleared` serializes to the
+    /// self-describing `{"cleared":true}` sentinel and deserializes back to
+    /// `Cleared`. This is the only thing standing between a future refactor and
+    /// silently breaking the cleared-avatar sentinel.
+    #[test]
+    fn avatar_state_cleared_round_trips_via_sentinel() {
+        let serialized =
+            serde_json::to_string(&AvatarState::Cleared).expect("Cleared should serialize");
+        assert_eq!(serialized, r#"{"cleared":true}"#);
+
+        let back: AvatarState =
+            serde_json::from_str(&serialized).expect("sentinel should deserialize");
+        assert_eq!(back, AvatarState::Cleared);
+    }
+
+    /// `Set` and `Unmigrated` also round-trip cleanly through serialize +
+    /// deserialize, closing the loop on every variant.
+    #[test]
+    fn avatar_state_set_and_unmigrated_round_trip() {
+        for state in [
+            AvatarState::Set("https://x/a.png".to_string()),
+            AvatarState::Unmigrated,
+        ] {
+            let serialized = serde_json::to_string(&state).expect("should serialize");
+            let back: AvatarState = serde_json::from_str(&serialized).expect("should round-trip");
+            assert_eq!(back, state);
+        }
+    }
+
     // ── Inbound author gate tests ────────────────────────────────────────
 
     use super::{validate_respond_to_allowlist, RespondTo};

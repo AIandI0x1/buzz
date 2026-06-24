@@ -170,3 +170,17 @@ fn legacy_avatar_empty_when_nothing_resolves() {
 
     assert!(resolved.is_empty());
 }
+
+/// Invariant: no creation/constructor path can ever produce `AvatarState::Cleared`.
+/// `Cleared` must be reachable ONLY through an explicit user clear via the update
+/// path — if creation could mint it, the mutual-exclusivity guarantee leaks and a
+/// brand-new avatarless agent would be wrongly excluded from relay/persona backfill.
+/// With no input, no persona, and an unknown command (so the command fallback
+/// yields nothing), the result must be `Unmigrated`, never `Cleared`.
+#[test]
+fn created_avatar_never_cleared_without_explicit_clear() {
+    let resolved = resolve_created_avatar_url(None, None, "totally-unknown-command");
+
+    assert_eq!(resolved, AvatarState::Unmigrated);
+    assert_ne!(resolved, AvatarState::Cleared);
+}
