@@ -507,13 +507,21 @@ mod tests {
                 .await
                 .expect("pubsub manager"),
         );
-        let audit = buzz_audit::AuditService::new(pool);
+        let audit = buzz_audit::AuditService::new(pool.clone());
         let auth = buzz_auth::AuthService::new(config.auth.clone());
-        let search = buzz_search::SearchService::new(buzz_search::SearchConfig {
-            url: config.typesense_url.clone(),
-            api_key: config.typesense_key.clone(),
-            collection: "events".to_string(),
-        });
+        let search = match config.search_backend {
+            buzz_search::SearchBackend::Typesense => {
+                buzz_search::SearchService::new(buzz_search::SearchConfig {
+                    url: config.typesense_url.clone(),
+                    api_key: config.typesense_key.clone(),
+                    collection: "events".to_string(),
+                })
+            }
+            buzz_search::SearchBackend::Postgres => {
+                buzz_search::SearchService::with_postgres(pool.clone())
+            }
+            buzz_search::SearchBackend::Disabled => buzz_search::SearchService::disabled(),
+        };
         let workflow_engine = std::sync::Arc::new(buzz_workflow::WorkflowEngine::new(
             db.clone(),
             buzz_workflow::WorkflowConfig::default(),

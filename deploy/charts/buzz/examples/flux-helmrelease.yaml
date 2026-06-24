@@ -37,9 +37,8 @@ spec:
     secrets:
       existingSecret: buzz-secrets
 
-    typesense:
-      url: "http://typesense.buzz.svc.cluster.local:8108"
-      # apiKey lives in buzz-secrets
+    search:
+      backend: postgres
 
     s3:
       endpoint: "https://s3.us-east-1.amazonaws.com"

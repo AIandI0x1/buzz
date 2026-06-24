@@ -8,14 +8,12 @@ templates:
   - templates/service.yaml
   - templates/pvc-git.yaml
 tests:
-  - it: renders cleanly in production profile (external pg/redis/typesense)
+  - it: renders cleanly in production profile (external pg/redis/s3, postgres search)
     set:
       relayUrl: wss://buzz.example.com
       ownerPubkey: "0000000000000000000000000000000000000000000000000000000000000000"
       externalPostgresql.url: postgres://u:p@h:5432/d
       externalRedis.url: redis://h:6379
-      typesense.url: http://ts:8108
-      typesense.apiKey: k
       s3.endpoint: http://minio:9000
       s3.accessKey: a
       s3.secretKey: s
@@ -39,8 +37,6 @@ tests:
       ownerPubkey: "0000000000000000000000000000000000000000000000000000000000000000"
       externalPostgresql.url: postgres://u:p@h:5432/d
       externalRedis.url: redis://h:6379
-      typesense.url: http://ts:8108
-      typesense.apiKey: k
       s3.endpoint: http://minio:9000
       s3.accessKey: a
       s3.secretKey: s
@@ -55,3 +51,56 @@ tests:
           path: spec.accessModes[0]
           value: ReadWriteMany
         template: templates/pvc-git.yaml
+
+  - it: postgres backend does not require a Typesense source
+    set:
+      relayUrl: wss://buzz.example.com
+      ownerPubkey: "0000000000000000000000000000000000000000000000000000000000000000"
+      externalPostgresql.url: postgres://u:p@h:5432/d
+      s3.endpoint: http://minio:9000
+      s3.accessKey: a
+      s3.secretKey: s
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: BUZZ_SEARCH_BACKEND
+            value: "postgres"
+        template: templates/deployment.yaml
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: TYPESENSE_URL
+        template: templates/deployment.yaml
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: TYPESENSE_API_KEY
+        template: templates/deployment.yaml
+
+  - it: disabled backend does not require a Typesense source
+    set:
+      relayUrl: wss://buzz.example.com
+      ownerPubkey: "0000000000000000000000000000000000000000000000000000000000000000"
+      externalPostgresql.url: postgres://u:p@h:5432/d
+      search.backend: disabled
+      s3.endpoint: http://minio:9000
+      s3.accessKey: a
+      s3.secretKey: s
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: BUZZ_SEARCH_BACKEND
+            value: "disabled"
+        template: templates/deployment.yaml
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: TYPESENSE_URL
+        template: templates/deployment.yaml
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: TYPESENSE_API_KEY
+        template: templates/deployment.yaml

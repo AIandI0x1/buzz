@@ -4,7 +4,7 @@ single replica, no TLS, API key from the chart-managed Secret. Production
 deploys leave typesense.enabled=false and point typesense.url/apiKey (or
 secrets.existingSecret) at a managed Typesense service.
 */ -}}
-{{- if .Values.typesense.enabled -}}
+{{- if and .Values.typesense.enabled (eq (include "buzz.searchBackend" .) "typesense") -}}
 {{- if .Values.secrets.existingSecret -}}
 {{- fail "typesense.enabled=true (quickstart) is incompatible with secrets.existingSecret. Quickstart autogenerates the Typesense key in the chart-managed Secret; for external Typesense set typesense.enabled=false and provide TYPESENSE_URL/TYPESENSE_API_KEY." -}}
 {{- end -}}

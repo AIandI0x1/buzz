@@ -50,9 +50,9 @@ surface at template time regardless of which manifest helm renders first.
   {{- fail "Postgres source missing: enable postgresql.enabled=true, set externalPostgresql.url, or provide secrets.existingSecret with key DATABASE_URL." -}}
 {{- end -}}
 
-{{/* Typesense source must exist somewhere */}}
-{{- if not (or .Values.typesense.enabled .Values.typesense.url .Values.secrets.existingSecret) -}}
-  {{- fail "Typesense source missing: enable typesense.enabled=true (quickstart in-cluster), set typesense.url + typesense.apiKey, or provide secrets.existingSecret with keys TYPESENSE_URL + TYPESENSE_API_KEY." -}}
+{{/* Typesense source is required only when search.backend=typesense. */}}
+{{- if and (eq (include "buzz.searchBackend" .) "typesense") (not (or .Values.typesense.enabled .Values.typesense.url .Values.secrets.existingSecret)) -}}
+  {{- fail "Typesense source missing for search.backend=typesense: enable typesense.enabled=true (quickstart in-cluster), set typesense.url + typesense.apiKey, or provide secrets.existingSecret with keys TYPESENSE_URL + TYPESENSE_API_KEY." -}}
 {{- end -}}
 
 {{/* S3 / object-storage source must exist somewhere (relay hard-fails its

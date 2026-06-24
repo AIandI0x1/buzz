@@ -162,6 +162,13 @@
         "url": { "type": "string", "pattern": "^(rediss?://.+)?$" }
       }
     },
+    "search": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "backend": { "type": "string", "enum": ["postgres", "typesense", "disabled"] }
+      }
+    },
     "typesense": {
       "type": "object",
       "additionalProperties": false,

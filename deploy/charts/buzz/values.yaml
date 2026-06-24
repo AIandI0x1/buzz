@@ -6,11 +6,11 @@
 #   refs everywhere, no chart-side autogeneration, GitOps-safe (ArgoCD/Flux).
 #   HA-ready: replicaCount >= 2 (requires Redis and RWX storage for git).
 #
-#   QUICKSTART — bundles in-cluster Postgres + Redis + MinIO + Typesense and
-#   auto-generates relay secrets via the `lookup` pattern (NOT GitOps-safe —
-#   see README), single replica, evaluation only. Opt in by enabling each
-#   bundled service: postgresql.enabled, redis.enabled, minio.enabled,
-#   typesense.enabled. See ci/quickstart-values.yaml and the README.
+#   QUICKSTART — bundles in-cluster Postgres + Redis + MinIO and auto-generates
+#   relay secrets via the `lookup` pattern (NOT GitOps-safe — see README),
+#   single replica, evaluation only. Opt in by enabling each bundled service:
+#   postgresql.enabled, redis.enabled, minio.enabled. Typesense is optional only
+#   when search.backend=typesense. See ci/quickstart-values.yaml and the README.
 #
 # See examples/argocd-app.yaml and examples/flux-helmrelease.yaml for the
 # canonical GitOps configurations.
@@ -56,8 +56,8 @@ ownerPubkey: ""
 #   BUZZ_GIT_HOOK_HMAC_SECRET     — 32+ chars; required when replicaCount > 1
 #   DATABASE_URL                  — full Postgres URL (preferred over externalPostgresql.url)
 #   REDIS_URL                     — full Redis URL with auth
-#   TYPESENSE_URL                 — Typesense base URL
-#   TYPESENSE_API_KEY             — Typesense API key
+#   TYPESENSE_URL                 — Typesense base URL (only when search.backend=typesense)
+#   TYPESENSE_API_KEY             — Typesense API key (only when search.backend=typesense)
 #   BUZZ_S3_ACCESS_KEY            — S3 access key
 #   BUZZ_S3_SECRET_KEY            — S3 secret key
 secrets:
@@ -210,6 +210,13 @@ redis:
     size: 4Gi
 externalRedis:
   url: ""                        # redis://:pass@host:6379
+
+# ── Search ───────────────────────────────────────────────────────────────────
+# Postgres FTS is the default. Set backend=typesense only while using the
+# fallback Typesense index; set backend=disabled to fail NIP-50 search closed
+# (queries return no hits, without weakening auth/channel filtering).
+search:
+  backend: postgres               # postgres | typesense | disabled
 
 # ── Typesense ────────────────────────────────────────────────────────────────
 # Production: point url/apiKey at an external Typesense service (or supply

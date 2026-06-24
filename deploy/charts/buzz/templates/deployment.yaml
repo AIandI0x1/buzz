@@ -1,4 +1,5 @@
 {{- include "buzz.validate" . -}}
+{{- $searchBackend := include "buzz.searchBackend" . -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -80,6 +81,7 @@ spec:
             - { name: BUZZ_REQUIRE_RELAY_MEMBERSHIP, value: {{ .Values.relay.requireRelayMembership | quote }} }
             - { name: BUZZ_ALLOW_NIP_OA_AUTH,      value: {{ .Values.relay.allowNipOaAuth | quote }} }
             - { name: BUZZ_PUBKEY_ALLOWLIST,       value: {{ .Values.relay.pubkeyAllowlist | quote }} }
+            - { name: BUZZ_SEARCH_BACKEND, value: {{ $searchBackend | quote }} }
             {{- if .Values.relay.corsOrigins }}
             - { name: BUZZ_CORS_ORIGINS, value: {{ join "," .Values.relay.corsOrigins | quote }} }
             {{- end }}
@@ -130,6 +132,7 @@ spec:
                   name: {{ include "buzz.envSecretName" . }}
                   key: REDIS_URL
                   optional: {{ and (eq (.Values.replicaCount | int) 1) (not .Values.redis.enabled) (not .Values.externalRedis.url) }}
+            {{- if eq $searchBackend "typesense" }}
             - name: TYPESENSE_URL
               valueFrom:
                 secretKeyRef:
@@ -140,6 +143,7 @@ spec:
                 secretKeyRef:
                   name: {{ include "buzz.envSecretName" . }}
                   key: TYPESENSE_API_KEY
+            {{- end }}
             - name: BUZZ_S3_ACCESS_KEY
               valueFrom:
                 secretKeyRef:

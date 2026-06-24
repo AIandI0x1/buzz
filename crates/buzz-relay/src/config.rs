@@ -159,7 +159,7 @@ impl Config {
                     "BUZZ_SEARCH_BACKEND={bad:?} (expected `typesense`, `postgres`, or `disabled`)"
                 ))
             })?,
-            Err(_) => buzz_search::SearchBackend::Typesense,
+            Err(_) => buzz_search::SearchBackend::Postgres,
         };
 
         let relay_url =
@@ -562,16 +562,20 @@ mod tests {
     }
 
     #[test]
-    fn search_backend_defaults_to_typesense() {
+    fn search_backend_defaults_to_postgres() {
         let _guard = ENV_MUTEX.lock().unwrap();
         std::env::remove_var("BUZZ_SEARCH_BACKEND");
         let config = Config::from_env().expect("default config");
-        assert_eq!(config.search_backend, buzz_search::SearchBackend::Typesense);
+        assert_eq!(config.search_backend, buzz_search::SearchBackend::Postgres);
     }
 
     #[test]
-    fn search_backend_parses_postgres_and_disabled() {
+    fn search_backend_parses_typesense_postgres_and_disabled() {
         let _guard = ENV_MUTEX.lock().unwrap();
+
+        std::env::set_var("BUZZ_SEARCH_BACKEND", "typesense");
+        let config = Config::from_env().expect("config");
+        assert_eq!(config.search_backend, buzz_search::SearchBackend::Typesense);
 
         std::env::set_var("BUZZ_SEARCH_BACKEND", "postgres");
         let config = Config::from_env().expect("config");

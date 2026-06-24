@@ -1,6 +1,6 @@
 suite: quickstart bundled services
-# The dev quickstart must stand up MinIO + Typesense in-cluster so the relay's
-# startup S3 conformance probe passes with zero external dependencies.
+# The dev quickstart must stand up MinIO in-cluster so the relay's startup S3
+# conformance probe passes. Typesense is only bundled when search.backend=typesense.
 templates:
   - templates/quickstart-minio.yaml
   - templates/quickstart-minio-init.yaml
@@ -17,6 +17,7 @@ tests:
       ownerPubkey: "0000000000000000000000000000000000000000000000000000000000000000"
       postgresql.enabled: true
       redis.enabled: true
+      search.backend: typesense
       typesense.enabled: true
       minio.enabled: true
     asserts:
@@ -40,6 +41,7 @@ tests:
       ownerPubkey: "0000000000000000000000000000000000000000000000000000000000000000"
       postgresql.enabled: true
       redis.enabled: true
+      search.backend: typesense
       typesense.enabled: true
       minio.enabled: true
     asserts:
@@ -58,6 +60,7 @@ tests:
       ownerPubkey: "0000000000000000000000000000000000000000000000000000000000000000"
       postgresql.enabled: true
       redis.enabled: true
+      search.backend: typesense
       typesense.enabled: true
       minio.enabled: true
     asserts:
@@ -76,6 +79,7 @@ tests:
       ownerPubkey: "0000000000000000000000000000000000000000000000000000000000000000"
       postgresql.enabled: true
       redis.enabled: true
+      search.backend: typesense
       typesense.enabled: true
       minio.enabled: true
     asserts:
@@ -103,6 +107,7 @@ tests:
       ownerPubkey: "0000000000000000000000000000000000000000000000000000000000000000"
       postgresql.enabled: true
       redis.enabled: true
+      search.backend: typesense
       typesense.enabled: true
       minio.enabled: true
     asserts:

@@ -116,6 +116,12 @@ secrets.existingSecret, use that. Otherwise use the chart-managed one.
 {{- end -}}
 {{- end -}}
 
+{{/* Search backend flag. Defaults to Postgres FTS; Typesense remains opt-in fallback. */}}
+{{- define "buzz.searchBackend" -}}
+{{- $search := default dict .Values.search -}}
+{{- default "postgres" $search.backend -}}
+{{- end -}}
+
 {{/* In-cluster Typesense URL, used when typesense.enabled and url unset. */}}
 {{- define "buzz.typesenseUrl" -}}
 {{- if .Values.typesense.url -}}
