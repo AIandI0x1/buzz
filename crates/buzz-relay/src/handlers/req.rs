@@ -277,27 +277,23 @@ const MAX_SEARCH_PAGES: u32 = 10;
 pub(crate) fn build_search_channel_scope_filter(
     accessible_channels: &[uuid::Uuid],
     include_global: bool,
-) -> Option<String> {
+) -> Option<Vec<String>> {
     if accessible_channels.is_empty() {
         return if include_global {
-            Some("channel_id:=__global__".to_string())
+            Some(vec![buzz_search::GLOBAL_CHANNEL_SENTINEL.to_string()])
         } else {
             None
         };
     }
 
-    let ids: Vec<String> = accessible_channels
+    let mut ids: Vec<String> = accessible_channels
         .iter()
         .map(|id| id.to_string())
         .collect();
-    Some(if include_global {
-        format!(
-            "(channel_id:=[{}] || channel_id:=__global__)",
-            ids.join(",")
-        )
-    } else {
-        format!("channel_id:=[{}]", ids.join(","))
-    })
+    if include_global {
+        ids.push(buzz_search::GLOBAL_CHANNEL_SENTINEL.to_string());
+    }
+    Some(ids)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -337,17 +333,17 @@ async fn handle_search_req(
             continue; // NIP-01: limit 0 means "no results from this filter"
         }
 
-        // Push as many NIP-01 constraints into Typesense as possible so
-        // post-filtering is a correction step, not the primary filter.
+        // Push as many NIP-01 constraints into the search backend as possible
+        // so post-filtering is a correction step, not the primary filter.
         //
-        // If the filter has a #h tag, push the specific channel(s) into Typesense
-        // instead of the full accessible set. This prevents cross-channel hits from
-        // consuming pagination budget and causing under-fetch.
-        // If the filter has #h, intersect with accessible channels. If all #h
-        // values are invalid/inaccessible, skip the filter entirely (match nothing)
-        // rather than broadening to all channels.
+        // If the filter has a #h tag, push the specific channel(s) into the
+        // search instead of the full accessible set. This prevents
+        // cross-channel hits from consuming pagination budget and causing
+        // under-fetch. If all #h values are invalid/inaccessible, skip the
+        // filter entirely (match nothing) rather than broadening to all
+        // channels.
         let h_tag = nostr::SingleLetterTag::lowercase(nostr::Alphabet::H);
-        let channel_scope =
+        let channel_scope: Vec<String> =
             if let Some(vs) = filter.generic_tags.get(&h_tag).filter(|vs| !vs.is_empty()) {
                 let valid: Vec<String> = vs
                     .iter()
@@ -358,31 +354,22 @@ async fn handle_search_req(
                 if valid.is_empty() {
                     continue; // all #h values invalid/inaccessible — skip filter
                 }
-                format!("channel_id:=[{}]", valid.join(","))
+                valid
             } else {
                 all_channels_filter.clone()
             };
-        let mut filter_parts = vec![channel_scope];
-        if let Some(ref kinds) = filter.kinds {
-            if !kinds.is_empty() {
-                let kind_vals: Vec<String> = kinds.iter().map(|k| k.as_u16().to_string()).collect();
-                filter_parts.push(format!("kind:=[{}]", kind_vals.join(",")));
-            }
-        }
-        if let Some(ref authors) = filter.authors {
-            if !authors.is_empty() {
-                let author_vals: Vec<String> = authors.iter().map(|a| a.to_hex()).collect();
-                filter_parts.push(format!("pubkey:=[{}]", author_vals.join(",")));
-            }
-        }
-        if let Some(since) = filter.since {
-            filter_parts.push(format!("created_at:>={}", since.as_secs()));
-        }
-        if let Some(until) = filter.until {
-            filter_parts.push(format!("created_at:<={}", until.as_secs()));
-        }
-
-        let filter_by = filter_parts.join(" && ");
+        let kinds_vec: Vec<u16> = filter
+            .kinds
+            .as_ref()
+            .map(|ks| ks.iter().map(|k| k.as_u16()).collect())
+            .unwrap_or_default();
+        let authors_vec: Vec<String> = filter
+            .authors
+            .as_ref()
+            .map(|auths| auths.iter().map(|a| a.to_hex()).collect())
+            .unwrap_or_default();
+        let since_secs = filter.since.map(|t| t.as_secs() as i64);
+        let until_secs = filter.until.map(|t| t.as_secs() as i64);
 
         // Paginate: keep fetching pages until we've emitted `limit` results
         // or exhausted the search result set. This ensures post-filtering
@@ -399,8 +386,11 @@ async fn handle_search_req(
 
             let search_query = buzz_search::SearchQuery {
                 q: search_text.clone(),
-                filter_by: Some(filter_by.clone()),
-                sort_by: None, // Typesense default = relevance (text_match score)
+                kinds: kinds_vec.clone(),
+                authors: authors_vec.clone(),
+                channel_ids: channel_scope.clone(),
+                since: since_secs,
+                until: until_secs,
                 page,
                 per_page,
             };
@@ -1071,7 +1061,7 @@ mod tests {
         let scope = build_search_channel_scope_filter(&[channel_id], false)
             .expect("restricted tokens with channel access should still search that channel");
 
-        assert_eq!(scope, format!("channel_id:=[{channel_id}]"));
+        assert_eq!(scope, vec![channel_id.to_string()]);
     }
 
     #[test]

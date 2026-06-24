@@ -5,15 +5,34 @@ use tracing::debug;
 
 use crate::error::SearchError;
 
-/// Parameters for a Typesense search request.
+/// Sentinel channel identifier used for events that are not scoped to any
+/// channel. Mirrored verbatim from `crates/buzz-search/src/index.rs` so the
+/// query layer can pass it through without depending on the indexer.
+pub const GLOBAL_CHANNEL_SENTINEL: &str = "__global__";
+
+/// Backend-neutral search query.
+///
+/// Constructed by `req.rs` from a NIP-50 filter and passed to whichever
+/// [`crate::SearchService`] backend is active. Each backend renders these
+/// structured fields into its own filter syntax (Typesense `filter_by` string,
+/// Postgres `WHERE` clause, …) so the call site doesn't have to know which
+/// backend is in use.
 #[derive(Debug, Clone)]
 pub struct SearchQuery {
-    /// The search query string (`"*"` matches all documents).
+    /// The full-text query string. Empty string is treated as "match all".
     pub q: String,
-    /// Optional Typesense filter expression (e.g. `"kind:=1"`).
-    pub filter_by: Option<String>,
-    /// Optional sort expression (e.g. `"created_at:desc"`).
-    pub sort_by: Option<String>,
+    /// Nostr kinds to restrict to. Empty = no restriction.
+    pub kinds: Vec<u16>,
+    /// Event author pubkeys (hex). Empty = no restriction.
+    pub authors: Vec<String>,
+    /// Channel UUID strings to restrict to. Empty = no restriction. The
+    /// [`GLOBAL_CHANNEL_SENTINEL`] value (`"__global__"`) selects events that
+    /// have no `channel_id` set.
+    pub channel_ids: Vec<String>,
+    /// Lower bound on `created_at` (Unix seconds, inclusive).
+    pub since: Option<i64>,
+    /// Upper bound on `created_at` (Unix seconds, inclusive).
+    pub until: Option<i64>,
     /// Page number (1-indexed).
     pub page: u32,
     /// Number of results per page.
@@ -24,8 +43,11 @@ impl Default for SearchQuery {
     fn default() -> Self {
         Self {
             q: "*".into(),
-            filter_by: None,
-            sort_by: Some("created_at:desc".into()),
+            kinds: Vec::new(),
+            authors: Vec::new(),
+            channel_ids: Vec::new(),
+            since: None,
+            until: None,
             page: 1,
             per_page: 20,
         }
@@ -33,7 +55,60 @@ impl Default for SearchQuery {
 }
 
 impl SearchQuery {
-    /// Converts the query into Typesense HTTP query parameters.
+    /// Renders the structured filters into a Typesense `filter_by` string.
+    /// Returns `None` when no constraints apply.
+    pub(crate) fn typesense_filter_by(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+
+        if !self.channel_ids.is_empty() {
+            // Split global sentinel from real UUIDs so we emit
+            //   (channel_id:=[uuid1,uuid2] || channel_id:=__global__)
+            // instead of an invalid `channel_id:=[__global__,uuid]` mix.
+            let (globals, uuids): (Vec<&String>, Vec<&String>) = self
+                .channel_ids
+                .iter()
+                .partition(|id| id.as_str() == GLOBAL_CHANNEL_SENTINEL);
+
+            let include_global = !globals.is_empty();
+            if !uuids.is_empty() {
+                let joined: Vec<String> = uuids.iter().map(|s| (*s).clone()).collect();
+                if include_global {
+                    parts.push(format!(
+                        "(channel_id:=[{}] || channel_id:=__global__)",
+                        joined.join(",")
+                    ));
+                } else {
+                    parts.push(format!("channel_id:=[{}]", joined.join(",")));
+                }
+            } else if include_global {
+                parts.push("channel_id:=__global__".to_string());
+            }
+        }
+
+        if !self.kinds.is_empty() {
+            let vs: Vec<String> = self.kinds.iter().map(|k| k.to_string()).collect();
+            parts.push(format!("kind:=[{}]", vs.join(",")));
+        }
+        if !self.authors.is_empty() {
+            parts.push(format!("pubkey:=[{}]", self.authors.join(",")));
+        }
+        if let Some(since) = self.since {
+            parts.push(format!("created_at:>={}", since));
+        }
+        if let Some(until) = self.until {
+            parts.push(format!("created_at:<={}", until));
+        }
+
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" && "))
+        }
+    }
+
+    /// Renders the Typesense HTTP query parameters. Kept for compatibility
+    /// with `to_query_params`-based callers; the actual production path uses
+    /// `multi_search` via [`search`].
     pub fn to_query_params(&self) -> Vec<(String, String)> {
         let mut params = vec![
             ("q".into(), self.q.clone()),
@@ -42,12 +117,8 @@ impl SearchQuery {
             ("per_page".into(), self.per_page.to_string()),
         ];
 
-        if let Some(ref filter) = self.filter_by {
-            params.push(("filter_by".into(), filter.clone()));
-        }
-
-        if let Some(ref sort) = self.sort_by {
-            params.push(("sort_by".into(), sort.clone()));
+        if let Some(filter) = self.typesense_filter_by() {
+            params.push(("filter_by".into(), filter));
         }
 
         params
@@ -167,11 +238,8 @@ pub async fn search(
         "page": query.page,
         "per_page": query.per_page,
     });
-    if let Some(ref filter) = query.filter_by {
-        search_params["filter_by"] = serde_json::Value::String(filter.clone());
-    }
-    if let Some(ref sort) = query.sort_by {
-        search_params["sort_by"] = serde_json::Value::String(sort.clone());
+    if let Some(filter) = query.typesense_filter_by() {
+        search_params["filter_by"] = serde_json::Value::String(filter);
     }
     let body = serde_json::json!({ "searches": [search_params] });
 
@@ -241,8 +309,11 @@ mod tests {
     fn test_search_query_building() {
         let q = SearchQuery {
             q: "hello world".into(),
-            filter_by: Some("kind:=1".into()),
-            sort_by: Some("created_at:desc".into()),
+            kinds: vec![1],
+            authors: Vec::new(),
+            channel_ids: Vec::new(),
+            since: None,
+            until: None,
             page: 2,
             per_page: 10,
         };
@@ -259,16 +330,20 @@ mod tests {
         assert_eq!(get("query_by").unwrap(), "content");
         assert_eq!(get("page").unwrap(), "2");
         assert_eq!(get("per_page").unwrap(), "10");
-        assert_eq!(get("filter_by").unwrap(), "kind:=1");
-        assert_eq!(get("sort_by").unwrap(), "created_at:desc");
+        assert_eq!(get("filter_by").unwrap(), "kind:=[1]");
+        // sort_by is no longer emitted — Typesense default = relevance.
+        assert!(params.iter().all(|(k, _)| k != "sort_by"));
     }
 
     #[test]
     fn test_search_query_no_optional_fields() {
         let q = SearchQuery {
             q: "*".into(),
-            filter_by: None,
-            sort_by: None,
+            kinds: Vec::new(),
+            authors: Vec::new(),
+            channel_ids: Vec::new(),
+            since: None,
+            until: None,
             page: 1,
             per_page: 20,
         };
@@ -282,6 +357,50 @@ mod tests {
         assert!(has_key("per_page"));
         assert!(!has_key("filter_by"));
         assert!(!has_key("sort_by"));
+    }
+
+    #[test]
+    fn test_typesense_filter_by_renders_structured_fields() {
+        let q = SearchQuery {
+            q: "hello".into(),
+            kinds: vec![1, 42],
+            authors: vec!["deadbeef".into()],
+            channel_ids: vec!["11111111-1111-1111-1111-111111111111".into()],
+            since: Some(1_700_000_000),
+            until: Some(1_700_000_100),
+            ..Default::default()
+        };
+        let filter = q.typesense_filter_by().expect("non-empty filter");
+        assert!(filter.contains("channel_id:=[11111111-1111-1111-1111-111111111111]"));
+        assert!(filter.contains("kind:=[1,42]"));
+        assert!(filter.contains("pubkey:=[deadbeef]"));
+        assert!(filter.contains("created_at:>=1700000000"));
+        assert!(filter.contains("created_at:<=1700000100"));
+    }
+
+    #[test]
+    fn test_typesense_filter_by_handles_global_sentinel() {
+        let with_global_only = SearchQuery {
+            q: "*".into(),
+            channel_ids: vec![GLOBAL_CHANNEL_SENTINEL.to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            with_global_only.typesense_filter_by().as_deref(),
+            Some("channel_id:=__global__")
+        );
+
+        let with_mix = SearchQuery {
+            q: "*".into(),
+            channel_ids: vec![
+                "11111111-1111-1111-1111-111111111111".into(),
+                GLOBAL_CHANNEL_SENTINEL.to_string(),
+            ],
+            ..Default::default()
+        };
+        let filter = with_mix.typesense_filter_by().expect("non-empty");
+        assert!(filter.contains("|| channel_id:=__global__"));
+        assert!(filter.contains("channel_id:=[11111111-1111-1111-1111-111111111111]"));
     }
 
     #[test]

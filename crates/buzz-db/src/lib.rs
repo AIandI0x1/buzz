@@ -198,6 +198,14 @@ impl Db {
         Self { pool }
     }
 
+    /// Returns a clone of the underlying connection pool.
+    ///
+    /// Used by the Postgres FTS backend in `buzz-search` so it can run
+    /// queries against the same pool as the rest of the relay.
+    pub fn pool(&self) -> PgPool {
+        self.pool.clone()
+    }
+
     /// Run pending database migrations.
     pub async fn migrate(&self) -> Result<()> {
         migration::run_migrations(&self.pool).await

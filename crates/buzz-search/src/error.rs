@@ -36,4 +36,8 @@ pub enum SearchError {
     /// The provided event ID is not valid hex.
     #[error("Invalid event_id: {0}")]
     InvalidEventId(String),
+
+    /// A database error from sqlx (Postgres backend only).
+    #[error("Database error: {0}")]
+    Database(#[from] sqlx::Error),
 }

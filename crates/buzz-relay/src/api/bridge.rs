@@ -719,9 +719,10 @@ async fn handle_bridge_search(
             continue;
         }
 
-        // Build Typesense filter — push channel scope + NIP-01 constraints.
+        // Build the backend-neutral search filter — push channel scope +
+        // NIP-01 constraints into structured fields.
         let h_tag = nostr::SingleLetterTag::lowercase(nostr::Alphabet::H);
-        let filter_channel_scope =
+        let filter_channel_scope: Vec<String> =
             if let Some(vs) = filter.generic_tags.get(&h_tag).filter(|vs| !vs.is_empty()) {
                 let valid: Vec<String> = vs
                     .iter()
@@ -732,37 +733,31 @@ async fn handle_bridge_search(
                 if valid.is_empty() {
                     continue; // All #h values inaccessible — skip filter.
                 }
-                format!("channel_id:=[{}]", valid.join(","))
+                valid
             } else {
                 channel_scope.clone()
             };
 
-        let mut filter_parts = vec![filter_channel_scope];
-        if let Some(ref kinds) = filter.kinds {
-            if !kinds.is_empty() {
-                let kind_vals: Vec<String> = kinds.iter().map(|k| k.as_u16().to_string()).collect();
-                filter_parts.push(format!("kind:=[{}]", kind_vals.join(",")));
-            }
-        }
-        if let Some(ref authors) = filter.authors {
-            if !authors.is_empty() {
-                let author_vals: Vec<String> = authors.iter().map(|a| a.to_hex()).collect();
-                filter_parts.push(format!("pubkey:=[{}]", author_vals.join(",")));
-            }
-        }
-        if let Some(since) = filter.since {
-            filter_parts.push(format!("created_at:>={}", since.as_secs()));
-        }
-        if let Some(until) = filter.until {
-            filter_parts.push(format!("created_at:<={}", until.as_secs()));
-        }
-
-        let filter_by = filter_parts.join(" && ");
+        let kinds_vec: Vec<u16> = filter
+            .kinds
+            .as_ref()
+            .map(|ks| ks.iter().map(|k| k.as_u16()).collect())
+            .unwrap_or_default();
+        let authors_vec: Vec<String> = filter
+            .authors
+            .as_ref()
+            .map(|auths| auths.iter().map(|a| a.to_hex()).collect())
+            .unwrap_or_default();
+        let since_secs = filter.since.map(|t| t.as_secs() as i64);
+        let until_secs = filter.until.map(|t| t.as_secs() as i64);
 
         let search_query = buzz_search::SearchQuery {
             q: search_text,
-            filter_by: Some(filter_by),
-            sort_by: None, // Typesense default = relevance
+            kinds: kinds_vec,
+            authors: authors_vec,
+            channel_ids: filter_channel_scope,
+            since: since_secs,
+            until: until_secs,
             page: 1,
             per_page: limit,
         };

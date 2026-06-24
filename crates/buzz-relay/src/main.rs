@@ -8,7 +8,7 @@ use buzz_audit::AuditService;
 use buzz_auth::AuthService;
 use buzz_db::{Db, DbConfig};
 use buzz_pubsub::PubSubManager;
-use buzz_search::{SearchConfig, SearchService};
+use buzz_search::{SearchBackend, SearchConfig, SearchService};
 
 use buzz_relay::config::Config;
 use buzz_relay::metrics as relay_metrics;
@@ -189,15 +189,29 @@ async fn main() -> anyhow::Result<()> {
 
     let auth = AuthService::new(config.auth.clone());
 
-    let search_config = SearchConfig {
-        url: config.typesense_url.clone(),
-        api_key: config.typesense_key.clone(),
-        collection: std::env::var("TYPESENSE_COLLECTION").unwrap_or_else(|_| "events".to_string()),
+    let search = match config.search_backend {
+        SearchBackend::Typesense => {
+            let search_config = SearchConfig {
+                url: config.typesense_url.clone(),
+                api_key: config.typesense_key.clone(),
+                collection: std::env::var("TYPESENSE_COLLECTION")
+                    .unwrap_or_else(|_| "events".to_string()),
+            };
+            let service = SearchService::new(search_config);
+            if let Err(e) = service.ensure_collection().await {
+                error!("Typesense collection setup failed (non-fatal): {e}");
+            }
+            service
+        }
+        SearchBackend::Postgres => {
+            info!("Search backend: postgres (content_tsv generated column)");
+            SearchService::with_postgres(db.pool())
+        }
+        SearchBackend::Disabled => {
+            info!("Search backend: disabled (NIP-50 queries will return empty)");
+            SearchService::disabled()
+        }
     };
-    let search = SearchService::new(search_config);
-    if let Err(e) = search.ensure_collection().await {
-        error!("Typesense collection setup failed (non-fatal): {e}");
-    }
 
     let workflow_config = buzz_workflow::WorkflowConfig::default();
     let workflow_engine = Arc::new(WorkflowEngine::new(db.clone(), workflow_config));

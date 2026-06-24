@@ -35,6 +35,8 @@ pub struct Config {
     pub typesense_url: String,
     /// Typesense API key.
     pub typesense_key: String,
+    /// Which search backend the relay should use.
+    pub search_backend: buzz_search::SearchBackend,
     /// Public WebSocket URL of this relay, advertised in NIP-11.
     pub relay_url: String,
     /// Maximum number of concurrent WebSocket connections.
@@ -150,6 +152,15 @@ impl Config {
 
         let typesense_key =
             std::env::var("TYPESENSE_API_KEY").unwrap_or_else(|_| "buzz_dev_key".to_string());
+
+        let search_backend = match std::env::var("BUZZ_SEARCH_BACKEND") {
+            Ok(raw) => buzz_search::SearchBackend::parse(&raw).map_err(|bad| {
+                ConfigError::InvalidValue(format!(
+                    "BUZZ_SEARCH_BACKEND={bad:?} (expected `typesense`, `postgres`, or `disabled`)"
+                ))
+            })?,
+            Err(_) => buzz_search::SearchBackend::Typesense,
+        };
 
         let relay_url =
             std::env::var("RELAY_URL").unwrap_or_else(|_| "ws://localhost:3000".to_string());
@@ -377,6 +388,7 @@ impl Config {
             redis_url,
             typesense_url,
             typesense_key,
+            search_backend,
             relay_url,
             max_connections,
             max_concurrent_handlers,
@@ -546,6 +558,41 @@ mod tests {
         assert_eq!(
             config.media.server_domain.as_deref(),
             Some("custom.example.com")
+        );
+    }
+
+    #[test]
+    fn search_backend_defaults_to_typesense() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        std::env::remove_var("BUZZ_SEARCH_BACKEND");
+        let config = Config::from_env().expect("default config");
+        assert_eq!(config.search_backend, buzz_search::SearchBackend::Typesense);
+    }
+
+    #[test]
+    fn search_backend_parses_postgres_and_disabled() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        std::env::set_var("BUZZ_SEARCH_BACKEND", "postgres");
+        let config = Config::from_env().expect("config");
+        assert_eq!(config.search_backend, buzz_search::SearchBackend::Postgres);
+
+        std::env::set_var("BUZZ_SEARCH_BACKEND", "disabled");
+        let config = Config::from_env().expect("config");
+        assert_eq!(config.search_backend, buzz_search::SearchBackend::Disabled);
+
+        std::env::remove_var("BUZZ_SEARCH_BACKEND");
+    }
+
+    #[test]
+    fn search_backend_rejects_unknown_value() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("BUZZ_SEARCH_BACKEND", "postgress"); // typo
+        let result = Config::from_env();
+        std::env::remove_var("BUZZ_SEARCH_BACKEND");
+        assert!(
+            matches!(result, Err(ConfigError::InvalidValue(ref msg)) if msg.contains("BUZZ_SEARCH_BACKEND")),
+            "expected InvalidValue for BUZZ_SEARCH_BACKEND, got {result:?}",
         );
     }
 }

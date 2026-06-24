@@ -128,7 +128,7 @@ mod tests {
     fn embedded_migrator_contains_all_schema_migrations() {
         let migrations: Vec<_> = MIGRATOR.iter().collect();
 
-        assert_eq!(migrations.len(), 3);
+        assert_eq!(migrations.len(), 4);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(
@@ -159,6 +159,17 @@ mod tests {
                 .contains("ADD COLUMN not_before BIGINT")
                 && migrations[2].sql.as_str().contains("idx_events_not_before"),
             "third migration should add the NIP-ER reminder columns and index"
+        );
+
+        assert_eq!(migrations[3].version, 4);
+        assert_eq!(&*migrations[3].description, "search fts");
+        assert!(
+            migrations[3].sql.as_str().contains("content_tsv tsvector")
+                && migrations[3]
+                    .sql
+                    .as_str()
+                    .contains("idx_events_content_tsv"),
+            "fourth migration should add the generated tsvector column and GIN index"
         );
     }
 
@@ -192,24 +203,33 @@ mod tests {
         .expect("read applied migrations")
     }
 
-    /// Returns `schema/schema.sql` with the NIP-ER reminder DDL removed, so it
-    /// models a pre-stack deployment whose `events` table lacks the reminder
-    /// columns and index. The strip is asserted: if the snapshot text drifts so
-    /// these fragments no longer match, the test fails loudly rather than
-    /// silently loading a snapshot that already carries the reminder columns
-    /// (which would make migration 0003 collide on re-add).
+    /// Returns `schema/schema.sql` with the NIP-ER reminder DDL and the
+    /// search-FTS DDL removed, so it models a pre-stack deployment whose
+    /// `events` table lacks the reminder columns and the generated tsvector
+    /// column. The strip is asserted: if the snapshot text drifts so these
+    /// fragments no longer match, the test fails loudly rather than silently
+    /// loading a snapshot that already carries the columns (which would make
+    /// migration 0003 or 0004 collide on re-add).
     fn pre_reminder_schema_snapshot() -> String {
         const REMINDER_COLUMNS: &str = "    not_before  BIGINT,\n    delivered_at BIGINT,\n";
         const REMINDER_INDEX: &str = "CREATE INDEX idx_events_not_before ON events (not_before)\n    WHERE not_before IS NOT NULL AND deleted_at IS NULL AND delivered_at IS NULL;\n";
+        const FTS_COLUMN: &str = "    content_tsv tsvector\n        GENERATED ALWAYS AS (to_tsvector('simple', content)) STORED,\n";
+        const FTS_INDEX: &str =
+            "CREATE INDEX idx_events_content_tsv ON events USING GIN (content_tsv);\n";
 
         assert!(
-            SCHEMA_SQL.contains(REMINDER_COLUMNS) && SCHEMA_SQL.contains(REMINDER_INDEX),
-            "schema.sql reminder DDL drifted; update pre_reminder_schema_snapshot to match"
+            SCHEMA_SQL.contains(REMINDER_COLUMNS)
+                && SCHEMA_SQL.contains(REMINDER_INDEX)
+                && SCHEMA_SQL.contains(FTS_COLUMN)
+                && SCHEMA_SQL.contains(FTS_INDEX),
+            "schema.sql reminder/FTS DDL drifted; update pre_reminder_schema_snapshot to match"
         );
 
         SCHEMA_SQL
             .replace(REMINDER_COLUMNS, "")
             .replace(REMINDER_INDEX, "")
+            .replace(FTS_COLUMN, "")
+            .replace(FTS_INDEX, "")
     }
 
     #[tokio::test]
@@ -220,7 +240,7 @@ mod tests {
 
         run_migrations(&pool).await.expect("run migrations");
 
-        assert_eq!(applied_versions(&pool).await, vec![1, 2, 3]);
+        assert_eq!(applied_versions(&pool).await, vec![1, 2, 3, 4]);
         let events_exists = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'events')",
         )
@@ -253,7 +273,7 @@ mod tests {
 
         run_migrations(&pool).await.expect("baseline migrations");
 
-        assert_eq!(applied_versions(&pool).await, vec![1, 2, 3]);
+        assert_eq!(applied_versions(&pool).await, vec![1, 2, 3, 4]);
         let allowlist_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pubkey_allowlist")
             .fetch_one(&pool)
             .await
