@@ -164,12 +164,15 @@ mod tests {
         assert_eq!(migrations[3].version, 4);
         assert_eq!(&*migrations[3].description, "search fts");
         assert!(
-            migrations[3].sql.as_str().contains("content_tsv tsvector")
+            migrations[3]
+                .sql
+                .as_str()
+                .contains("idx_events_content_fts")
                 && migrations[3]
                     .sql
                     .as_str()
-                    .contains("idx_events_content_tsv"),
-            "fourth migration should add the generated tsvector column and GIN index"
+                    .contains("to_tsvector('simple', content)"),
+            "fourth migration should add the expression GIN index for FTS"
         );
     }
 
@@ -204,23 +207,21 @@ mod tests {
     }
 
     /// Returns `schema/schema.sql` with the NIP-ER reminder DDL and the
-    /// search-FTS DDL removed, so it models a pre-stack deployment whose
-    /// `events` table lacks the reminder columns and the generated tsvector
-    /// column. The strip is asserted: if the snapshot text drifts so these
+    /// search-FTS index removed, so it models a pre-stack deployment whose
+    /// `events` table lacks the reminder columns and the FTS expression
+    /// index. The strip is asserted: if the snapshot text drifts so these
     /// fragments no longer match, the test fails loudly rather than silently
-    /// loading a snapshot that already carries the columns (which would make
+    /// loading a snapshot that already carries them (which would make
     /// migration 0003 or 0004 collide on re-add).
     fn pre_reminder_schema_snapshot() -> String {
         const REMINDER_COLUMNS: &str = "    not_before  BIGINT,\n    delivered_at BIGINT,\n";
         const REMINDER_INDEX: &str = "CREATE INDEX idx_events_not_before ON events (not_before)\n    WHERE not_before IS NOT NULL AND deleted_at IS NULL AND delivered_at IS NULL;\n";
-        const FTS_COLUMN: &str = "    content_tsv tsvector\n        GENERATED ALWAYS AS (to_tsvector('simple', content)) STORED,\n";
         const FTS_INDEX: &str =
-            "CREATE INDEX idx_events_content_tsv ON events USING GIN (content_tsv);\n";
+            "CREATE INDEX idx_events_content_fts ON events USING GIN (to_tsvector('simple', content));\n";
 
         assert!(
             SCHEMA_SQL.contains(REMINDER_COLUMNS)
                 && SCHEMA_SQL.contains(REMINDER_INDEX)
-                && SCHEMA_SQL.contains(FTS_COLUMN)
                 && SCHEMA_SQL.contains(FTS_INDEX),
             "schema.sql reminder/FTS DDL drifted; update pre_reminder_schema_snapshot to match"
         );
@@ -228,7 +229,6 @@ mod tests {
         SCHEMA_SQL
             .replace(REMINDER_COLUMNS, "")
             .replace(REMINDER_INDEX, "")
-            .replace(FTS_COLUMN, "")
             .replace(FTS_INDEX, "")
     }
 

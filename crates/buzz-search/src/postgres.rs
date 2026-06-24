@@ -6,8 +6,9 @@
 //! `db.get_events_by_ids` → `filters_match` → auth post-filter chain in
 //! `crates/buzz-relay/src/handlers/req.rs` is unchanged.
 //!
-//! Matching uses `plainto_tsquery('simple', $q)` against the `content_tsv`
-//! generated column added in migration `0004_search_fts.sql`. Pushdowns:
+//! Matching uses `plainto_tsquery('simple', $q)` against the
+//! `idx_events_content_fts` expression GIN index added in migration
+//! `0004_search_fts.sql`. Pushdowns:
 //!
 //! - `kinds`             → `kind = ANY($kinds)`
 //! - `authors`           → `pubkey = ANY($authors)`         (hex-decoded)
@@ -69,8 +70,9 @@ pub async fn search(pool: &PgPool, query: &SearchQuery) -> Result<SearchResult, 
     // hand-rolling a query with a stable parameter ordering is more readable
     // and easier to audit.
     //
-    // `simple` matches the tokenizer used by the `content_tsv` generated
-    // column in migration 0004. plainto_tsquery treats the input as a plain
+    // `simple` matches the tokenizer used by the `idx_events_content_fts`
+    // expression index in migration 0004 (`to_tsvector('simple', content)`),
+    // so this query is index-served. plainto_tsquery treats the input as a plain
     // string (handles spaces, ignores punctuation) — closest analogue to
     // Typesense's default `query_by=content` behavior.
     let mut binds = Binds::new();
@@ -91,13 +93,13 @@ pub async fn search(pool: &PgPool, query: &SearchQuery) -> Result<SearchResult, 
         // terms cluster together — closer match to Typesense's text relevance
         // than plain `ts_rank`. Returned as `rank REAL`.
         sql.push_str(&format!(
-            ", ts_rank_cd(content_tsv, plainto_tsquery('simple', ${idx})) AS rank"
+            ", ts_rank_cd(to_tsvector('simple', content), plainto_tsquery('simple', ${idx})) AS rank"
         ));
     }
     sql.push_str(", COUNT(*) OVER () AS total FROM events WHERE deleted_at IS NULL");
     if let Some(idx) = q_idx {
         sql.push_str(&format!(
-            " AND content_tsv @@ plainto_tsquery('simple', ${idx})"
+            " AND to_tsvector('simple', content) @@ plainto_tsquery('simple', ${idx})"
         ));
     }
 

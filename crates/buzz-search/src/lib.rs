@@ -9,8 +9,9 @@
 //!   `search()` path returns event IDs that the relay then refetches from
 //!   Postgres.
 //! - [`SearchService::with_postgres`] (Postgres FTS): runs `plainto_tsquery`
-//!   against a generated `content_tsv` column on `events`. No write-path
-//!   indexing needed — the generated stored column auto-populates on INSERT.
+//!   against the `idx_events_content_fts` expression GIN index on `events`. No
+//!   write-path indexing needed — Postgres maintains the expression index on
+//!   every INSERT/UPDATE, exactly like a column index.
 //! - [`SearchService::disabled`]: returns empty results for every query and
 //!   accepts indexing calls as no-ops. Used when NIP-50 search is intentionally
 //!   off (e.g. for tenants who opted out).
@@ -39,7 +40,7 @@ use sqlx::PgPool;
 pub enum SearchBackend {
     /// Typesense (current production default).
     Typesense,
-    /// Postgres full-text search via the `content_tsv` generated column.
+    /// Postgres full-text search via the `idx_events_content_fts` expression GIN index.
     Postgres,
     /// NIP-50 search is disabled; every query returns empty.
     Disabled,
@@ -138,8 +139,8 @@ impl SearchService {
     }
 
     /// Creates a Postgres FTS `SearchService` backed by the supplied pool.
-    /// No indexing setup is required — the `content_tsv` generated column
-    /// populates on every INSERT.
+    /// No indexing setup is required — the `idx_events_content_fts` expression
+    /// index is maintained by Postgres on every INSERT/UPDATE.
     pub fn with_postgres(pool: PgPool) -> Self {
         Self::Postgres(pool)
     }
@@ -174,8 +175,8 @@ impl SearchService {
     /// Indexes a single event (upsert semantics).
     ///
     /// - **Typesense**: writes a document to the collection.
-    /// - **Postgres**: no-op — the `content_tsv` generated stored column is
-    ///   populated automatically on the original INSERT.
+    /// - **Postgres**: no-op — the `idx_events_content_fts` expression index is
+    ///   maintained automatically on the original INSERT.
     /// - **Disabled**: no-op.
     pub async fn index_event(&self, event: &StoredEvent) -> Result<(), SearchError> {
         match self {
@@ -236,9 +237,9 @@ impl SearchService {
     /// Removes an event from the search index by its event ID hex string.
     ///
     /// - **Typesense**: deletes the document.
-    /// - **Postgres**: no-op — `content_tsv` is tied to the event row;
-    ///   removing the row removes the index entry, and the relay's event
-    ///   deletion path already handles that.
+    /// - **Postgres**: no-op — the `idx_events_content_fts` entry is tied to the
+    ///   event row; removing the row removes the index entry, and the relay's
+    ///   event deletion path already handles that.
     /// - **Disabled**: no-op.
     pub async fn delete_event(&self, event_id: &str) -> Result<(), SearchError> {
         match self {

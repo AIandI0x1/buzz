@@ -208,7 +208,7 @@ async fn main() -> anyhow::Result<()> {
             service
         }
         SearchBackend::Postgres => {
-            info!("Search backend: postgres (content_tsv generated column)");
+            info!("Search backend: postgres (expression GIN index idx_events_content_fts)");
             SearchService::with_postgres(db.pool())
         }
         SearchBackend::Disabled => {

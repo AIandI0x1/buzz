@@ -1,35 +1,40 @@
--- Add a generated full-text-search column + GIN index to the events table so
--- the relay can serve NIP-50 search directly from Postgres, eliminating the
--- Typesense dependency.
+-- Add a full-text-search GIN index to the events table so the relay can serve
+-- NIP-50 search directly from Postgres, eliminating the Typesense dependency.
 --
--- `content_tsv` is `GENERATED ALWAYS AS (to_tsvector('simple', content)) STORED`
--- so every INSERT/UPDATE populates it automatically — no application-level
--- index maintenance needed (matches the pattern Typesense filled today via the
--- worker pipeline in `buzz-relay/src/state.rs`).
+-- Shape: an EXPRESSION index on `to_tsvector('simple', content)` rather than a
+-- `GENERATED ... STORED` column. Postgres maintains an expression index on every
+-- INSERT/UPDATE exactly like a column index, so the write path needs no
+-- application-level index maintenance (this replaces the Typesense worker
+-- pipeline) — and there is no stored column, so no `ALTER TABLE ... STORED` row
+-- rewrite and no `ACCESS EXCLUSIVE` backfill. The index build is therefore
+-- online-safe on a fresh/small relay (this file) and pre-buildable out of band
+-- on a large populated relay (operator runbook, below).
 --
 -- Tokenizer choice: `simple` does no stemming and preserves identifiers like
 -- agent handles, nip05 strings, and slugs. The `english` config would stem
--- ("running" → "run") but mangle handles ("alice42" tokenizes fine, but
--- something like "agents" → "agent" would break exact-handle search). Chat
--- content is heterogeneous; `simple` is the safer default for v1.
+-- ("running" -> "run") and mangle handles. Chat content is heterogeneous;
+-- `simple` is the safer default for v1. The query path in
+-- `buzz-search/src/postgres.rs` renders the identical `to_tsvector('simple', content)`
+-- expression so the planner matches this index.
 --
--- kind:0 metadata flattening: the existing Typesense pipeline appends parsed
--- display_name/name/nip05 to event content before indexing
--- (`buzz-search/src/index.rs::flatten_kind0_for_indexing`). With FTS on raw
+-- kind:0 metadata: the old Typesense pipeline appended parsed
+-- display_name/name/nip05 to event content before indexing. With FTS over raw
 -- `content`, those strings still tokenize because they live in the kind:0 JSON
--- body — `to_tsvector('simple', '{"name":"alice"}')` matches `q=alice` after
--- json-aware tokenization. Validated by the NIP-50 e2e suite.
+-- body — `to_tsvector('simple', '{"name":"alice"}')` matches `q=alice`.
+-- Validated by the NIP-50 e2e suite.
 --
--- `events` is partitioned by RANGE (created_at); ADD COLUMN on the parent
--- cascades the generated column to every partition, and CREATE INDEX on the
--- parent builds a partitioned GIN index that propagates to each partition.
--- Partition pruning on since/until queries narrows the GIN scan further than
--- Typesense's full-collection scan does today.
+-- `events` is partitioned by RANGE (created_at). `CREATE INDEX ... ON events`
+-- builds a partitioned GIN index whose per-partition child indexes propagate to
+-- existing and future partitions. Partition pruning on since/until narrows the
+-- GIN scan further than Typesense's full-collection scan does today.
+--
+-- IF NOT EXISTS makes this migration idempotent against the operator runbook:
+-- on a large relay the index is built per-child with CREATE INDEX CONCURRENTLY
+-- and ATTACHed to a parent named `idx_events_content_fts` BEFORE this code
+-- deploys, so this statement is a no-op. See
+-- GUIDES/BUZZ_POSTGRES_FTS_LIVE_RELAY_RUNBOOK.md.
 --
 -- Managed by sqlx migrations.
 
-ALTER TABLE events
-    ADD COLUMN content_tsv tsvector
-    GENERATED ALWAYS AS (to_tsvector('simple', content)) STORED;
-
-CREATE INDEX idx_events_content_tsv ON events USING GIN (content_tsv);
+CREATE INDEX IF NOT EXISTS idx_events_content_fts
+    ON events USING GIN (to_tsvector('simple', content));
