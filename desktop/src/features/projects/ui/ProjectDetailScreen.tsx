@@ -5,7 +5,6 @@ import {
   CheckCircle2,
   CircleDot,
   Copy,
-  ExternalLink,
   FileDiff,
   FolderGit2,
   GitBranch,
@@ -31,7 +30,6 @@ import { useUsersBatchQuery } from "@/features/profile/hooks";
 import { resolveUserLabel } from "@/features/profile/lib/identity";
 import { topChromeInset } from "@/shared/layout/chromeLayout";
 import { cn } from "@/shared/lib/cn";
-import { isSafeUrl } from "@/shared/lib/url";
 import { Button } from "@/shared/ui/button";
 import { Card } from "@/shared/ui/card";
 import { Textarea } from "@/shared/ui/textarea";
@@ -580,23 +578,6 @@ export function ProjectDetailScreen({ projectId }: ProjectDetailScreenProps) {
               </p>
             </Card>
           </section>
-
-          {project.webUrl && isSafeUrl(project.webUrl) ? (
-            <section className="space-y-2">
-              <h3 className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-                Web
-              </h3>
-              <a
-                className="inline-flex items-center gap-1.5 text-sm text-primary hover:underline"
-                href={project.webUrl}
-                rel="noopener noreferrer"
-                target="_blank"
-              >
-                <ExternalLink className="h-4 w-4" />
-                {project.webUrl}
-              </a>
-            </section>
-          ) : null}
 
           {project.contributors.length > 0 ? (
             <section className="space-y-2">

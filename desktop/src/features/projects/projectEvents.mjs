@@ -146,6 +146,28 @@ export function eventToProject(event) {
   };
 }
 
+export function withCanonicalProjectCloneUrl(project, relayHttpUrl) {
+  try {
+    return {
+      ...project,
+      cloneUrls: [
+        buildProjectCloneUrl({
+          relayHttpUrl,
+          owner: project.owner,
+          repoId: project.dtag,
+        }),
+      ],
+    };
+  } catch {
+    return {
+      ...project,
+      cloneUrls: project.cloneUrls.filter(
+        (url) => !/github\.com/i.test(String(url)),
+      ),
+    };
+  }
+}
+
 export function dedupProjectEvents(events) {
   const best = new Map();
 

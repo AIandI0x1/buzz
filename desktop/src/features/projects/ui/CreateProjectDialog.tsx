@@ -100,7 +100,7 @@ export function CreateProjectDialog({
         footerClassName="border-t-0 pt-0"
         headerClassName="pb-2"
         title="Create project"
-        description="Create a Buzz-hosted Git repo with a linked channel for project and code discussion."
+        description="Create a BizzHub repo with a linked channel for project and code discussion."
         footer={
           <div className="flex w-full items-center justify-between gap-3">
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -194,7 +194,7 @@ export function CreateProjectDialog({
               />
             </div>
             <p className="text-xs text-muted-foreground/70">
-              Used in the Buzz Git clone URL.
+              Used in the BizzHub clone URL.
             </p>
           </div>
 

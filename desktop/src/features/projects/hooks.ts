@@ -1,8 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import * as React from "react";
 
 import { relayClient } from "@/shared/api/relayClient";
 import {
   KIND_GIT_ISSUE,
+  KIND_GIT_PATCH,
+  KIND_GIT_PR_UPDATE,
+  KIND_GIT_PULL_REQUEST,
   KIND_GIT_STATUS_CLOSED,
   KIND_GIT_STATUS_DRAFT,
   KIND_GIT_STATUS_MERGED,
@@ -23,7 +27,9 @@ import {
   eventToProject,
   getTag,
   projectEventsToProjects,
+  withCanonicalProjectCloneUrl,
 } from "./projectEvents.mjs";
+import { summarizeProjectActivityEvents } from "./projectActivity.mjs";
 import {
   buildGitIssueTags,
   buildGitStatusTags,
@@ -62,6 +68,14 @@ export type RepoState = {
   updatedAt: number;
 };
 
+export type ProjectActivitySummary = {
+  repoAddress: string;
+  issueCount: number;
+  activityCount: number;
+  updatedAt: number;
+  participantPubkeys: string[];
+};
+
 export type CreateProjectIssueInput = {
   title: string;
   content?: string;
@@ -75,23 +89,33 @@ export type ProjectIssueStatusInput = {
 };
 
 async function fetchProjects(): Promise<Project[]> {
-  const events = await relayClient.fetchEvents({
-    kinds: [KIND_REPO_ANNOUNCEMENT],
-    limit: 200,
-  });
+  const [events, relayHttpUrl] = await Promise.all([
+    relayClient.fetchEvents({
+      kinds: [KIND_REPO_ANNOUNCEMENT],
+      limit: 200,
+    }),
+    getRelayHttpUrl(),
+  ]);
 
-  return projectEventsToProjects(events) as Project[];
+  return (projectEventsToProjects(events) as Project[]).map((project) =>
+    withCanonicalProjectCloneUrl(project, relayHttpUrl),
+  );
 }
 
 async function fetchProject(projectId: string): Promise<Project | null> {
-  const events = await relayClient.fetchEvents({
-    kinds: [KIND_REPO_ANNOUNCEMENT],
-    "#d": [projectId],
-    limit: 10,
-  });
+  const [events, relayHttpUrl] = await Promise.all([
+    relayClient.fetchEvents({
+      kinds: [KIND_REPO_ANNOUNCEMENT],
+      "#d": [projectId],
+      limit: 10,
+    }),
+    getRelayHttpUrl(),
+  ]);
 
   const projects = projectEventsToProjects(events) as Project[];
-  return projects.length > 0 ? projects[0] : null;
+  return projects.length > 0
+    ? withCanonicalProjectCloneUrl(projects[0], relayHttpUrl)
+    : null;
 }
 
 function eventToRepoState(event: RelayEvent): RepoState {
@@ -153,6 +177,34 @@ async function fetchProjectIssues(project: Project): Promise<ProjectIssue[]> {
   ]);
 
   return projectIssueEventsToIssues(issueEvents, statusEvents);
+}
+
+async function fetchProjectActivitySummaries(
+  projects: Project[],
+): Promise<Record<string, ProjectActivitySummary>> {
+  if (projects.length === 0) {
+    return {};
+  }
+
+  const events = await relayClient.fetchEvents({
+    kinds: [
+      KIND_GIT_ISSUE,
+      KIND_GIT_STATUS_OPEN,
+      KIND_GIT_STATUS_MERGED,
+      KIND_GIT_STATUS_CLOSED,
+      KIND_GIT_STATUS_DRAFT,
+      KIND_GIT_PATCH,
+      KIND_GIT_PULL_REQUEST,
+      KIND_GIT_PR_UPDATE,
+    ],
+    "#a": projects.map((project) => project.repoAddress),
+    limit: 1_000,
+  });
+
+  return summarizeProjectActivityEvents(events, projects) as Record<
+    string,
+    ProjectActivitySummary
+  >;
 }
 
 async function createProject(input: CreateProjectInput): Promise<Project> {
@@ -246,6 +298,20 @@ export function useProjectIssuesQuery(project: Project | null | undefined) {
       }
       return fetchProjectIssues(project);
     },
+    staleTime: 30_000,
+  });
+}
+
+export function useProjectActivitySummariesQuery(projects: Project[]) {
+  const repoAddresses = React.useMemo(
+    () => projects.map((project) => project.repoAddress).sort(),
+    [projects],
+  );
+
+  return useQuery({
+    enabled: repoAddresses.length > 0,
+    queryKey: ["projects", "activity-summaries", repoAddresses],
+    queryFn: () => fetchProjectActivitySummaries(projects),
     staleTime: 30_000,
   });
 }

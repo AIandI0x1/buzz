@@ -2871,13 +2871,13 @@ function createMockProjectEvents(): RelayEvent[] {
   return [
     createMockEvent(
       KIND_REPO_ANNOUNCEMENT,
-      "A Buzz-hosted Git project for testing project workflows, code discussion, and agent progress.",
+      "A BizzHub project for testing project workflows, code discussion, and agent progress.",
       [
         ["d", MOCK_PROJECT_REPO_ID],
         ["name", "Sprout Invaders"],
         [
           "description",
-          "A Buzz-hosted Git project for testing project workflows, code discussion, and agent progress.",
+          "A BizzHub project for testing project workflows, code discussion, and agent progress.",
         ],
         [
           "clone",

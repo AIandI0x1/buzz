@@ -8,6 +8,7 @@ import {
   isValidRepoId,
   normalizeProjectSlug,
   projectEventsToProjects,
+  withCanonicalProjectCloneUrl,
 } from "./projectEvents.mjs";
 
 const OWNER =
@@ -46,7 +47,7 @@ test("normalizes project names into repo slugs", () => {
   assert.equal(normalizeProjectSlug("A".repeat(80)), "a".repeat(64));
 });
 
-test("builds canonical Buzz git clone URL", () => {
+test("builds canonical BizzHub git clone URL", () => {
   assert.equal(
     buildProjectCloneUrl({
       relayHttpUrl: "https://relay.example.com/",
@@ -54,6 +55,24 @@ test("builds canonical Buzz git clone URL", () => {
       repoId: "my-repo",
     }),
     `https://relay.example.com/git/${OWNER}/my-repo`,
+  );
+});
+
+test("projects display the canonical BizzHub clone URL", () => {
+  const project = eventToProject(
+    repoEvent({
+      tags: [
+        ["d", "block-buzz"],
+        ["name", "block/buzz"],
+        ["clone", "https://github.com/block/buzz.git"],
+      ],
+    }),
+  );
+
+  assert.deepEqual(
+    withCanonicalProjectCloneUrl(project, "https://relay.example.com")
+      .cloneUrls,
+    [`https://relay.example.com/git/${OWNER}/block-buzz`],
   );
 });
 
