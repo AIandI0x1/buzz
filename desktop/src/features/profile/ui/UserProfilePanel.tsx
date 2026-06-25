@@ -602,21 +602,17 @@ export function UserProfilePanel({
       }
 
       try {
-        const deletedInstances =
-          await deleteManagedAgentsForPersona(personaToConfirm);
-        if (deletedInstances.cancelled) return;
-
         await deletePersonaMutation.mutateAsync(personaToConfirm.id);
         toast.success(`Deleted ${personaToConfirm.displayName}.`);
         setPersonaToDelete(null);
         onClose();
       } catch (error) {
         toast.error(
-          error instanceof Error ? error.message : "Failed to delete agent.",
+          error instanceof Error ? error.message : "Failed to delete persona.",
         );
       }
     },
-    [deleteManagedAgentsForPersona, deletePersonaMutation.mutateAsync, onClose],
+    [deletePersonaMutation.mutateAsync, onClose],
   );
 
   const handleAddedToChannel = React.useCallback(
