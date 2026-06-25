@@ -365,7 +365,7 @@ export function UserProfilePanel({
           candidate.availability === "available",
       );
       const defaultRuntime = runtimes[0] ?? null;
-      const { runtime, warnings } = resolvePersonaRuntime(
+      const { runtime, warnings, isOverridden } = resolvePersonaRuntime(
         personaToStart.runtime,
         runtimes,
         defaultRuntime,
@@ -382,6 +382,7 @@ export function UserProfilePanel({
         name: personaToStart.displayName,
         acpCommand: "buzz-acp",
         agentCommand: runtime.command,
+        harnessOverride: isOverridden,
         agentArgs: runtime.defaultArgs,
         mcpCommand: runtime.mcpCommand ?? "",
         personaId: personaToStart.id,
@@ -809,7 +810,6 @@ export function UserProfilePanel({
       {view === "info" ? (
         <AgentInfoFocusedView metadataFields={agentInfoFields} />
       ) : null}
-
       {view === "model" ? (
         <ModelFocusedView
           managedAgent={managedAgent}
