@@ -286,6 +286,30 @@ impl Db {
         })
     }
 
+    /// Returns the community that owns a channel, if the channel exists.
+    ///
+    /// Internal relay producers use this to derive tenant context from the row
+    /// they are acting on, rather than falling back to an implicit default.
+    pub async fn community_of_channel(&self, channel_id: Uuid) -> Result<Option<CommunityId>> {
+        let row = sqlx::query(
+            r#"
+            SELECT community_id
+            FROM channels
+            WHERE id = $1
+              AND deleted_at IS NULL
+            "#,
+        )
+        .bind(channel_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|row| {
+            let id: Uuid = row.try_get("community_id")?;
+            Ok(CommunityId::from_uuid(id))
+        })
+        .transpose()
+    }
+
     /// Inserts an event. Returns `(StoredEvent, was_inserted)` — `false` on duplicate.
     pub async fn insert_event(
         &self,
