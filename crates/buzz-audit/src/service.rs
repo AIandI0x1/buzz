@@ -77,13 +77,17 @@ impl AuditService {
     ) -> Result<AuditEntry, AuditError> {
         let mut tx = conn.begin().await?;
 
+        // The stored row keys on the raw UUID; the typed `CommunityId` on the
+        // input is the provenance fence, dereferenced here at the DB boundary.
+        let community_id = *entry.community_id.as_uuid();
+
         // Head of THIS community's chain — scoped by community_id.
         let head = sqlx::query(
             "SELECT seq, hash FROM audit_log
              WHERE community_id = $1
              ORDER BY seq DESC LIMIT 1",
         )
-        .bind(entry.community_id)
+        .bind(community_id)
         .fetch_optional(&mut *tx)
         .await?;
 
@@ -99,7 +103,7 @@ impl AuditService {
         let created_at: DateTime<Utc> = Utc::now();
 
         let mut audit_entry = AuditEntry {
-            community_id: entry.community_id,
+            community_id,
             seq,
             hash: Vec::new(),
             prev_hash,
@@ -280,7 +284,7 @@ mod tests {
 
     fn new_entry(community_id: Uuid, action: AuditAction) -> NewAuditEntry {
         NewAuditEntry {
-            community_id,
+            community_id: CommunityId::from_uuid(community_id),
             action,
             actor_pubkey: Some(vec![0xab; 32]),
             object_id: Some(format!("obj_{}", Uuid::new_v4())),

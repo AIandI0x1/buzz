@@ -1,3 +1,4 @@
+use buzz_core::CommunityId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -41,10 +42,19 @@ pub struct AuditEntry {
 /// `community_id` is the **server-resolved** tenant (from the request's
 /// `TenantContext`), never a client-supplied value — the same provenance rule
 /// the whole multi-tenant model rests on.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Not `Serialize`/`Deserialize`: this is an in-process input struct (consumed
+/// by `AuditService::log`, threaded through the in-memory audit sink), never
+/// crossing a wire or DB boundary as a whole. Keeping it non-deserializable
+/// reinforces the fence — there is no path by which a client-supplied blob
+/// becomes a `NewAuditEntry` (and thus a `CommunityId`).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewAuditEntry {
-    /// Server-resolved community this entry belongs to.
-    pub community_id: Uuid,
+    /// Server-resolved community this entry belongs to. Typed as [`CommunityId`]
+    /// (not a raw `Uuid`) so the provenance rule is visible in the signature:
+    /// the only ways to obtain one are host resolution or a server-scoped DB
+    /// row — never a value parsed from client input.
+    pub community_id: CommunityId,
     /// Action that was performed.
     pub action: AuditAction,
     /// Raw bytes of the actor's Nostr pubkey, if the action has one.
@@ -58,6 +68,5 @@ pub struct NewAuditEntry {
     /// or other secrets here. `AuthSuccess`/`AuthFailure` entries carry only
     /// outcome metadata — the token has no slot in this type, and `detail` must
     /// not become one.
-    #[serde(default)]
     pub detail: serde_json::Value,
 }
