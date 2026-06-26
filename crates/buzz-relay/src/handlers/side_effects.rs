@@ -860,7 +860,9 @@ async fn handle_kind0_profile(event: &Event, state: &Arc<AppState>) -> anyhow::R
     let nip05_handle = nip05_owned.as_deref().unwrap_or("");
 
     // NIP-01 standard `email` field — stored as-is for agent commit trailer injection.
-    // No validation beyond presence: the user is responsible for setting a valid git email.
+    // Empty string is intentional: `update_user_profile` passes it through `empty_to_none`,
+    // which converts "" → NULL in the DB (consistent with display_name, avatar_url, about).
+    // Do NOT add an explicit `.filter(|s| !s.is_empty())` here — `empty_to_none` owns that.
     let git_email_owned = content
         .get("email")
         .and_then(|v| v.as_str())
