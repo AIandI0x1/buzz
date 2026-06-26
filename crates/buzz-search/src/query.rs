@@ -14,6 +14,44 @@ use uuid::Uuid;
 
 use crate::error::SearchError;
 
+/// Channel-scope filter for a community-scoped FTS query.
+///
+/// Four variants, 1-to-1 with the legacy `(accessible_channels: &[Uuid],
+/// include_global: bool)` matrix from the Typesense relay:
+///
+/// | accessible | include_global | `ChannelScope` |
+/// |---|---|---|
+/// | non-empty  | true  | `ChannelsOrChannelLess(accessible)` |
+/// | non-empty  | false | `Channels(accessible)`              |
+/// | empty      | true  | `ChannelLessOnly`                   |
+/// | empty      | false | (don't call — caller short-circuits to EOSE) |
+///
+/// `ChannelLessOnly` is the variant that the old `Option<Vec<Uuid>>` +
+/// `bool` 2x2 could not express unambiguously: with empty accessible
+/// channels and `include_global=true`, both `Some(vec![]) + true` and
+/// `None + true` would broaden to all community channels rather than
+/// restrict to channel-less events. The enum closes that hole at the
+/// type level.
+///
+/// Empty-vec edge cases are intentionally not special-cased:
+/// `Channels(vec![])` emits `channel_id = ANY('{}')` which Postgres
+/// evaluates as false-for-all-rows (zero hits), and
+/// `ChannelsOrChannelLess(vec![])` emits `(channel_id = ANY('{}') OR
+/// channel_id IS NULL)` which is equivalent to `ChannelLessOnly`.
+#[derive(Debug, Clone)]
+pub enum ChannelScope {
+    /// No channel constraint. Matches every event in the community.
+    Any,
+    /// Restrict to `channel_id IS NULL` events only — what the legacy
+    /// Typesense `channel_id:=__global__` sentinel meant.
+    ChannelLessOnly,
+    /// Restrict to events whose `channel_id` is in this list.
+    Channels(Vec<Uuid>),
+    /// Restrict to events whose `channel_id` is in this list, OR are
+    /// channel-less (`channel_id IS NULL`).
+    ChannelsOrChannelLess(Vec<Uuid>),
+}
+
 /// A community-scoped FTS query.
 ///
 /// The community is REQUIRED at the type level — there is no construction path
@@ -26,15 +64,11 @@ pub struct SearchQuery {
     /// NIP-50 search text. Empty string is rejected by `search()` early
     /// (no hits, no SQL roundtrip).
     pub q: String,
-    /// Restrict hits to one of these channel UUIDs. `None` = no channel
-    /// constraint (community-global within the community). An empty `Some(vec![])`
-    /// is also treated as "no channel constraint" — call sites that mean
-    /// "no channels are accessible" must short-circuit before calling.
-    pub channel_ids: Option<Vec<Uuid>>,
-    /// If `true`, include channel-less events (channel_id IS NULL) in addition
-    /// to any `channel_ids` filter. If `channel_ids` is `None`, this is
-    /// implicitly satisfied. Maps to today's `__global__` sentinel semantic.
-    pub include_channel_less: bool,
+    /// How to scope hits by channel. See [`ChannelScope`] — the four variants
+    /// are 1-to-1 with the legacy `(accessible_channels, include_global)`
+    /// matrix, and `ChannelLessOnly` closes the gap where "empty accessible
+    /// channels + include global" used to silently broaden to all channels.
+    pub channel_scope: ChannelScope,
     /// NIP-01 kinds filter. None = no kind constraint.
     pub kinds: Option<Vec<i32>>,
     /// NIP-01 authors filter (32-byte pubkeys). None = no author constraint.
@@ -127,35 +161,26 @@ pub async fn search(pool: &PgPool, query: &SearchQuery) -> Result<SearchResult, 
     qb.push_bind(*query.community.as_uuid());
     qb.push(" AND deleted_at IS NULL AND search_tsv @@ query");
 
-    // Channel scope. Three shapes:
-    //   - channel_ids = Some([..]) + include_channel_less = true:  (channel_id = ANY($) OR channel_id IS NULL)
-    //   - channel_ids = Some([..]) + include_channel_less = false: channel_id = ANY($)
-    //   - channel_ids = None + include_channel_less = true:        (no constraint — also covers None/false for callers
-    //                                                               that explicitly want "no channel scope at all")
-    //   - channel_ids = None + include_channel_less = false:       caller meant "nothing accessible" but didn't
-    //                                                               short-circuit; we conservatively return no hits
-    match (&query.channel_ids, query.include_channel_less) {
-        (Some(ids), include_global) if !ids.is_empty() => {
+    // Channel scope — see `ChannelScope` doc for the four-case mapping. The
+    // emitted SQL fragments are identical to the legacy 2x2 tuple for the
+    // three carry-over cases; `ChannelLessOnly` is the new fence that the
+    // old shape could not express.
+    match &query.channel_scope {
+        ChannelScope::Any => {
+            // No channel constraint.
+        }
+        ChannelScope::ChannelLessOnly => {
+            qb.push(" AND channel_id IS NULL");
+        }
+        ChannelScope::Channels(ids) => {
+            qb.push(" AND channel_id = ANY(");
+            qb.push_bind(ids.clone());
+            qb.push(")");
+        }
+        ChannelScope::ChannelsOrChannelLess(ids) => {
             qb.push(" AND (channel_id = ANY(");
             qb.push_bind(ids.clone());
-            if include_global {
-                qb.push(") OR channel_id IS NULL)");
-            } else {
-                qb.push("))");
-            }
-        }
-        (Some(_), true) | (None, true) => {
-            // No channel constraint — include everything in the community.
-            // (channel_ids = Some(empty) falls here because no IDs to filter
-            // by and channel-less events are included.)
-        }
-        (Some(_), false) | (None, false) => {
-            // Caller said "no accessible channels and exclude channel-less" —
-            // produces an empty result.
-            return Ok(SearchResult {
-                hits: Vec::new(),
-                page,
-            });
+            qb.push(") OR channel_id IS NULL)");
         }
     }
 

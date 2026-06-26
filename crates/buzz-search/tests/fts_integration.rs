@@ -7,7 +7,7 @@
 //! parallel-safe.
 
 use buzz_core::CommunityId;
-use buzz_search::{SearchQuery, SearchService};
+use buzz_search::{ChannelScope, SearchQuery, SearchService};
 use sqlx::{postgres::PgPoolOptions, Executor, PgPool};
 use uuid::Uuid;
 
@@ -136,8 +136,7 @@ async fn search_finds_event_in_same_community() {
         .search(&SearchQuery {
             community: c_a,
             q: "wonderland".into(),
-            channel_ids: None,
-            include_channel_less: true,
+            channel_scope: ChannelScope::Any,
             kinds: None,
             authors: None,
             since: None,
@@ -184,8 +183,7 @@ async fn search_does_not_return_other_community_events() {
         .search(&SearchQuery {
             community: c_a,
             q: "unique-token-xyz".into(),
-            channel_ids: None,
-            include_channel_less: true,
+            channel_scope: ChannelScope::Any,
             kinds: None,
             authors: None,
             since: None,
@@ -201,8 +199,7 @@ async fn search_does_not_return_other_community_events() {
         .search(&SearchQuery {
             community: c_b,
             q: "unique-token-xyz".into(),
-            channel_ids: None,
-            include_channel_less: true,
+            channel_scope: ChannelScope::Any,
             kinds: None,
             authors: None,
             since: None,
@@ -245,8 +242,7 @@ async fn kind0_search_by_display_name_works_without_flattening() {
             .search(&SearchQuery {
                 community: c,
                 q: q.to_string(),
-                channel_ids: None,
-                include_channel_less: true,
+                channel_scope: ChannelScope::Any,
                 kinds: Some(vec![0]),
                 authors: None,
                 since: None,
@@ -324,8 +320,7 @@ async fn channel_scope_restricts_results() {
         .search(&SearchQuery {
             community: c,
             q: "shared-token".into(),
-            channel_ids: Some(vec![ch_a]),
-            include_channel_less: false,
+            channel_scope: ChannelScope::Channels(vec![ch_a]),
             kinds: None,
             authors: None,
             since: None,
@@ -343,8 +338,7 @@ async fn channel_scope_restricts_results() {
         .search(&SearchQuery {
             community: c,
             q: "shared-token".into(),
-            channel_ids: Some(vec![ch_a]),
-            include_channel_less: true,
+            channel_scope: ChannelScope::ChannelsOrChannelLess(vec![ch_a]),
             kinds: None,
             authors: None,
             since: None,
@@ -361,8 +355,7 @@ async fn channel_scope_restricts_results() {
         .search(&SearchQuery {
             community: c,
             q: "shared-token".into(),
-            channel_ids: None,
-            include_channel_less: true,
+            channel_scope: ChannelScope::Any,
             kinds: None,
             authors: None,
             since: None,
@@ -379,8 +372,7 @@ async fn channel_scope_restricts_results() {
         .search(&SearchQuery {
             community: c,
             q: "shared-token".into(),
-            channel_ids: Some(vec![]),
-            include_channel_less: false,
+            channel_scope: ChannelScope::Channels(vec![]),
             kinds: None,
             authors: None,
             since: None,
@@ -418,8 +410,7 @@ async fn deleted_events_are_excluded() {
         .search(&SearchQuery {
             community: c,
             q: "deleted-token-q".into(),
-            channel_ids: None,
-            include_channel_less: true,
+            channel_scope: ChannelScope::Any,
             kinds: None,
             authors: None,
             since: None,
@@ -449,8 +440,7 @@ async fn empty_query_returns_empty_result_no_roundtrip() {
             .search(&SearchQuery {
                 community: c,
                 q: q.into(),
-                channel_ids: None,
-                include_channel_less: true,
+                channel_scope: ChannelScope::Any,
                 kinds: None,
                 authors: None,
                 since: None,
@@ -516,8 +506,7 @@ async fn since_until_filters() {
         .search(&SearchQuery {
             community: c,
             q: "time-token-zz".into(),
-            channel_ids: None,
-            include_channel_less: true,
+            channel_scope: ChannelScope::Any,
             kinds: None,
             authors: None,
             since: Some(1_700_005_000),
@@ -560,8 +549,7 @@ async fn pagination_works() {
         .search(&SearchQuery {
             community: c,
             q: "page-token-qq".into(),
-            channel_ids: None,
-            include_channel_less: true,
+            channel_scope: ChannelScope::Any,
             kinds: None,
             authors: None,
             since: None,
@@ -577,8 +565,7 @@ async fn pagination_works() {
         .search(&SearchQuery {
             community: c,
             q: "page-token-qq".into(),
-            channel_ids: None,
-            include_channel_less: true,
+            channel_scope: ChannelScope::Any,
             kinds: None,
             authors: None,
             since: None,
@@ -593,6 +580,98 @@ async fn pagination_works() {
         1,
         "page 3 of 7 with per_page=3 should have 1 hit"
     );
+
+    teardown(pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn channel_less_only_excludes_per_channel_events() {
+    // Closes the row-3 fence hole: in the legacy 2x2 shape, both
+    // `Some(vec![]) + true` and `None + true` silently broadened to all
+    // community channels rather than restricting to channel-less events.
+    // `ChannelScope::ChannelLessOnly` is the variant that the old type
+    // could not express.
+    //
+    // Adversarial check: mutate this test's expectation to `>= 2` and the
+    // assertion goes red against the new SQL `AND channel_id IS NULL`,
+    // proving the predicate bites. Mutate `query.rs` `ChannelLessOnly` arm
+    // to a no-op (the `Any` semantic the old code emitted) and this test
+    // also goes red — three hits instead of one — proving the fix is the
+    // emitted predicate, not the variant name.
+    let (pool, schema) = setup().await;
+
+    let c = mk_community(&pool, "a.example").await;
+    let ch_a = Uuid::new_v4();
+    let ch_b = Uuid::new_v4();
+    sqlx::query("INSERT INTO channels (community_id, id, name, channel_type, created_by) VALUES ($1, $2, $3, 'stream'::channel_type, $4), ($1, $5, $6, 'stream'::channel_type, $4)")
+        .bind(c.as_uuid())
+        .bind(ch_a)
+        .bind("ch-a")
+        .bind(b"\x01".repeat(32))
+        .bind(ch_b)
+        .bind("ch-b")
+        .execute(&pool)
+        .await
+        .expect("insert channels");
+
+    let pk = rand_bytes32();
+    insert_event(
+        &pool,
+        c,
+        rand_bytes32(),
+        pk,
+        1,
+        "fence-token in ch-a",
+        Some(ch_a),
+        1_700_000_000,
+    )
+    .await;
+    insert_event(
+        &pool,
+        c,
+        rand_bytes32(),
+        pk,
+        1,
+        "fence-token in ch-b",
+        Some(ch_b),
+        1_700_000_001,
+    )
+    .await;
+    insert_event(
+        &pool,
+        c,
+        rand_bytes32(),
+        pk,
+        1,
+        "fence-token channel-less",
+        None,
+        1_700_000_002,
+    )
+    .await;
+
+    let svc = SearchService::new(pool.clone());
+
+    let r = svc
+        .search(&SearchQuery {
+            community: c,
+            q: "fence-token".into(),
+            channel_scope: ChannelScope::ChannelLessOnly,
+            kinds: None,
+            authors: None,
+            since: None,
+            until: None,
+            page: 1,
+            per_page: 10,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        r.hits.len(),
+        1,
+        "ChannelLessOnly must return only the channel_id IS NULL row"
+    );
+    assert_eq!(r.hits[0].channel_id, None);
 
     teardown(pool, &schema).await;
 }
