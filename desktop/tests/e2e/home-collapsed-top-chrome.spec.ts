@@ -27,4 +27,37 @@ test.describe("home inbox header collapsed-sidebar chrome clearance", () => {
 
     await waitForAnimations(page);
   });
+
+  test("inbox list and detail share a single header backdrop", async ({
+    page,
+  }) => {
+    await installMockBridge(page);
+    await page.goto("/");
+    await expect(page.getByTestId("home-inbox-list")).toBeVisible();
+    await expect(page.getByTestId("home-inbox-detail")).toBeVisible();
+
+    const homeInbox = page.getByTestId("home-inbox");
+    const sharedBackdrop = page.getByTestId(
+      "home-inbox-shared-header-backdrop",
+    );
+    await expect(sharedBackdrop).toHaveCount(1);
+
+    const [homeBox, backdropBox, backdropFilter] = await Promise.all([
+      homeInbox.boundingBox(),
+      sharedBackdrop.boundingBox(),
+      sharedBackdrop.evaluate(
+        (element) => getComputedStyle(element).backdropFilter,
+      ),
+    ]);
+
+    expect(homeBox).not.toBeNull();
+    expect(backdropBox).not.toBeNull();
+    expect(Math.round(backdropBox?.x ?? 0)).toBe(Math.round(homeBox?.x ?? 0));
+    expect(Math.round(backdropBox?.width ?? 0)).toBe(
+      Math.round(homeBox?.width ?? 0),
+    );
+    expect(backdropFilter).not.toBe("none");
+
+    await waitForAnimations(page);
+  });
 });
