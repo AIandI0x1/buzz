@@ -149,6 +149,20 @@ mod tests {
             migrations[0]
                 .sql
                 .as_str()
+                .contains("community_id    UUID NOT NULL REFERENCES communities(id)"),
+            "workflows should carry row-owned community_id"
+        );
+        assert!(
+            migrations[0]
+                .sql
+                .as_str()
+                .contains("trg_workflows_community_id_immutable"),
+            "workflow community_id should be immutable after insert"
+        );
+        assert!(
+            migrations[0]
+                .sql
+                .as_str()
                 .contains("workflow_run_id UUID REFERENCES workflow_runs"),
             "workflow cron claim table should optionally link to the run it created"
         );
@@ -156,8 +170,15 @@ mod tests {
             migrations[0]
                 .sql
                 .as_str()
-                .contains("PRIMARY KEY (community_id, workflow_id, scheduled_for)"),
-            "workflow cron claim uniqueness must include the community label"
+                .contains("PRIMARY KEY (workflow_id, scheduled_for)"),
+            "workflow cron claim uniqueness should be the globally unique workflow plus schedule instant"
+        );
+        assert!(
+            migrations[0]
+                .sql
+                .as_str()
+                .contains("FOREIGN KEY (community_id, workflow_id)"),
+            "workflow cron claim table should tie community_id to the workflow row"
         );
         assert!(
             migrations[0].sql.as_str().contains("CREATE TABLE channels"),

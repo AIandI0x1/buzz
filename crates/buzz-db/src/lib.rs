@@ -664,7 +664,7 @@ impl Db {
         event_id: &[u8],
         event_created_at: chrono::DateTime<chrono::Utc>,
         delivery_stamp: i64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         event::release_due_reminder(&self.pool, event_id, event_created_at, delivery_stamp).await
     }
 
@@ -1203,6 +1203,7 @@ impl Db {
     /// Create a new workflow.
     pub async fn create_workflow(
         &self,
+        community_id: CommunityId,
         channel_id: Option<Uuid>,
         owner_pubkey: &[u8],
         name: &str,
@@ -1211,6 +1212,7 @@ impl Db {
     ) -> Result<Uuid> {
         workflow::create_workflow(
             &self.pool,
+            community_id,
             channel_id,
             owner_pubkey,
             name,
@@ -1250,43 +1252,34 @@ impl Db {
 
     /// Claim a scheduled workflow fire for an authoritative schedule instant.
     ///
-    /// Returns `Some` only for the first pod to claim `(community_id,
-    /// workflow_id, scheduled_for)`; all other pods must skip creating a run.
+    /// Returns `Some` only for the first pod to claim `(workflow_id,
+    /// scheduled_for)`; all other pods must skip creating a run. The claim SQL
+    /// resolves `community_id` from the workflow row; callers never supply it.
     pub async fn claim_scheduled_workflow_fire(
         &self,
-        community_id: CommunityId,
         workflow_id: Uuid,
         scheduled_for: chrono::DateTime<chrono::Utc>,
     ) -> Result<Option<workflow::ScheduledWorkflowFireClaim>> {
-        workflow::claim_scheduled_workflow_fire(
-            &self.pool,
-            community_id,
-            workflow_id,
-            scheduled_for,
-        )
-        .await
+        workflow::claim_scheduled_workflow_fire(&self.pool, workflow_id, scheduled_for).await
     }
 
     /// Fetch the latest claimed schedule instant for interval trigger anchoring.
     pub async fn latest_scheduled_workflow_fire(
         &self,
-        community_id: CommunityId,
         workflow_id: Uuid,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
-        workflow::latest_scheduled_workflow_fire(&self.pool, community_id, workflow_id).await
+        workflow::latest_scheduled_workflow_fire(&self.pool, workflow_id).await
     }
 
     /// Attach the workflow run id created from a won scheduled-fire claim.
     pub async fn attach_scheduled_workflow_run(
         &self,
-        community_id: CommunityId,
         workflow_id: Uuid,
         scheduled_for: chrono::DateTime<chrono::Utc>,
         workflow_run_id: Uuid,
     ) -> Result<bool> {
         workflow::attach_scheduled_workflow_run(
             &self.pool,
-            community_id,
             workflow_id,
             scheduled_for,
             workflow_run_id,

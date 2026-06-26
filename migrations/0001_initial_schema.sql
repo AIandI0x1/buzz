@@ -58,6 +58,7 @@ CREATE TABLE channels (
     CONSTRAINT chk_channels_id_not_nil CHECK (id <> '00000000-0000-0000-0000-000000000000'::uuid)
 );
 
+CREATE UNIQUE INDEX idx_channels_community_id_id ON channels (community_id, id);
 CREATE INDEX idx_channels_type ON channels (channel_type);
 CREATE INDEX idx_channels_visibility ON channels (visibility);
 CREATE INDEX idx_channels_created_by ON channels (created_by);
@@ -210,18 +211,37 @@ CREATE TABLE delivery_log_p_future PARTITION OF delivery_log
 
 CREATE TABLE workflows (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    community_id    UUID NOT NULL REFERENCES communities(id),
     name            VARCHAR(255) NOT NULL,
     owner_pubkey    BYTEA NOT NULL REFERENCES users(pubkey),
-    channel_id      UUID REFERENCES channels(id),
+    channel_id      UUID,
     definition      JSONB NOT NULL,
     definition_hash BYTEA NOT NULL,
     status          workflow_status NOT NULL DEFAULT 'active',
     enabled         BOOLEAN NOT NULL DEFAULT TRUE,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    FOREIGN KEY (community_id, channel_id)
+        REFERENCES channels(community_id, id)
 );
 
-CREATE INDEX idx_workflows_channel_active ON workflows (channel_id, status, enabled);
+CREATE UNIQUE INDEX idx_workflows_community_id_id ON workflows (community_id, id);
+CREATE INDEX idx_workflows_channel_active ON workflows (community_id, channel_id, status, enabled);
+
+CREATE OR REPLACE FUNCTION prevent_workflows_community_id_update()
+RETURNS trigger AS $$
+BEGIN
+    IF NEW.community_id IS DISTINCT FROM OLD.community_id THEN
+        RAISE EXCEPTION 'workflows.community_id is immutable';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_workflows_community_id_immutable
+    BEFORE UPDATE OF community_id ON workflows
+    FOR EACH ROW
+    EXECUTE FUNCTION prevent_workflows_community_id_update();
 
 -- ── Workflow runs ─────────────────────────────────────────────────────────────
 
@@ -246,12 +266,14 @@ CREATE INDEX idx_workflow_runs_status ON workflow_runs (status);
 -- Each schedule tick must win this insert before creating a workflow run; this
 -- replaces per-pod in-memory last-fired state as the deduplication boundary.
 CREATE TABLE scheduled_workflow_fires (
-    community_id    UUID NOT NULL REFERENCES communities(id),
-    workflow_id     UUID NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    community_id    UUID NOT NULL,
+    workflow_id     UUID NOT NULL,
     scheduled_for   TIMESTAMPTZ NOT NULL,
     claimed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     workflow_run_id UUID REFERENCES workflow_runs(id) ON DELETE SET NULL,
-    PRIMARY KEY (community_id, workflow_id, scheduled_for)
+    PRIMARY KEY (workflow_id, scheduled_for),
+    FOREIGN KEY (community_id, workflow_id)
+        REFERENCES workflows(community_id, id) ON DELETE CASCADE
 );
 
 CREATE INDEX idx_scheduled_workflow_fires_scheduled_for

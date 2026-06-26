@@ -1122,8 +1122,8 @@ pub async fn release_due_reminder(
     event_id: &[u8],
     event_created_at: DateTime<Utc>,
     delivery_stamp: i64,
-) -> Result<()> {
-    sqlx::query(
+) -> Result<bool> {
+    let result = sqlx::query(
         r#"
         UPDATE events
         SET delivered_at = NULL
@@ -1138,7 +1138,7 @@ pub async fn release_due_reminder(
     .execute(pool)
     .await?;
 
-    Ok(())
+    Ok(result.rows_affected() == 1)
 }
 
 #[cfg(test)]

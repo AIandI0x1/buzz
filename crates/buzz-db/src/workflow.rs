@@ -165,6 +165,8 @@ impl FromStr for ApprovalStatus {
 pub struct WorkflowRecord {
     /// Unique workflow identifier.
     pub id: Uuid,
+    /// Server-resolved community that owns this workflow.
+    pub community_id: CommunityId,
     /// Human-readable workflow name.
     pub name: String,
     /// Compressed public key bytes of the workflow owner.
@@ -215,9 +217,9 @@ pub struct WorkflowRunRecord {
 
 /// A winning scheduled workflow fire claim.
 ///
-/// The primary identity is `(community_id, workflow_id, scheduled_for)`. The
-/// database also returns `claimed_at` so the workflow scheduler can log and audit
-/// the exact claim row it won without relying on a per-pod clock.
+/// The primary identity is `(workflow_id, scheduled_for)`. `community_id` is
+/// resolved from the workflow row inside the claim SQL and returned for scoped
+/// audit/logging; callers never supply it as a claim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduledWorkflowFireClaim {
     /// Community that owns this scheduled fire.
@@ -263,6 +265,7 @@ pub struct ApprovalRecord {
 /// New workflows start as `active` and `enabled = TRUE`.
 pub async fn create_workflow(
     pool: &PgPool,
+    community_id: CommunityId,
     channel_id: Option<Uuid>,
     owner_pubkey: &[u8],
     name: &str,
@@ -274,11 +277,12 @@ pub async fn create_workflow(
     sqlx::query(
         r#"
         INSERT INTO workflows
-            (id, name, owner_pubkey, channel_id, definition, definition_hash, status, enabled)
-        VALUES ($1, $2, $3, $4, $5::jsonb, $6, 'active', TRUE)
+            (id, community_id, name, owner_pubkey, channel_id, definition, definition_hash, status, enabled)
+        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, 'active', TRUE)
         "#,
     )
     .bind(id)
+    .bind(community_id.as_uuid())
     .bind(name)
     .bind(owner_pubkey)
     .bind(channel_id)
@@ -294,7 +298,7 @@ pub async fn create_workflow(
 pub async fn get_workflow(pool: &PgPool, id: Uuid) -> Result<WorkflowRecord> {
     let row = sqlx::query(
         r#"
-        SELECT id, name, owner_pubkey, channel_id, definition, definition_hash,
+        SELECT id, community_id, name, owner_pubkey, channel_id, definition, definition_hash,
                status::text AS status, enabled, created_at, updated_at
         FROM workflows
         WHERE id = $1
@@ -323,7 +327,7 @@ pub async fn list_channel_workflows(
 
     let rows = sqlx::query(
         r#"
-        SELECT id, name, owner_pubkey, channel_id, definition, definition_hash,
+        SELECT id, community_id, name, owner_pubkey, channel_id, definition, definition_hash,
                status::text AS status, enabled, created_at, updated_at
         FROM workflows
         WHERE channel_id = $1
@@ -352,7 +356,7 @@ pub async fn list_enabled_channel_workflows(
 ) -> Result<Vec<WorkflowRecord>> {
     let rows = sqlx::query(
         r#"
-        SELECT id, name, owner_pubkey, channel_id, definition, definition_hash,
+        SELECT id, community_id, name, owner_pubkey, channel_id, definition, definition_hash,
                status::text AS status, enabled, created_at, updated_at
         FROM workflows
         WHERE channel_id = $1
@@ -378,7 +382,7 @@ pub async fn list_enabled_channel_workflows(
 pub async fn list_all_enabled_workflows(pool: &PgPool) -> Result<Vec<WorkflowRecord>> {
     let rows = sqlx::query(
         r#"
-        SELECT id, name, owner_pubkey, channel_id, definition, definition_hash,
+        SELECT id, community_id, name, owner_pubkey, channel_id, definition, definition_hash,
                status::text AS status, enabled, created_at, updated_at
         FROM workflows
         WHERE status = 'active'
@@ -397,27 +401,27 @@ pub async fn list_all_enabled_workflows(pool: &PgPool) -> Result<Vec<WorkflowRec
 
 /// Claim a scheduled workflow fire for an authoritative schedule instant.
 ///
-/// Returns `Some` only for the first pod that claims `(community_id,
-/// workflow_id, scheduled_for)`. All other pods receive `None` and must skip
-/// creating a workflow run. The `scheduled_for` value must come from an external
+/// Returns `Some` only for the first pod that claims `(workflow_id,
+/// scheduled_for)`. All other pods receive `None` and must skip creating a
+/// workflow run. The `scheduled_for` value must come from an external
 /// schedule anchor (cron expression) or DB-authoritative interval anchor; a
 /// per-pod in-memory timestamp is not safe because different pods can compute
 /// different claim keys.
 pub async fn claim_scheduled_workflow_fire(
     pool: &PgPool,
-    community_id: CommunityId,
     workflow_id: Uuid,
     scheduled_for: DateTime<Utc>,
 ) -> Result<Option<ScheduledWorkflowFireClaim>> {
     let row = sqlx::query(
         r#"
         INSERT INTO scheduled_workflow_fires (community_id, workflow_id, scheduled_for)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (community_id, workflow_id, scheduled_for) DO NOTHING
+        SELECT w.community_id, w.id, $2
+        FROM workflows w
+        WHERE w.id = $1
+        ON CONFLICT (workflow_id, scheduled_for) DO NOTHING
         RETURNING community_id, workflow_id, scheduled_for, claimed_at
         "#,
     )
-    .bind(community_id.as_uuid())
     .bind(workflow_id)
     .bind(scheduled_for)
     .fetch_optional(pool)
@@ -444,18 +448,15 @@ pub async fn claim_scheduled_workflow_fire(
 /// row is the source of truth for schedule deduplication.
 pub async fn latest_scheduled_workflow_fire(
     pool: &PgPool,
-    community_id: CommunityId,
     workflow_id: Uuid,
 ) -> Result<Option<DateTime<Utc>>> {
     let row = sqlx::query(
         r#"
         SELECT MAX(scheduled_for) AS scheduled_for
         FROM scheduled_workflow_fires
-        WHERE community_id = $1
-          AND workflow_id = $2
+        WHERE workflow_id = $1
         "#,
     )
-    .bind(community_id.as_uuid())
     .bind(workflow_id)
     .fetch_one(pool)
     .await?;
@@ -471,7 +472,6 @@ pub async fn latest_scheduled_workflow_fire(
 /// intentional: the schedule instant was claimed and must not duplicate later.
 pub async fn attach_scheduled_workflow_run(
     pool: &PgPool,
-    community_id: CommunityId,
     workflow_id: Uuid,
     scheduled_for: DateTime<Utc>,
     workflow_run_id: Uuid,
@@ -479,14 +479,12 @@ pub async fn attach_scheduled_workflow_run(
     let result = sqlx::query(
         r#"
         UPDATE scheduled_workflow_fires
-        SET workflow_run_id = $4
-        WHERE community_id = $1
-          AND workflow_id = $2
-          AND scheduled_for = $3
+        SET workflow_run_id = $3
+        WHERE workflow_id = $1
+          AND scheduled_for = $2
           AND workflow_run_id IS NULL
         "#,
     )
-    .bind(community_id.as_uuid())
     .bind(workflow_id)
     .bind(scheduled_for)
     .bind(workflow_run_id)
@@ -909,8 +907,11 @@ fn row_to_workflow_record(row: sqlx::postgres::PgRow) -> Result<WorkflowRecord> 
 
     let enabled: bool = row.try_get("enabled")?;
 
+    let community_id: Uuid = row.try_get("community_id")?;
+
     Ok(WorkflowRecord {
         id,
+        community_id: CommunityId::from_uuid(community_id),
         name: row.try_get("name")?,
         owner_pubkey: row.try_get("owner_pubkey")?,
         channel_id,
@@ -975,7 +976,7 @@ pub async fn find_by_owner_and_name(
 ) -> Result<Option<WorkflowRecord>> {
     let row = sqlx::query(
         r#"
-        SELECT id, name, owner_pubkey, channel_id, definition, definition_hash,
+        SELECT id, community_id, name, owner_pubkey, channel_id, definition, definition_hash,
                status::text AS status, enabled, created_at, updated_at
         FROM workflows
         WHERE owner_pubkey = $1 AND name = $2
@@ -1099,8 +1100,11 @@ mod tests {
             "steps": [{ "id": "s1", "action": "send_message", "text": "hi" }]
         });
 
+        let community_id = CommunityId::from_uuid(Uuid::new_v4());
+
         let record = WorkflowRecord {
             id,
+            community_id,
             name: "My Workflow".to_owned(),
             owner_pubkey: vec![0xab; 32],
             channel_id: Some(channel_id),
@@ -1113,6 +1117,7 @@ mod tests {
         };
 
         assert_eq!(record.id, id);
+        assert_eq!(record.community_id, community_id);
         assert_eq!(record.name, "My Workflow");
         assert_eq!(record.owner_pubkey, vec![0xab; 32]);
         assert_eq!(record.channel_id, Some(channel_id));
@@ -1129,6 +1134,7 @@ mod tests {
 
         let record = WorkflowRecord {
             id,
+            community_id: CommunityId::from_uuid(Uuid::new_v4()),
             name: "Global Workflow".to_owned(),
             owner_pubkey: vec![0x00; 32],
             channel_id: None,
@@ -1150,6 +1156,7 @@ mod tests {
 
         let record = WorkflowRecord {
             id,
+            community_id: CommunityId::from_uuid(Uuid::new_v4()),
             name: "Original".to_owned(),
             owner_pubkey: vec![0x01; 32],
             channel_id: None,
@@ -1178,6 +1185,7 @@ mod tests {
         ] {
             let record = WorkflowRecord {
                 id: Uuid::new_v4(),
+                community_id: CommunityId::from_uuid(Uuid::new_v4()),
                 name: "Test".to_owned(),
                 owner_pubkey: vec![],
                 channel_id: None,
@@ -1197,6 +1205,7 @@ mod tests {
         let now = Utc::now();
         let record = WorkflowRecord {
             id: Uuid::new_v4(),
+            community_id: CommunityId::from_uuid(Uuid::new_v4()),
             name: "Paused".to_owned(),
             owner_pubkey: vec![],
             channel_id: None,
