@@ -7,6 +7,7 @@ import {
   buildAgentConversationRecap,
   buildAgentConversationMarkers,
   deriveAgentConversationTitle,
+  getAutoRoutedAgentConversationPubkeys,
   getHiddenAgentConversationMessageIds,
   parseAgentConversationMarker,
   readPersistedAgentConversations,
@@ -282,6 +283,7 @@ test("continued conversations persist across app restarts", () => {
 
 test("message-anchored tasks persist without a primary agent", () => {
   withMockLocalStorage(() => {
+    const workspaceScope = "wss://relay.example.com";
     const root = message({
       body: "Can someone turn this into a task?",
       createdAt: 1,
@@ -297,8 +299,8 @@ test("message-anchored tasks persist without a primary agent", () => {
       threadRootMessage: root,
     });
 
-    writePersistedAgentConversations("human", [conversation]);
-    const persisted = readPersistedAgentConversations("human");
+    writePersistedAgentConversations("human", workspaceScope, [conversation]);
+    const persisted = readPersistedAgentConversations("human", workspaceScope);
 
     assert.equal(persisted.length, 1);
     assert.equal(persisted[0].id, conversation.id);
@@ -556,6 +558,50 @@ test("continued conversation marker hides loaded task replies when anchor is out
   );
 
   assert.deepEqual([...hiddenIds], ["task-reply"]);
+});
+
+test("source-message task marker does not hide later thread replies", () => {
+  const root = message({
+    body: "Can you look into the data model?",
+    createdAt: 1,
+    id: "root",
+  });
+  const humanAnchor = message({
+    body: "Let's make this a task.",
+    createdAt: 2,
+    id: "human-anchor",
+  });
+  const laterReply = message({
+    body: "This normal thread reply should stay visible.",
+    createdAt: 3,
+    id: "later",
+  });
+  const marker = parseAgentConversationMarker({
+    ...markerEvent({
+      content: {
+        agentName: "",
+        agentPubkey: "",
+        agentReplyId: "human-anchor",
+        startedAt: 2,
+      },
+      createdAt: 2,
+      id: "source-marker",
+      includeAgent: false,
+    }),
+    tags: [
+      ["h", "channel"],
+      ["e", "root", "", "root"],
+      ["e", "human-anchor", "", "agent-reply"],
+      ["title", "Source task"],
+    ],
+  });
+
+  const hiddenIds = getHiddenAgentConversationMessageIds(
+    [root, humanAnchor, laterReply],
+    marker ? [marker] : [],
+  );
+
+  assert.deepEqual([...hiddenIds], []);
 });
 
 test("continued conversation markers keep later task anchors visible", () => {

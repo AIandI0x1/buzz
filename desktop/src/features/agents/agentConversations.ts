@@ -678,6 +678,9 @@ export function getHiddenAgentConversationMessageIds(
   for (const marker of markers) {
     const anchorMessage = messageById.get(marker.agentReplyId);
     const anchorIndex = messageIndexById.get(marker.agentReplyId);
+    if (!marker.agentPubkey) {
+      continue;
+    }
     if (!anchorMessage || anchorIndex === undefined) {
       const hasLoadedThreadContext = orderedMessages.some(({ message }) => {
         const messageThreadRootId = message.rootId ?? message.parentId ?? null;
@@ -693,6 +696,9 @@ export function getHiddenAgentConversationMessageIds(
       const anchorThreadRootId =
         anchorMessage.rootId ?? anchorMessage.parentId ?? anchorMessage.id;
       if (anchorThreadRootId !== marker.threadRootId) {
+        continue;
+      }
+      if (anchorMessage.pubkey !== marker.agentPubkey) {
         continue;
       }
 
