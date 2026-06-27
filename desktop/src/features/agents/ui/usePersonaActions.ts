@@ -144,7 +144,10 @@ export function usePersonaActions() {
     clearFeedback("library");
     try {
       const result = await parsePersonaFiles(fileBytes, fileName);
-      if (isSingleItemFile(fileBytes) && result.personas.length === 1) {
+      if (
+        isSingleItemFile(fileBytes, fileName) &&
+        result.personas.length === 1
+      ) {
         setShouldLoadAcpRuntimes(true);
         setPersonaDialogState(importPersonaDialogState(result.personas[0]));
       } else if (result.personas.length > 0) {
@@ -221,19 +224,15 @@ export function usePersonaActions() {
     exportPersonaJsonMutation.isPending;
 
   return {
-    // Queries
     personasQuery,
     acpRuntimesQuery,
-    // Mutations (for error/pending access)
     createPersonaMutation,
     updatePersonaMutation,
     setPersonaActiveMutation,
-    // Derived state
     catalogPersonas,
     libraryPersonas,
     personaLabelsById,
     isPending,
-    // UI state
     personaDialogState,
     setPersonaDialogState,
     personaToDelete,
@@ -246,9 +245,7 @@ export function usePersonaActions() {
     personaNoticeMessage,
     personaErrorMessage,
     personaFeedbackSurface,
-    // Import actions (composed)
     personaImportActions,
-    // Handlers
     handleSubmit,
     handleDelete,
     handleSetActive,

@@ -61,19 +61,16 @@ export function ManagedAgentSessionPanel({
   );
   const transcript = useAgentTranscript(hasObserver, agent.pubkey);
 
-  // Filter transcript items by channelId (lightweight — items now carry channelId)
   const scopedTranscript = React.useMemo(
     () => scopeByChannel(transcript, channelId),
     [channelId, transcript],
   );
 
-  // Filter raw events by channelId for the RawEventRail
   const scopedEvents = React.useMemo(
     () => scopeByChannel(events, channelId),
     [channelId, events],
   );
 
-  // Derive latestSessionId from channel-scoped events
   const latestSessionId = React.useMemo(
     () => deriveLatestSessionId(scopedEvents),
     [scopedEvents],

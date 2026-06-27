@@ -21,7 +21,7 @@ import { Button } from "@/shared/ui/button";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import {
   OverlayPanelBackdrop,
-  PANEL_BASE_CLASS,
+  PANEL_ENTER_BASE_CLASS,
   PANEL_OVERLAY_CLASS,
   PANEL_SINGLE_COLUMN_HEADER_LAYER_CLASS,
 } from "@/shared/ui/OverlayPanelBackdrop";
@@ -32,7 +32,7 @@ import type { ChannelAgentSessionAgent } from "./useChannelAgentSessions";
 
 type AgentSessionThreadPanelProps = {
   agent: ChannelAgentSessionAgent;
-  channel: Channel;
+  channel: Channel | null;
   canInterruptTurn: boolean;
   isWorking: boolean;
   layout?: "standalone" | "split";
@@ -62,7 +62,7 @@ export function AgentSessionThreadPanel({
   useEscapeKey(onClose, isOverlay || isSinglePanelView);
 
   const { ref: scrollRef, onScroll } = useStickToBottom<HTMLDivElement>();
-  const rawFeedScopeKey = `${agent.pubkey}:${channel.id}`;
+  const rawFeedScopeKey = `${agent.pubkey}:${channel?.id ?? "all"}`;
   const [rawFeedState, setRawFeedState] = React.useState(() => ({
     scopeKey: rawFeedScopeKey,
     show: false,
@@ -77,6 +77,10 @@ export function AgentSessionThreadPanel({
   );
 
   async function handleInterruptTurn() {
+    if (!channel) {
+      return;
+    }
+
     try {
       await cancelManagedAgentTurn(agent.pubkey, channel.id);
       toast.success(
@@ -105,7 +109,9 @@ export function AgentSessionThreadPanel({
           title={
             showRawFeed
               ? "Hide raw JSON-RPC payloads."
-              : "Show raw JSON-RPC payloads for this channel."
+              : channel
+                ? "Show raw JSON-RPC payloads for this channel."
+                : "Show raw JSON-RPC payloads for this agent."
           }
         >
           <label
@@ -198,9 +204,13 @@ export function AgentSessionThreadPanel({
     >
       <ManagedAgentSessionPanel
         agent={agent}
-        channelId={channel.id}
+        channelId={channel?.id ?? null}
         className="border-0 bg-transparent p-0 shadow-none"
-        emptyDescription={`Mention ${agent.name} in the channel to see its work here.`}
+        emptyDescription={
+          channel
+            ? `Mention ${agent.name} in the channel to see its work here.`
+            : `Mention ${agent.name} in any channel to see its work here.`
+        }
         isWorking={isWorking}
         profiles={profiles}
         rawLayout="exclusive"
@@ -224,7 +234,7 @@ export function AgentSessionThreadPanel({
       {isFloatingOverlay && <OverlayPanelBackdrop onClose={onClose} />}
       <aside
         className={cn(
-          PANEL_BASE_CLASS,
+          PANEL_ENTER_BASE_CLASS,
           isSinglePanelView && "border-l-0",
           isFloatingOverlay && PANEL_OVERLAY_CLASS,
         )}

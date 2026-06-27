@@ -111,10 +111,12 @@ export function ChannelScreen({
     openAgentSessionPubkey,
     openThreadHeadId,
     profilePanelPubkey,
+    profilePanelTab,
     profilePanelView,
     setChannelManagementOpen,
     setOpenAgentSessionPubkey,
     setOpenThreadHeadId,
+    setProfilePanelTab,
     setProfilePanelPubkey,
     setProfilePanelView,
   } = useChannelPanelHistoryState();
@@ -314,8 +316,8 @@ export function ChannelScreen({
     enabled: messageProfilePubkeys.length > 0,
   });
   const {
+    agentSessionCandidates,
     botTypingEntries,
-    channelAgentSessionAgents: activeChannelAgentSessionAgents,
     humanTypingPubkeys,
     threadTypingPubkeys,
   } = useChannelActivityTyping({
@@ -327,7 +329,29 @@ export function ChannelScreen({
     relayAgents,
     typingEntries,
   });
-  useManagedAgentObserverBridge(activeChannelAgentSessionAgents);
+  const observerBridgeAgents = React.useMemo(() => {
+    if (
+      !profilePanelPubkey ||
+      !openAgentSessionPubkey ||
+      normalizePubkey(profilePanelPubkey) !==
+        normalizePubkey(openAgentSessionPubkey) ||
+      managedAgents.some(
+        (agent) =>
+          normalizePubkey(agent.pubkey) === normalizePubkey(profilePanelPubkey),
+      )
+    ) {
+      return managedAgents;
+    }
+
+    return [
+      ...managedAgents,
+      {
+        pubkey: profilePanelPubkey,
+        status: "deployed" as const,
+      },
+    ];
+  }, [managedAgents, openAgentSessionPubkey, profilePanelPubkey]);
+  useManagedAgentObserverBridge(observerBridgeAgents);
   const messageProfiles = React.useMemo(() => {
     const base =
       mergeCurrentProfileIntoLookup(
@@ -490,6 +514,7 @@ export function ChannelScreen({
       ? handleSendVideoReviewComment
       : undefined;
   const {
+    agentSessionAgents,
     channelAgentSessionAgents,
     closeAgentSession: handleCloseAgentSession,
     openAgentSession: handleOpenAgentSession,
@@ -507,8 +532,9 @@ export function ChannelScreen({
       !relayAgentsQuery.isLoading,
     channelMembers,
     handleOpenThread,
-    managedAgents: activeChannelAgentSessionAgents,
+    managedAgents: agentSessionCandidates,
     openAgentSessionPubkey,
+    profilePanelPubkey,
     setChannelManagementOpen,
     setExpandedThreadReplyIds,
     setOpenAgentSessionPubkey,
@@ -732,8 +758,9 @@ export function ChannelScreen({
               >
                 <ChannelPane
                   activeChannel={activeChannel}
+                  activityAgents={channelAgentSessionAgents}
                   agentPubkeys={agentPubkeys}
-                  agentSessionAgents={channelAgentSessionAgents}
+                  agentSessionAgents={agentSessionAgents}
                   botTypingEntries={botTypingEntries}
                   channelFind={channelFind}
                   channelManagementOpen={channelManagementOpen}
@@ -820,7 +847,9 @@ export function ChannelScreen({
                   openThreadHeadId={effectiveOpenThreadHeadId}
                   shouldShowThreadSkeleton={shouldShowThreadSkeleton}
                   onProfilePanelViewChange={setProfilePanelView}
+                  onProfilePanelTabChange={setProfilePanelTab}
                   profilePanelPubkey={profilePanelPubkey}
+                  profilePanelTab={profilePanelTab}
                   profilePanelView={profilePanelView}
                   personaLookup={personaLookup}
                   profiles={messageProfiles}

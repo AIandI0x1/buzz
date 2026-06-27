@@ -16,11 +16,14 @@ import {
 } from "@/shared/ui/context-menu";
 
 import { ChannelContextMenuItems } from "@/features/sidebar/ui/CustomChannelSection";
+import type { ActiveChannelTurnSummary } from "@/features/agents/activeAgentTurnsStore";
+import { formatElapsed } from "@/features/agents/ui/agentSessionUtils";
 import { getEphemeralChannelDisplay } from "@/features/channels/lib/ephemeralChannel";
 import { EphemeralChannelBadge } from "@/features/channels/ui/EphemeralChannelBadge";
 import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
 import type { Channel, PresenceStatus } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
+import { useNow } from "@/shared/lib/useNow";
 import {
   SidebarGroup,
   SidebarGroupContent,
@@ -40,6 +43,8 @@ const SECTION_LABEL_CHEVRON_ICON_CLASS =
   "absolute left-1/2 top-1/2 size-2.5 -translate-x-1/2 -translate-y-1/2";
 const SIDEBAR_ROW_ACTION_VISIBILITY_CLASS =
   "group-focus-within/menu-item:opacity-100 group-hover/menu-item:opacity-100 md:opacity-0";
+const SIDEBAR_ROW_ACTION_REPLACED_BADGE_CLASS =
+  "max-md:opacity-0 md:group-focus-within/menu-item:opacity-0 md:group-hover/menu-item:opacity-0";
 const SIDEBAR_ROW_ICON_ACTION_CLASS =
   "flex size-6 items-center justify-center p-1 text-sidebar-foreground/45 transition-colors hover:text-sidebar-foreground focus-visible:text-sidebar-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-sidebar-ring peer-data-[active=true]/menu-button:text-sidebar-active-foreground/75 peer-data-[active=true]/menu-button:hover:text-sidebar-active-foreground [&>svg]:size-4 [&>svg]:shrink-0";
 
@@ -83,6 +88,38 @@ function UnreadDotBadge({
       data-testid={`channel-unread-dot-${channelName}`}
     >
       <span className="sr-only">unread</span>
+    </span>
+  );
+}
+
+function ChannelWorkingBadge({
+  channelName,
+  isActive,
+  summary,
+}: {
+  channelName: string;
+  isActive: boolean;
+  summary: ActiveChannelTurnSummary;
+}) {
+  const now = useNow(1000);
+  const elapsed = formatElapsed(now - summary.anchorAt);
+  const label =
+    summary.agentCount > 1
+      ? `${summary.agentCount} working · ${elapsed}`
+      : `Working · ${elapsed}`;
+
+  return (
+    <span
+      className={cn(
+        "hidden max-w-32 shrink-0 truncate rounded-full px-1.5 py-0.5 text-2xs font-medium leading-none tabular-nums motion-safe:animate-pulse group-data-[collapsible=icon]:hidden sm:inline-flex",
+        isActive
+          ? "bg-sidebar-active-foreground/20 text-sidebar-active-foreground"
+          : "bg-primary/10 text-primary",
+      )}
+      data-testid={`channel-working-${channelName}`}
+      title={label}
+    >
+      {label}
     </span>
   );
 }
@@ -191,6 +228,7 @@ export function ChannelMenuButton({
   isActive,
   hasUnread,
   unreadCount = 0,
+  activeWorking,
   isMuted,
   dmParticipants,
   presenceStatus,
@@ -201,6 +239,7 @@ export function ChannelMenuButton({
   isActive: boolean;
   hasUnread: boolean;
   unreadCount?: number;
+  activeWorking?: ActiveChannelTurnSummary;
   isMuted?: boolean;
   dmParticipants?: SidebarDmParticipant[];
   presenceStatus?: PresenceStatus;
@@ -240,6 +279,13 @@ export function ChannelMenuButton({
           variant="sidebar"
         />
       ) : null}
+      {activeWorking ? (
+        <ChannelWorkingBadge
+          channelName={channel.name}
+          isActive={isActive}
+          summary={activeWorking}
+        />
+      ) : null}
       {isMuted ? (
         <BellOff
           className={cn(
@@ -267,6 +313,7 @@ export function ChannelMenuButton({
 
 export function SidebarSection({
   action,
+  activeWorkingByChannelId,
   dmParticipantsByChannelId,
   emptyState,
   items,
@@ -289,6 +336,7 @@ export function SidebarSection({
   onUnmuteChannel,
 }: {
   action?: React.ReactNode;
+  activeWorkingByChannelId?: ReadonlyMap<string, ActiveChannelTurnSummary>;
   dmParticipantsByChannelId?: Record<string, SidebarDmParticipant[]>;
   emptyState?: React.ReactNode;
   items: Channel[];
@@ -321,7 +369,7 @@ export function SidebarSection({
   const canToggle = Boolean(onToggleCollapsed);
 
   return (
-    <SidebarGroup className="group/sidebar-section">
+    <SidebarGroup className="group/sidebar-section select-none">
       <div className="relative">
         <SidebarGroupLabel asChild={canToggle}>
           {canToggle ? (
@@ -360,6 +408,7 @@ export function SidebarSection({
                   >
                     <ChannelMenuButton
                       channel={channel}
+                      activeWorking={activeWorkingByChannelId?.get(channel.id)}
                       dmParticipants={dmParticipantsByChannelId?.[channel.id]}
                       hasUnread={unreadChannelIds.has(channel.id)}
                       unreadCount={unreadChannelCounts.get(channel.id) ?? 0}
@@ -376,7 +425,10 @@ export function SidebarSection({
                     !(isActiveChannel && selectedChannelId === channel.id) ? (
                       <UnreadCountBadge
                         channelName={channel.name}
-                        className="absolute right-1 top-1/2 -translate-y-1/2"
+                        className={cn(
+                          "pointer-events-none absolute right-1 top-1/2 -translate-y-1/2 transition-opacity",
+                          onHideDm && SIDEBAR_ROW_ACTION_REPLACED_BADGE_CLASS,
+                        )}
                         count={Math.max(
                           unreadChannelCounts.get(channel.id) ?? 0,
                           1,
@@ -405,12 +457,9 @@ export function SidebarSection({
                   </SidebarMenuItem>
                 );
 
-                const hasContextAction =
-                  (unreadChannelIds.has(channel.id) && onMarkChannelRead) ||
-                  (!unreadChannelIds.has(channel.id) && onMarkChannelUnread) ||
-                  (onMuteChannel && onUnmuteChannel);
-
-                return hasContextAction ? (
+                // The shared menu always renders copy actions, so every row
+                // gets a context menu regardless of read/mute availability.
+                return (
                   <ContextMenu key={channel.id}>
                     <ContextMenuTrigger asChild>{menuItem}</ContextMenuTrigger>
                     <ContextMenuContent>
@@ -425,8 +474,6 @@ export function SidebarSection({
                       />
                     </ContextMenuContent>
                   </ContextMenu>
-                ) : (
-                  menuItem
                 );
               })}
             </SidebarMenu>
