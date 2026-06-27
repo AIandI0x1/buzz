@@ -1,5 +1,5 @@
 import * as React from "react";
-import { CircleDot, Octagon, Settings, TerminalSquare } from "lucide-react";
+import { Octagon, Settings, TerminalSquare } from "lucide-react";
 import { toast } from "sonner";
 
 import { ManagedAgentSessionPanel } from "@/features/agents/ui/ManagedAgentSessionPanel";
@@ -23,7 +23,6 @@ import {
   auxiliaryPanelHeaderBodyOffsetClass,
   auxiliaryPanelContentPaddingClass,
 } from "@/shared/layout/AuxiliaryPanelHeader";
-import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import {
@@ -34,11 +33,11 @@ import {
 } from "@/shared/ui/OverlayPanelBackdrop";
 import { THREAD_PANEL_MIN_WIDTH_PX } from "@/shared/hooks/useThreadPanelWidth";
 import { Switch } from "@/shared/ui/switch";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/shared/ui/dropdown-menu";
 import type { ChannelAgentSessionAgent } from "./useChannelAgentSessions";
@@ -89,6 +88,7 @@ export function AgentSessionThreadPanel({
     },
     [rawFeedScopeKey],
   );
+  const canStopCurrentTurn = isWorking && canInterruptTurn;
 
   async function handleInterruptTurn() {
     if (!channel) {
@@ -111,17 +111,12 @@ export function AgentSessionThreadPanel({
 
   const agentHeaderActions = (
     <AuxiliaryPanelHeaderActions>
-      {isLive && isWorking ? (
-        <Badge className="shrink-0 gap-1 px-2 py-0 text-2xs" variant="default">
-          <CircleDot className="h-2.5 w-2.5" />
-          Live
-        </Badge>
-      ) : null}
       {isLive ? (
         <DropdownMenu modal={false}>
           <DropdownMenuTrigger asChild>
             <Button
               aria-label="Open activity settings"
+              className="relative"
               data-testid="agent-session-settings-menu-trigger"
               size="icon"
               title="Activity settings"
@@ -129,6 +124,13 @@ export function AgentSessionThreadPanel({
               variant="ghost"
             >
               <Settings />
+              {canStopCurrentTurn ? (
+                <span
+                  aria-hidden="true"
+                  className="absolute bottom-1 right-1 h-2 w-2 rounded-full bg-primary ring-2 ring-background"
+                  data-testid="agent-session-settings-live-badge"
+                />
+              ) : null}
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent
@@ -167,34 +169,38 @@ export function AgentSessionThreadPanel({
                 onClick={(event) => event.stopPropagation()}
               />
             </DropdownMenuItem>
+            {isWorking ? (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  className="items-start gap-3"
+                  data-testid="agent-session-stop-turn"
+                  disabled={!canStopCurrentTurn}
+                  onSelect={() => {
+                    void handleInterruptTurn();
+                  }}
+                  title={
+                    canStopCurrentTurn
+                      ? "Interrupt the current ACP turn without stopping the agent process."
+                      : "Only locally managed agents can be interrupted from this workspace."
+                  }
+                >
+                  <Octagon className="mt-0.5 h-4 w-4 text-muted-foreground" />
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-sm font-medium">
+                      Stop current turn
+                    </span>
+                    {!canStopCurrentTurn ? (
+                      <span className="mt-0.5 block text-xs text-muted-foreground">
+                        Only available for locally managed agents.
+                      </span>
+                    ) : null}
+                  </span>
+                </DropdownMenuItem>
+              </>
+            ) : null}
           </DropdownMenuContent>
         </DropdownMenu>
-      ) : null}
-      {isLive && isWorking ? (
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              aria-label="Stop current agent turn"
-              className="h-6 px-2 text-2xs"
-              data-testid="agent-session-stop-turn"
-              disabled={!canInterruptTurn}
-              onClick={() => {
-                void handleInterruptTurn();
-              }}
-              size="sm"
-              type="button"
-              variant="outline"
-            >
-              <Octagon className="h-4 w-4" />
-              Stop
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom" className="text-xs">
-            {canInterruptTurn
-              ? "Interrupt the current ACP turn without stopping the agent process."
-              : "This agent cannot be interrupted from this workspace."}
-          </TooltipContent>
-        </Tooltip>
       ) : null}
       <AuxiliaryPanelHeaderCloseButton
         ariaLabel="Close activity panel"
