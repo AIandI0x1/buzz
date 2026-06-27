@@ -2568,7 +2568,7 @@ pub async fn publish_dm_visibility_snapshot(
     viewer: &[u8],
 ) -> anyhow::Result<()> {
     let viewer_hex = hex::encode(viewer);
-    let hidden = state.db.list_hidden_dms(viewer).await?;
+    let hidden = state.db.list_hidden_dms(tenant.community(), viewer).await?;
     let relay_pubkey_hex = state.relay_keypair.public_key().to_hex();
 
     let mut tags: Vec<Tag> = Vec::with_capacity(hidden.len() + 2);

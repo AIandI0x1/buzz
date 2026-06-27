@@ -56,8 +56,8 @@ pub async fn handle_command(
         KIND_DM_HIDE => handle_dm_hide(tenant, state, &event, &auth).await,
         KIND_WORKFLOW_DEF => handle_workflow_def(tenant, state, &event, &auth).await,
         KIND_WORKFLOW_TRIGGER => handle_workflow_trigger(tenant, state, &event, &auth).await,
-        KIND_APPROVAL_GRANT => handle_approval_grant(state, &event, &auth).await,
-        KIND_APPROVAL_DENY => handle_approval_deny(state, &event, &auth).await,
+        KIND_APPROVAL_GRANT => handle_approval_grant(tenant, state, &event, &auth).await,
+        KIND_APPROVAL_DENY => handle_approval_deny(tenant, state, &event, &auth).await,
         _ => Err(IngestError::Rejected(format!(
             "unknown command kind: {kind}"
         ))),
@@ -91,6 +91,7 @@ enum PersistResult {
 /// as the natural dedup key.
 async fn persist_command_event(
     state: &Arc<AppState>,
+    tenant: &TenantContext,
     event: &Event,
 ) -> Result<PersistResult, IngestError> {
     let channel_id = extract_channel_id(event);
@@ -129,11 +130,12 @@ async fn persist_command_event(
 
     let result = sqlx::query(
         r#"
-        INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id, d_tag)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        INSERT INTO events (community_id, id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id, d_tag)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         ON CONFLICT DO NOTHING
         "#,
     )
+    .bind(tenant.community().as_uuid())
     .bind(id_bytes.as_slice())
     .bind(pubkey_bytes.as_slice())
     .bind(created_at)
@@ -271,7 +273,7 @@ async fn handle_dm_open(
     }
 
     // Persist the command event (idempotency) — returns open transaction
-    let tx = match persist_command_event(state, event).await? {
+    let tx = match persist_command_event(state, tenant, event).await? {
         PersistResult::Duplicate => {
             return Ok(IngestResult {
                 event_id: event.id.to_hex(),
@@ -286,7 +288,7 @@ async fn handle_dm_open(
     let all_refs: Vec<&[u8]> = all_bytes.iter().map(|b| b.as_slice()).collect();
     let (channel, was_created) = state
         .db
-        .open_dm(&all_refs, &self_bytes)
+        .open_dm(tenant.community(), &all_refs, &self_bytes)
         .await
         .map_err(|e| IngestError::Internal(format!("error: db open_dm: {e}")))?;
 
@@ -425,7 +427,7 @@ async fn handle_dm_add_member(
     }
 
     // Persist the command event — returns open transaction
-    let tx = match persist_command_event(state, event).await? {
+    let tx = match persist_command_event(state, tenant, event).await? {
         PersistResult::Duplicate => {
             return Ok(IngestResult {
                 event_id: event.id.to_hex(),
@@ -440,7 +442,7 @@ async fn handle_dm_add_member(
     let all_refs: Vec<&[u8]> = all_bytes.iter().map(|b| b.as_slice()).collect();
     let (new_channel, was_created) = state
         .db
-        .open_dm(&all_refs, &self_bytes)
+        .open_dm(tenant.community(), &all_refs, &self_bytes)
         .await
         .map_err(|e| IngestError::Internal(format!("error: db open_dm: {e}")))?;
 
@@ -524,7 +526,7 @@ async fn handle_dm_hide(
     }
 
     // Persist the command event — returns open transaction
-    let tx = match persist_command_event(state, event).await? {
+    let tx = match persist_command_event(state, tenant, event).await? {
         PersistResult::Duplicate => {
             return Ok(IngestResult {
                 event_id: event.id.to_hex(),
@@ -538,7 +540,7 @@ async fn handle_dm_hide(
     // 4. Execute: hide_dm
     state
         .db
-        .hide_dm(channel_id, &self_bytes)
+        .hide_dm(tenant.community(), channel_id, &self_bytes)
         .await
         .map_err(|e| IngestError::Internal(format!("error: db hide_dm: {e}")))?;
 
@@ -614,7 +616,7 @@ async fn handle_workflow_def(
     let hash = compute_definition_hash(&definition_json_final);
 
     // Persist the command event — returns open transaction
-    let tx = match persist_command_event(state, event).await? {
+    let tx = match persist_command_event(state, tenant, event).await? {
         PersistResult::Duplicate => {
             return Ok(IngestResult {
                 event_id: event.id.to_hex(),
@@ -710,7 +712,7 @@ async fn handle_workflow_trigger(
     }
 
     // Persist the command event — returns open transaction
-    let tx = match persist_command_event(state, event).await? {
+    let tx = match persist_command_event(state, tenant, event).await? {
         PersistResult::Duplicate => {
             return Ok(IngestResult {
                 event_id: event.id.to_hex(),
@@ -843,6 +845,7 @@ fn check_approver_spec(approver_spec: &str, requester_hex: &str) -> Result<(), I
 }
 
 async fn handle_approval_grant(
+    tenant: &TenantContext,
     state: &Arc<AppState>,
     event: &Event,
     auth: &IngestAuth,
@@ -885,7 +888,7 @@ async fn handle_approval_grant(
     check_approver_spec(&approval.approver_spec, &self_hex)?;
 
     // Persist the command event — returns open transaction
-    let tx = match persist_command_event(state, event).await? {
+    let tx = match persist_command_event(state, tenant, event).await? {
         PersistResult::Duplicate => {
             return Ok(IngestResult {
                 event_id: event.id.to_hex(),
@@ -951,6 +954,7 @@ async fn handle_approval_grant(
 }
 
 async fn handle_approval_deny(
+    tenant: &TenantContext,
     state: &Arc<AppState>,
     event: &Event,
     auth: &IngestAuth,
@@ -992,7 +996,7 @@ async fn handle_approval_deny(
     check_approver_spec(&approval.approver_spec, &self_hex)?;
 
     // Persist the command event — returns open transaction
-    let tx = match persist_command_event(state, event).await? {
+    let tx = match persist_command_event(state, tenant, event).await? {
         PersistResult::Duplicate => {
             return Ok(IngestResult {
                 event_id: event.id.to_hex(),

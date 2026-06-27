@@ -889,55 +889,73 @@ impl Db {
     /// Find an existing DM by its participant hash.
     pub async fn find_dm_by_participants(
         &self,
+        community_id: CommunityId,
         participant_hash: &[u8],
     ) -> Result<Option<channel::ChannelRecord>> {
-        dm::find_dm_by_participants(&self.pool, participant_hash).await
+        dm::find_dm_by_participants(&self.pool, community_id, participant_hash).await
     }
 
     /// Create or return an existing DM channel.
     pub async fn create_dm(
         &self,
+        community_id: CommunityId,
         participants: &[&[u8]],
         created_by: &[u8],
     ) -> Result<channel::ChannelRecord> {
-        dm::create_dm(&self.pool, participants, created_by).await
+        dm::create_dm(&self.pool, community_id, participants, created_by).await
     }
 
     /// List all DMs for a user.
     pub async fn list_dms_for_user(
         &self,
+        community_id: CommunityId,
         pubkey: &[u8],
         limit: u32,
         cursor: Option<Uuid>,
     ) -> Result<Vec<dm::DmRecord>> {
-        dm::list_dms_for_user(&self.pool, pubkey, limit, cursor).await
+        dm::list_dms_for_user(&self.pool, community_id, pubkey, limit, cursor).await
     }
 
     /// Open or retrieve a DM for the given participants.
     pub async fn open_dm(
         &self,
+        community_id: CommunityId,
         pubkeys: &[&[u8]],
         created_by: &[u8],
     ) -> Result<(channel::ChannelRecord, bool)> {
-        dm::open_dm(&self.pool, pubkeys, created_by).await
+        dm::open_dm(&self.pool, community_id, pubkeys, created_by).await
     }
 
     /// Hide a DM channel for a specific user.
     ///
     /// The DM is not deleted — it can be restored by opening a new DM with
     /// the same participants.
-    pub async fn hide_dm(&self, channel_id: Uuid, pubkey: &[u8]) -> Result<()> {
-        dm::hide_dm(&self.pool, channel_id, pubkey).await
+    pub async fn hide_dm(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        pubkey: &[u8],
+    ) -> Result<()> {
+        dm::hide_dm(&self.pool, community_id, channel_id, pubkey).await
     }
 
     /// Unhide a DM channel for a specific user.
-    pub async fn unhide_dm(&self, channel_id: Uuid, pubkey: &[u8]) -> Result<()> {
-        dm::unhide_dm(&self.pool, channel_id, pubkey).await
+    pub async fn unhide_dm(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        pubkey: &[u8],
+    ) -> Result<()> {
+        dm::unhide_dm(&self.pool, community_id, channel_id, pubkey).await
     }
 
     /// List the channel IDs of all DMs the given user currently has hidden.
-    pub async fn list_hidden_dms(&self, pubkey: &[u8]) -> Result<Vec<Uuid>> {
-        dm::list_hidden_dms(&self.pool, pubkey).await
+    pub async fn list_hidden_dms(
+        &self,
+        community_id: CommunityId,
+        pubkey: &[u8],
+    ) -> Result<Vec<Uuid>> {
+        dm::list_hidden_dms(&self.pool, community_id, pubkey).await
     }
 
     /// Insert thread metadata.
