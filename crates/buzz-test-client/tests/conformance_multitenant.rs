@@ -1567,15 +1567,280 @@ mod channels_membership {
 mod workflows {
     use super::*;
 
-    /// Obligation: identical workflow UUID / approval-token hash in two
-    /// communities are independent; trigger evaluation only sees same-community
-    /// events; schedule execution is isolated (at-most-once per community).
+    use nostr::{EventBuilder, Keys, Kind, Tag};
+
+    /// Workflow definition command (NIP-custom kind 30620). `content` is the
+    /// YAML body; `h` tags the channel. The server *generates* the workflow id
+    /// and returns it in the OK message — it is **not** the `d` tag.
+    const KIND_WORKFLOW_DEF: u16 = 30620;
+    /// Workflow trigger command (kind 46020). `d` tag = the server-generated
+    /// workflow id to fire.
+    const KIND_WORKFLOW_TRIGGER: u16 = 46020;
+
+    /// Convert any base form to `http(s)://` for the REST `POST /events` door.
+    fn to_http(base: &str) -> String {
+        if base.starts_with("http://") || base.starts_with("https://") {
+            base.trim_end_matches('/').to_string()
+        } else {
+            base.replace("wss://", "https://")
+                .replace("ws://", "http://")
+                .trim_end_matches('/')
+                .to_string()
+        }
+    }
+
+    /// A minimal webhook-triggered workflow YAML. `send_message` is the simplest
+    /// valid action; the trigger type is irrelevant to *this* row (we fire via
+    /// the kind:46020 command door, not the webhook door), but it must parse.
+    fn workflow_yaml(name: &str) -> String {
+        format!(
+            "name: {name}\n\
+             description: conformance trigger-isolation probe\n\
+             trigger:\n\
+             \x20 on: webhook\n\
+             steps:\n\
+             \x20 - id: step1\n\
+             \x20   name: Notify\n\
+             \x20   action: send_message\n\
+             \x20   text: \"conformance\"\n"
+        )
+    }
+
+    /// Submit a signed event to the community bound to `http_base`'s host via
+    /// the REST bridge (`POST /events`). In dev mode (`BUZZ_REQUIRE_AUTH_TOKEN
+    /// =false`) the `X-Pubkey` header authenticates. Returns the parsed JSON
+    /// `{accepted, message, ...}` body. The community is derived from the host,
+    /// never from anything in the event — that's row zero.
+    async fn submit_event(http_base: &str, keys: &Keys, event: nostr::Event) -> serde_json::Value {
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{http_base}/events"))
+            .header("X-Pubkey", keys.public_key().to_hex())
+            .header("Content-Type", "application/json")
+            .body(serde_json::to_string(&event).expect("serialize event"))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("POST /events to {http_base} failed: {e}"));
+        let status = resp.status();
+        let body = resp.text().await.expect("read /events body");
+        assert!(
+            status.is_success(),
+            "POST /events to {http_base} returned HTTP {status}: {body}"
+        );
+        serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("parse /events JSON from {http_base}: {e} (body: {body})"))
+    }
+
+    /// Create an `open`-visibility channel with a caller-chosen UUID in the
+    /// community bound to `http_base`'s host (kind:9007, h-tag UUID → the
+    /// `create_channel_with_id` path, which bootstraps the creator as
+    /// owner-member). Using a caller-supplied UUID lets the test reuse the
+    /// *same* channel UUID across both communities: the PK is `(community_id,
+    /// id)`, so the same UUID legitimately co-exists, and `created_by` is
+    /// inserted into `channel_members` as `owner` on **each** side — so the one
+    /// keypair is a member of `U` in A *and* in B. That shared membership is
+    /// load-bearing: it removes "not a member" as an alternate explanation for
+    /// B rejecting the cross-community trigger, leaving the community fence on
+    /// `get_workflow` as the *only* thing that can produce the rejection.
+    async fn create_open_channel(http_base: &str, keys: &Keys, channel_uuid: uuid::Uuid) -> String {
+        let event = EventBuilder::new(Kind::Custom(9007), "")
+            .tags(vec![
+                Tag::parse(["h", &channel_uuid.to_string()]).unwrap(),
+                Tag::parse(["name", &format!("conformance-wf-{channel_uuid}")]).unwrap(),
+                Tag::parse(["channel_type", "stream"]).unwrap(),
+                Tag::parse(["visibility", "open"]).unwrap(),
+            ])
+            .sign_with_keys(keys)
+            .unwrap();
+        let body = submit_event(http_base, keys, event).await;
+        assert!(
+            body["accepted"].as_bool().unwrap_or(false),
+            "create-channel not accepted against {http_base}: {body}"
+        );
+        channel_uuid.to_string()
+    }
+
+    /// Define a workflow in `channel_id` on `http_base`'s community (kind:30620,
+    /// `h`=channel, content=YAML). Returns the **server-generated** workflow id,
+    /// parsed out of the OK message (`response:{"workflow_id":"…"}`). This id is
+    /// the tenant-scoped handle the trigger door confines: defined under A, it
+    /// only resolves under A.
+    async fn define_workflow(http_base: &str, keys: &Keys, channel_id: &str, name: &str) -> String {
+        // `h` binds the channel; `name` is required by `handle_workflow_def`
+        // (it rejects "missing workflow name" before parsing YAML). We use the
+        // `name` tag, not `d`: the server *generates* the workflow id, and that
+        // generated id — not any client-supplied `d` — is the handle this row
+        // confines. A `d` tag here would falsely imply the trigger resolves by
+        // client key.
+        let event = EventBuilder::new(Kind::Custom(KIND_WORKFLOW_DEF), workflow_yaml(name))
+            .tags(vec![
+                Tag::parse(["h", channel_id]).unwrap(),
+                Tag::parse(["name", name]).unwrap(),
+            ])
+            .sign_with_keys(keys)
+            .unwrap();
+        let body = submit_event(http_base, keys, event).await;
+        assert!(
+            body["accepted"].as_bool().unwrap_or(false),
+            "workflow def not accepted against {http_base}: {body}"
+        );
+        // The command executor returns `message: "response:{json}"` where json
+        // carries `workflow_id`. Extract it.
+        let msg = body["message"].as_str().unwrap_or_default();
+        let json_part = msg.strip_prefix("response:").unwrap_or_else(|| {
+            panic!("workflow def OK message missing `response:` prefix: {msg:?}")
+        });
+        let resp: serde_json::Value = serde_json::from_str(json_part)
+            .unwrap_or_else(|e| panic!("parse workflow def response json: {e} ({json_part:?})"));
+        resp["workflow_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("workflow def response missing workflow_id: {resp}"))
+            .to_string()
+    }
+
+    /// Fire a workflow by id on `http_base`'s community (kind:46020, `d`=id).
+    /// Returns the parsed `{accepted, message}` body so the caller can assert on
+    /// the *wire-observable* accept/reject and message. The relay resolves the
+    /// workflow with `get_workflow(host_community, id)` — community-scoped — so a
+    /// foreign-community id fails closed with a generic `invalid: workflow not
+    /// found`, indistinguishable from "no such id at all" (no cross-tenant
+    /// enumeration oracle).
+    async fn trigger_workflow(
+        http_base: &str,
+        keys: &Keys,
+        workflow_id: &str,
+    ) -> serde_json::Value {
+        let event = EventBuilder::new(Kind::Custom(KIND_WORKFLOW_TRIGGER), "")
+            .tags(vec![Tag::parse(["d", workflow_id]).unwrap()])
+            .sign_with_keys(keys)
+            .unwrap();
+        submit_event(http_base, keys, event).await
+    }
+
+    /// Obligation (trigger-confinement half): a workflow id defined under
+    /// community A is triggerable only under A. Firing A's id under host B —
+    /// even by a caller who is a legitimate member of the *same channel UUID* in
+    /// B — must fail closed, because trigger resolution is
+    /// `get_workflow(host_community, id)` and the row lives in A's community
+    /// only. The mirror positive (A fires its own id) must succeed, proving the
+    /// rejection is the community fence and not a workflow that is simply
+    /// untriggerable.
+    ///
+    /// Wire-observable shape (single keypair K; the fence under test must be
+    /// `community_id`, never `pubkey` or channel membership):
+    ///   1. Create the **same** channel UUID `U` in A and in B. PK is
+    ///      `(community_id, id)`, so both inserts succeed and K is bootstrapped
+    ///      as owner-member of `U` on *each* side (`create_channel_with_id`).
+    ///      This deliberately removes "not a member of U in B" as an alternate
+    ///      cause of the B rejection — K *is* a member of U in B.
+    ///   2. Define a workflow in `U` under **A** (kind:30620). The server
+    ///      generates `W` and returns it. `W` is an A-community row.
+    ///   3. Fire `W` under host **B** (kind:46020, `d`=W) as K. Must be
+    ///      rejected — `accepted == false` and the generic `workflow not found`
+    ///      message — because `get_workflow(B_community, W)` finds nothing: `W`
+    ///      exists only in A. K's membership of U-in-B is irrelevant; the
+    ///      lookup never reaches the membership check.
+    ///   4. Fire `W` under host **A** as K. Must be accepted — the positive
+    ///      half proves the rejection in (3) is community confinement, not a
+    ///      workflow that can never trigger. (This also exercises the
+    ///      same-community happy path through the very fence we're testing.)
+    ///
+    /// Mutate-bite (would-it-fail-without-the-fix): drop the community fence on
+    /// the trigger lookup at
+    /// `crates/buzz-relay/src/handlers/command_executor.rs:703`
+    /// (`get_workflow(community_id, workflow_id)` → bare-id lookup, e.g.
+    /// `get_workflow_any(workflow_id)`). Then B's trigger in step 3 loads A's
+    /// workflow row, passes the membership check against B's colliding channel
+    /// `U` (K is a member there), and **accepts** — step 3's `accepted == false`
+    /// assertion goes RED. Restore the `community_id` argument → GREEN. This is
+    /// the exact invariant commit `c81b89355` documents at that call site.
+    ///
+    /// NOTE — approval-token isolation is a **separate, not-yet-wire-live**
+    /// obligation, deliberately left as a `pending_lane` below. The grant
+    /// handler (`get_approval_by_stored_hash(community, hash)`) is already
+    /// community-scoped, but nothing *mints* a pending approval over the wire:
+    /// the executor's approval gate is an explicit TODO
+    /// (`crates/buzz-workflow/src/lib.rs` — "approval gates not yet implemented,
+    /// see WF-08") and `create_approval` is only reached from unit tests. A
+    /// green end-to-end approval-isolation test therefore cannot be exercised
+    /// today; writing one would violate this file's contract (a green run can
+    /// never be faked by an empty/DB-only body). It lands with WF-08.
     #[tokio::test]
     #[ignore]
-    async fn identical_workflow_and_approval_token_are_isolated() {
+    async fn workflow_trigger_is_community_confined() {
+        let http_a = to_http(&url_a());
+        let http_b = to_http(&url_b());
+
+        // One keypair across both communities — the fence under test must be
+        // community_id, never pubkey.
+        let keys = Keys::generate();
+
+        // (1) Same channel UUID in both communities. (community_id, id) PK
+        // permits this; K becomes owner-member of U on *each* side, so K's
+        // membership of U-in-B cannot explain the B rejection in step (3).
+        let shared_uuid = uuid::Uuid::new_v4();
+        let chan_a = create_open_channel(&http_a, &keys, shared_uuid).await;
+        let chan_b = create_open_channel(&http_b, &keys, shared_uuid).await;
+        assert_eq!(chan_a, chan_b, "channels must share UUID — test design");
+
+        // (2) Define the workflow under A. Server generates W.
+        let name = format!("wfconf_{}", uuid::Uuid::new_v4().simple());
+        let workflow_id = define_workflow(&http_a, &keys, &chan_a, &name).await;
+        assert!(
+            uuid::Uuid::parse_str(&workflow_id).is_ok(),
+            "server-generated workflow_id must be a UUID, got {workflow_id:?}"
+        );
+
+        // (3) Fire W under host B as K. Must fail closed: W is an A-community
+        // row, and get_workflow(B_community, W) finds nothing. K is a member of
+        // U in B, so a leak here is the community fence failing, not membership.
+        let b_resp = trigger_workflow(&http_b, &keys, &workflow_id).await;
+        assert_eq!(
+            b_resp["accepted"].as_bool(),
+            Some(false),
+            "host B accepted a trigger for an A-community workflow id — cross-community \
+             trigger leak. response: {b_resp}"
+        );
+        let b_msg = b_resp["message"].as_str().unwrap_or_default();
+        assert!(
+            b_msg.contains("workflow not found"),
+            "host B rejection must be the generic `workflow not found` (no enumeration \
+             oracle); got: {b_msg:?}"
+        );
+
+        // (4) Mirror positive: fire W under host A as K. Must be accepted —
+        // proves the B rejection is community confinement, not an
+        // untriggerable workflow, and exercises the same-community happy path
+        // through the fence under test.
+        let a_resp = trigger_workflow(&http_a, &keys, &workflow_id).await;
+        assert_eq!(
+            a_resp["accepted"].as_bool(),
+            Some(true),
+            "host A rejected a trigger for its own workflow id — positive control failed, \
+             so the B rejection cannot be attributed to community confinement. response: \
+             {a_resp}"
+        );
+    }
+
+    /// Obligation (approval-token half): an approval token (its stored hash)
+    /// minted under community A cannot be satisfied by a grant on host B, and
+    /// vice versa. The grant resolution is already community-scoped
+    /// (`get_approval_by_stored_hash(community, hash)`), but this half is
+    /// **not wire-live**: nothing mints a pending approval over the wire yet —
+    /// the executor approval gate is an explicit TODO (WF-08), and
+    /// `create_approval` is reached only from unit tests. Left as a precise
+    /// `pending_lane` so the WF-08 owner fills in *their* row; a green run can
+    /// never be faked by a DB-only/empty body. Depends on WF-08 (approval
+    /// minting), **not** buzz-db — the scoping fence it will exercise is
+    /// already landed.
+    #[tokio::test]
+    #[ignore]
+    async fn approval_token_is_community_confined() {
         pending_lane(
-            "buzz-db",
-            "same workflow UUID + approval hash in A and B act only within their community",
+            "WF-08 (approval minting)",
+            "an approval token minted under A cannot be satisfied by a grant on host B — \
+             blocked until the executor approval gate (WF-08) mints pending approvals over \
+             the wire; the get_approval_by_stored_hash(community, hash) fence is already landed",
         );
     }
 }
