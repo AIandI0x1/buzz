@@ -422,8 +422,8 @@ const MessageTimelineBase = React.forwardRef<
         ) : null}
         <div
           className={cn(
-            "absolute inset-0 overflow-y-auto overflow-x-hidden overscroll-none px-2 pt-1",
-            hasComposerOverlay ? "pb-24" : "pb-4",
+            "absolute inset-0 overflow-y-auto overflow-x-hidden overscroll-none px-2 pt-1 [overflow-anchor:none]",
+            hasComposerOverlay ? "pb-40" : "pb-4",
           )}
           data-scroll-restoration-id={scrollRestorationId}
           data-testid="message-timeline"
