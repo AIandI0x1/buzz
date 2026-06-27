@@ -118,14 +118,30 @@ async fn check_nip98_replay_with_guard(
     }
 }
 
-/// Reconstruct the canonical URL for NIP-98 verification from the relay config.
-fn canonical_url(relay_url: &str, path: &str) -> String {
-    let base = relay_url
-        .trim()
-        .trim_end_matches('/')
-        .replace("wss://", "https://")
-        .replace("ws://", "http://");
-    format!("{base}{path}")
+/// Construct the NIP-98 `u`-tag expected URL for a request bound to `tenant`.
+///
+/// Conformance row 44 obligation: "NIP-98 `u` URL host must match
+/// `req.community`." Host comes from the resolved [`TenantContext`] — the
+/// same host the row-zero seam already bound from the request `Host` header —
+/// and the scheme comes from the deployment's configured relay URL so
+/// `ws`/`wss` deployments map to `http`/`https` consistently with how the
+/// client signs the URL it is actually hitting.
+///
+/// Critically, this does NOT use `config_relay_url`'s host. `config.relay_url`
+/// is one static string per deployment; under multi-tenant a relay serves many
+/// hosts, only one of which would match. Using it as the URL match key would
+/// (a) accept a NIP-98 event signed for community A's host when the request
+/// arrives at community B's host (host-binding side door — verify_nip98 would
+/// pass and the relay would proceed against the wrong tenant's auth context),
+/// and (b) reject every legitimate request whose community host isn't the
+/// single configured one. Substituting `tenant.host()` closes both directions.
+fn nip98_expected_url(config_relay_url: &str, tenant: &TenantContext, path: &str) -> String {
+    let scheme = if config_relay_url.trim_start().starts_with("wss://") {
+        "https"
+    } else {
+        "http"
+    };
+    format!("{scheme}://{}{path}", tenant.host())
 }
 
 /// Extract a channel UUID from a single filter's `#h` tag.
@@ -206,7 +222,7 @@ pub async fn submit_event(
             )
         })?;
 
-    let url = canonical_url(&state.config.relay_url, "/events");
+    let url = nip98_expected_url(&state.config.relay_url, &tenant, "/events");
     let (pubkey, event_id_bytes) = verify_bridge_auth(
         &headers,
         "POST",
@@ -295,7 +311,7 @@ pub async fn query_events(
             )
         })?;
 
-    let url = canonical_url(&state.config.relay_url, "/query");
+    let url = nip98_expected_url(&state.config.relay_url, &tenant, "/query");
     let (pubkey, event_id_bytes) = verify_bridge_auth(
         &headers,
         "POST",
@@ -570,7 +586,7 @@ pub async fn count_events(
             )
         })?;
 
-    let url = canonical_url(&state.config.relay_url, "/count");
+    let url = nip98_expected_url(&state.config.relay_url, &tenant, "/count");
     let (pubkey, event_id_bytes) = verify_bridge_auth(
         &headers,
         "POST",
@@ -1241,6 +1257,151 @@ mod tests {
             msg.contains("replay check unavailable"),
             "fail-closed body must carry the unavailable signal so callers can \
              distinguish unavailability from replay; got body = {body:?}"
+        );
+    }
+
+    /// Build a signed NIP-98 event JSON string for `url` + `method`, mirroring
+    /// `buzz_auth::nip98::tests::make_nip98_event` so the bridge tests don't
+    /// reach into buzz-auth's test scope.
+    fn build_nip98_event_json(keys: &Keys, url: &str, method: &str) -> String {
+        let tags = vec![
+            Tag::parse(["u", url]).expect("u tag"),
+            Tag::parse(["method", method]).expect("method tag"),
+        ];
+        let event = EventBuilder::new(Kind::HttpAuth, "")
+            .tags(tags)
+            .sign_with_keys(keys)
+            .expect("sign NIP-98 event");
+        serde_json::to_string(&event).expect("serialize")
+    }
+
+    /// Build a `HeaderMap` with the NIP-98 event base64-encoded in
+    /// `Authorization: Nostr <base64>`, matching the production bridge auth
+    /// header shape.
+    fn nip98_auth_headers(event_json: &str) -> axum::http::HeaderMap {
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        let mut headers = axum::http::HeaderMap::new();
+        let value = format!("Nostr {}", BASE64.encode(event_json.as_bytes()));
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            value.parse().expect("valid header value"),
+        );
+        headers
+    }
+
+    /// Row 44 obligation: a NIP-98 event signed against community A's host
+    /// MUST be rejected at the bridge when the request resolves to community
+    /// B's host. The conformance text in `docs/multi-tenant-conformance.md`
+    /// states: "NIP-98 `u` URL host must match `req.community`". Before this
+    /// gap closed, `expected_url` was derived from `state.config.relay_url`
+    /// (one static string per deployment), so any request to *any* host on a
+    /// multi-tenant deployment would verify against community A's URL — both
+    /// admitting cross-host forgeries (event signed for A presented at B) and
+    /// rejecting every legitimate request whose community host wasn't the
+    /// single configured one.
+    ///
+    /// This test bites if `nip98_expected_url` is reverted to use
+    /// `config.relay_url`'s host (the original `canonical_url` behavior).
+    #[test]
+    fn verify_bridge_auth_rejects_nip98_event_signed_for_wrong_communitys_host() {
+        let keys = Keys::generate();
+        // Client signs an event for community A's host, then presents it at a
+        // request whose `Host` header resolved to community B.
+        let signed_url = "https://host-a.example/events";
+        let event_json = build_nip98_event_json(&keys, signed_url, "POST");
+        let headers = nip98_auth_headers(&event_json);
+
+        let config_relay_url = "wss://host-a.example"; // doesn't matter — only used for scheme.
+        let tenant_b = fresh_tenant("host-b.example");
+        let expected_url = nip98_expected_url(config_relay_url, &tenant_b, "/events");
+
+        let (status, body) = verify_bridge_auth(&headers, "POST", &expected_url, Some(b""), true)
+            .expect_err(
+                "cross-host NIP-98 event MUST be rejected — row 44: `u` URL host \
+                 must match req.community",
+            );
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "cross-host rejection must be a 401, not silently admitted"
+        );
+        let msg = body
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            msg.contains("URL mismatch"),
+            "rejection must carry the URL-mismatch signal so callers can \
+             distinguish it from other auth failures; got body = {body:?}"
+        );
+    }
+
+    /// Positive control for the cross-host test: a NIP-98 event signed for
+    /// host A MUST be accepted at a request whose tenant resolved to host A.
+    /// Without this, the cross-host test could be passing vacuously (e.g. if
+    /// `nip98_expected_url` always produced a URL no event could match).
+    #[test]
+    fn verify_bridge_auth_accepts_nip98_event_signed_for_matching_host() {
+        let keys = Keys::generate();
+        let signed_url = "https://host-a.example/events";
+        let event_json = build_nip98_event_json(&keys, signed_url, "POST");
+        let headers = nip98_auth_headers(&event_json);
+
+        // Configured relay URL deliberately differs in host from the request's
+        // tenant host — proving the helper uses `tenant.host()`, not the config.
+        let config_relay_url = "wss://other-config-host.example";
+        let tenant_a = fresh_tenant("host-a.example");
+        let expected_url = nip98_expected_url(config_relay_url, &tenant_a, "/events");
+
+        let (pubkey, _event_id_bytes) =
+            verify_bridge_auth(&headers, "POST", &expected_url, Some(b""), true)
+                .expect("matching-host NIP-98 event must verify");
+        assert_eq!(
+            pubkey,
+            keys.public_key(),
+            "returned pubkey must be the signer's"
+        );
+    }
+
+    /// `nip98_expected_url` derives host from `tenant`, not from
+    /// `config_relay_url`. Pin both directions: changing the tenant's host
+    /// changes the output; changing the config's host does NOT.
+    #[test]
+    fn nip98_expected_url_uses_tenant_host_not_config_host() {
+        let tenant_a = fresh_tenant("host-a.example");
+        let tenant_b = fresh_tenant("host-b.example");
+
+        let url_a = nip98_expected_url("wss://config-host.example", &tenant_a, "/events");
+        let url_b = nip98_expected_url("wss://config-host.example", &tenant_b, "/events");
+        assert_eq!(url_a, "https://host-a.example/events");
+        assert_eq!(url_b, "https://host-b.example/events");
+
+        // Same tenant, two different config hosts → output is identical.
+        // (If config-host ever leaked into the URL, this assertion would bite.)
+        let url_a_alt_config =
+            nip98_expected_url("wss://different-config.example", &tenant_a, "/events");
+        assert_eq!(
+            url_a, url_a_alt_config,
+            "config-relay-url's host MUST NOT influence the NIP-98 expected URL — \
+             only its scheme contributes"
+        );
+    }
+
+    /// `nip98_expected_url` derives scheme from `config_relay_url`'s prefix:
+    /// `wss://` → `https`, everything else → `http`. Deployments that run
+    /// `ws://` in dev/test still need a NIP-98 URL the client can sign against.
+    #[test]
+    fn nip98_expected_url_derives_scheme_from_config() {
+        let tenant = fresh_tenant("host-a.example");
+        assert_eq!(
+            nip98_expected_url("wss://config.example", &tenant, "/events"),
+            "https://host-a.example/events",
+            "wss:// production config → https:// URL"
+        );
+        assert_eq!(
+            nip98_expected_url("ws://config.example", &tenant, "/events"),
+            "http://host-a.example/events",
+            "ws:// dev config → http:// URL"
         );
     }
 
