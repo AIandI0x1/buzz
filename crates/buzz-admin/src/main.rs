@@ -189,7 +189,8 @@ async fn cmd_remove_member(pubkey_arg: String, role_filter: Option<String>) -> R
         db.remove_relay_member_if_role(tenant.community(), &pubkey_hex, role)
             .await
     } else {
-        db.remove_relay_member(tenant.community(), &pubkey_hex).await
+        db.remove_relay_member(tenant.community(), &pubkey_hex)
+            .await
     };
 
     match result {

@@ -248,8 +248,14 @@ mod tests {
     fn relay_url_authority_collapses_default_ports() {
         // Default ports collapse to the bare host, matching how an inbound
         // `Host` header for the same deployment normalizes.
-        assert_eq!(relay_url_authority("wss://relay.example:443"), "relay.example");
-        assert_eq!(relay_url_authority("ws://relay.example:80"), "relay.example");
+        assert_eq!(
+            relay_url_authority("wss://relay.example:443"),
+            "relay.example"
+        );
+        assert_eq!(
+            relay_url_authority("ws://relay.example:80"),
+            "relay.example"
+        );
         assert_eq!(relay_url_authority("wss://relay.example"), "relay.example");
     }
 

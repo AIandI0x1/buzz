@@ -591,7 +591,7 @@ async fn main() -> anyhow::Result<()> {
                         )
                         .await
                     {
-                        Ok(true) => {} // We won the claim — proceed to publish.
+                        Ok(true) => {}         // We won the claim — proceed to publish.
                         Ok(false) => continue, // Another pod claimed it; no side effect here.
                         Err(e) => {
                             warn!(

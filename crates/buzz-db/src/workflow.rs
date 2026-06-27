@@ -936,8 +936,15 @@ pub async fn update_approval(
     note: Option<&str>,
 ) -> Result<bool> {
     let token_hash = hash_approval_token(token);
-    update_approval_by_stored_hash(pool, community_id, &token_hash, status, approver_pubkey, note)
-        .await
+    update_approval_by_stored_hash(
+        pool,
+        community_id,
+        &token_hash,
+        status,
+        approver_pubkey,
+        note,
+    )
+    .await
 }
 
 /// Update an approval by its already-hashed token value.
@@ -1961,10 +1968,22 @@ mod tests {
         // Same workflow UUID and channel UUID in both communities.
         let shared_workflow_id = Uuid::new_v4();
         let shared_channel_id = Uuid::new_v4();
-        insert_workflow_with_ids(&pool, community_a, shared_workflow_id, shared_channel_id, "wf-A")
-            .await;
-        insert_workflow_with_ids(&pool, community_b, shared_workflow_id, shared_channel_id, "wf-B")
-            .await;
+        insert_workflow_with_ids(
+            &pool,
+            community_a,
+            shared_workflow_id,
+            shared_channel_id,
+            "wf-A",
+        )
+        .await;
+        insert_workflow_with_ids(
+            &pool,
+            community_b,
+            shared_workflow_id,
+            shared_channel_id,
+            "wf-B",
+        )
+        .await;
 
         // Scoped get returns each community's own row, never the other's.
         let from_a = get_workflow(&pool, community_a, shared_workflow_id)
@@ -1973,9 +1992,15 @@ mod tests {
         let from_b = get_workflow(&pool, community_b, shared_workflow_id)
             .await
             .expect("B's workflow exists");
-        assert_eq!(from_a.community_id, community_a, "A lookup must resolve A's row");
+        assert_eq!(
+            from_a.community_id, community_a,
+            "A lookup must resolve A's row"
+        );
         assert_eq!(from_a.name, "wf-A");
-        assert_eq!(from_b.community_id, community_b, "B lookup must resolve B's row");
+        assert_eq!(
+            from_b.community_id, community_b,
+            "B lookup must resolve B's row"
+        );
         assert_eq!(from_b.name, "wf-B");
 
         // A workflow that exists ONLY in B must be NotFound under A.
@@ -1993,7 +2018,11 @@ mod tests {
         let listed_a = list_enabled_channel_workflows(&pool, community_a, shared_channel_id)
             .await
             .expect("list A");
-        assert_eq!(listed_a.len(), 1, "A's channel listing must contain exactly A's workflow");
+        assert_eq!(
+            listed_a.len(),
+            1,
+            "A's channel listing must contain exactly A's workflow"
+        );
         assert_eq!(listed_a[0].community_id, community_a);
         assert_eq!(listed_a[0].name, "wf-A");
     }
@@ -2010,10 +2039,22 @@ mod tests {
         let community_a = make_community(&pool).await;
         let community_b = make_community(&pool).await;
         let shared_workflow_id = Uuid::new_v4();
-        insert_workflow_with_ids(&pool, community_a, shared_workflow_id, Uuid::new_v4(), "wf-A")
-            .await;
-        insert_workflow_with_ids(&pool, community_b, shared_workflow_id, Uuid::new_v4(), "wf-B")
-            .await;
+        insert_workflow_with_ids(
+            &pool,
+            community_a,
+            shared_workflow_id,
+            Uuid::new_v4(),
+            "wf-A",
+        )
+        .await;
+        insert_workflow_with_ids(
+            &pool,
+            community_b,
+            shared_workflow_id,
+            Uuid::new_v4(),
+            "wf-B",
+        )
+        .await;
 
         delete_workflow(&pool, community_a, shared_workflow_id)
             .await
@@ -2094,8 +2135,12 @@ mod tests {
         .expect("create approval B");
 
         // Scoped read returns each community's own approval (its own run id).
-        let read_a = get_approval(&pool, community_a, token).await.expect("read A");
-        let read_b = get_approval(&pool, community_b, token).await.expect("read B");
+        let read_a = get_approval(&pool, community_a, token)
+            .await
+            .expect("read A");
+        let read_b = get_approval(&pool, community_b, token)
+            .await
+            .expect("read B");
         assert_eq!(read_a.run_id, run_a, "A read must resolve A's approval");
         assert_eq!(read_b.run_id, run_b, "B read must resolve B's approval");
 
@@ -2113,8 +2158,12 @@ mod tests {
         .expect("grant A");
         assert!(granted, "A's approval must be granted");
 
-        let after_a = get_approval(&pool, community_a, token).await.expect("re-read A");
-        let after_b = get_approval(&pool, community_b, token).await.expect("re-read B");
+        let after_a = get_approval(&pool, community_a, token)
+            .await
+            .expect("re-read A");
+        let after_b = get_approval(&pool, community_b, token)
+            .await
+            .expect("re-read B");
         assert_eq!(after_a.status, ApprovalStatus::Granted, "A is now granted");
         assert_eq!(
             after_b.status,

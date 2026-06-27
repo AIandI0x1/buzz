@@ -28,11 +28,7 @@ pub struct RelayMember {
 }
 
 /// Returns `true` if `pubkey` (64-char hex) is a member of `community`.
-pub async fn is_relay_member(
-    pool: &PgPool,
-    community: CommunityId,
-    pubkey: &str,
-) -> Result<bool> {
+pub async fn is_relay_member(pool: &PgPool, community: CommunityId, pubkey: &str) -> Result<bool> {
     let row = sqlx::query("SELECT 1 FROM relay_members WHERE community_id = $1 AND pubkey = $2")
         .bind(community.as_uuid())
         .bind(pubkey)
@@ -70,10 +66,7 @@ pub async fn get_relay_member(
 }
 
 /// Returns all relay members of `community` ordered by `created_at` ascending.
-pub async fn list_relay_members(
-    pool: &PgPool,
-    community: CommunityId,
-) -> Result<Vec<RelayMember>> {
+pub async fn list_relay_members(pool: &PgPool, community: CommunityId) -> Result<Vec<RelayMember>> {
     let rows = sqlx::query(
         "SELECT pubkey, role, added_by, created_at, updated_at \
          FROM relay_members WHERE community_id = $1 ORDER BY created_at ASC",
@@ -315,12 +308,11 @@ pub async fn backfill_from_allowlist(pool: &PgPool, community: CommunityId) -> R
     // Only backfill if this community's relay_members is empty — once it has
     // rows (from a previous backfill or manual admin commands), we must not
     // re-add members that were intentionally removed.
-    let has_members: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM relay_members WHERE community_id = $1)",
-    )
-    .bind(community.as_uuid())
-    .fetch_one(pool)
-    .await?;
+    let has_members: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM relay_members WHERE community_id = $1)")
+            .bind(community.as_uuid())
+            .fetch_one(pool)
+            .await?;
 
     if has_members {
         return Ok(0);

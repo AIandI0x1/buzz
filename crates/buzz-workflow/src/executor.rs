@@ -1149,7 +1149,14 @@ async fn execute_steps(
             .unwrap_or(engine.config.default_timeout_secs);
         let dispatch_result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
-            dispatch_action(&step.id, &resolved_action, engine, community_id, run_id, trigger_ctx),
+            dispatch_action(
+                &step.id,
+                &resolved_action,
+                engine,
+                community_id,
+                run_id,
+                trigger_ctx,
+            ),
         )
         .await;
 

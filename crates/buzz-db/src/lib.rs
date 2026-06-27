@@ -268,10 +268,7 @@ impl Db {
     /// fan out under *that* community rather than the deployment default. The
     /// community is authoritative; the host is read back for labelling only and
     /// is never used to re-derive the community.
-    pub async fn lookup_community_host(
-        &self,
-        community_id: CommunityId,
-    ) -> Result<Option<String>> {
+    pub async fn lookup_community_host(&self, community_id: CommunityId) -> Result<Option<String>> {
         let row = sqlx::query(
             r#"
             SELECT host
@@ -1598,8 +1595,13 @@ impl Db {
         workflow_id: Uuid,
         scheduled_for: chrono::DateTime<chrono::Utc>,
     ) -> Result<Option<workflow::ScheduledWorkflowFireClaim>> {
-        workflow::claim_scheduled_workflow_fire(&self.pool, community_id, workflow_id, scheduled_for)
-            .await
+        workflow::claim_scheduled_workflow_fire(
+            &self.pool,
+            community_id,
+            workflow_id,
+            scheduled_for,
+        )
+        .await
     }
 
     /// Fetch the latest claimed schedule instant for interval trigger anchoring.
@@ -1794,8 +1796,15 @@ impl Db {
         approver_pubkey: Option<&[u8]>,
         note: Option<&str>,
     ) -> Result<bool> {
-        workflow::update_approval(&self.pool, community_id, token, status, approver_pubkey, note)
-            .await
+        workflow::update_approval(
+            &self.pool,
+            community_id,
+            token,
+            status,
+            approver_pubkey,
+            note,
+        )
+        .await
     }
 
     /// Update an approval by its already-hashed token (no re-hashing).

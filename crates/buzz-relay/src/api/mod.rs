@@ -86,9 +86,7 @@ pub mod relay_members {
                             .db
                             .is_relay_member(community, &owner_hex)
                             .await
-                            .map_err(|e| {
-                                format!("relay membership check (owner) failed: {e}")
-                            })?;
+                            .map_err(|e| format!("relay membership check (owner) failed: {e}"))?;
                         if owner_is_member {
                             debug!(
                                 agent = %pubkey_hex,

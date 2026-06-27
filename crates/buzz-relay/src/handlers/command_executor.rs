@@ -809,7 +809,9 @@ async fn handle_workflow_trigger(
             None,
         )
         .await;
-        engine.finalize_run(community_id, run_id, result, None).await;
+        engine
+            .finalize_run(community_id, run_id, result, None)
+            .await;
     });
 
     // 6. Return response

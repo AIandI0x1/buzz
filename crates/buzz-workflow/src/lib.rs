@@ -334,7 +334,9 @@ impl WorkflowEngine {
                 let result =
                     executor::execute_run(&engine, community_id, run_id, &def_clone, &ctx_clone)
                         .await;
-                engine.finalize_run(community_id, run_id, result, None).await;
+                engine
+                    .finalize_run(community_id, run_id, result, None)
+                    .await;
             });
         }
 
@@ -366,14 +368,7 @@ impl WorkflowEngine {
         last: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
     ) -> bool {
-        interval_prefilter_should_fire(
-            &self.last_fired,
-            community_id,
-            workflow_id,
-            dur,
-            last,
-            now,
-        )
+        interval_prefilter_should_fire(&self.last_fired, community_id, workflow_id, dur, last, now)
     }
 
     /// Background loop for scheduled (cron/interval) triggers.
@@ -614,10 +609,17 @@ impl WorkflowEngine {
                 let def_clone = def.clone();
                 let ctx_clone = trigger_ctx.clone();
                 tokio::spawn(async move {
-                    let result =
-                        executor::execute_run(&engine, community_id, run_id, &def_clone, &ctx_clone)
-                            .await;
-                    engine.finalize_run(community_id, run_id, result, None).await;
+                    let result = executor::execute_run(
+                        &engine,
+                        community_id,
+                        run_id,
+                        &def_clone,
+                        &ctx_clone,
+                    )
+                    .await;
+                    engine
+                        .finalize_run(community_id, run_id, result, None)
+                        .await;
                 });
             }
 
@@ -676,7 +678,11 @@ fn cron_fire_instant(
 /// so they collide on one `(community, workflow, scheduled_for)` claim — only
 /// one wins and creates the run. Returns `None` if the duration is unparseable
 /// or non-positive (the caller skips firing).
-fn interval_fire_instant(dur: &str, now: DateTime<Utc>, workflow_id: Uuid) -> Option<DateTime<Utc>> {
+fn interval_fire_instant(
+    dur: &str,
+    now: DateTime<Utc>,
+    workflow_id: Uuid,
+) -> Option<DateTime<Utc>> {
     match executor::parse_duration_secs(dur) {
         Ok(interval_secs) if interval_secs > 0 => {
             let secs = interval_secs as i64;
