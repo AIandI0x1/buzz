@@ -474,12 +474,36 @@ jobs:
         with:
           name: desktop-e2e-relay
           path: target/ci
+      - name: Apply schema and seed deployment community
+        # MT: the relay resolves each request's tenant from the communities host
+        # map and fails closed on an unmapped host. The reminder scheduler binds
+        # the deployment community ONCE at boot and exits permanently on an
+        # unmapped host (no retry, unlike the channel reconciler), so the
+        # 'localhost:3000' community MUST exist before the relay starts — seeding
+        # after boot leaves the scheduler dead. The relay migrates at boot via
+        # BUZZ_AUTO_MIGRATE, but that's too late for the pre-boot seed, so apply
+        # the schema here first (then drop AUTO_MIGRATE below). lower(host) is the
+        # unique index → ON CONFLICT target. psql isn't on PATH in hermit → exec
+        # into the buzz-postgres container.
+        env:
+          PGHOST: localhost
+          PGPORT: "5432"
+          PGUSER: buzz
+          PGPASSWORD: buzz_dev
+          PGDATABASE: buzz
+        run: |
+          ./bin/pgschema apply --file schema/schema.sql --auto-approve
+          docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
+            psql -U buzz -d buzz -qtA -c "
+          INSERT INTO communities (id, host)
+          VALUES ('00000000-0000-4000-8000-00000000c0de', 'localhost:3000')
+          ON CONFLICT (lower(host)) DO NOTHING
+          ;"
       - name: Start relay
         run: |
           chmod +x ./target/ci/buzz-relay
           nohup env \
             DATABASE_URL=postgres://buzz:buzz_dev@localhost:5432/buzz \
-            BUZZ_AUTO_MIGRATE=true \
             REDIS_URL=redis://localhost:6379 \
             TYPESENSE_URL=http://localhost:8108 \
             TYPESENSE_API_KEY=buzz_dev_key \
@@ -504,20 +528,6 @@ jobs:
           done
           cat /tmp/buzz-relay.log
           exit 1
-      - name: Seed deployment community
-        # MT: the relay resolves each connection's tenant from the communities
-        # host map and fails closed on an unmapped host. This suite connects over
-        # ws://localhost:3000 and creates channels at runtime, so the
-        # 'localhost:3000' community must exist or every connection 404s at
-        # host-binding. The relay's reconciler retries for 2min, so seeding after
-        # relay start is fine. lower(host) is the unique index → ON CONFLICT target.
-        run: |
-          docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
-            psql -U buzz -d buzz -qtA -c "
-          INSERT INTO communities (id, host)
-          VALUES ('00000000-0000-4000-8000-00000000c0de', 'localhost:3000')
-          ON CONFLICT (lower(host)) DO NOTHING
-          ;"
       - name: NIP-ER reminder e2e
         # Feature e2e for NIP-ER (Event Reminders, kind:30300): write-path
         # validation, author-only read filtering, and scheduler delivery against
