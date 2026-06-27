@@ -948,16 +948,303 @@ mod channelless_global_events_dms {
 mod channels_membership {
     use super::*;
 
+    use buzz_test_client::BuzzTestClient;
+    use nostr::{EventBuilder, Keys, Kind, Tag};
+
+    /// Convert any base form to `ws(s)://` for WS connect.
+    fn to_ws(base: &str) -> String {
+        if base.starts_with("ws://") || base.starts_with("wss://") {
+            base.trim_end_matches('/').to_string()
+        } else {
+            base.replace("https://", "wss://")
+                .replace("http://", "ws://")
+                .trim_end_matches('/')
+                .to_string()
+        }
+    }
+
+    /// Convert any base form to `http(s)://` for REST.
+    fn to_http(base: &str) -> String {
+        if base.starts_with("http://") || base.starts_with("https://") {
+            base.trim_end_matches('/').to_string()
+        } else {
+            base.replace("wss://", "https://")
+                .replace("ws://", "http://")
+                .trim_end_matches('/')
+                .to_string()
+        }
+    }
+
+    /// Create a `visibility=open`, `channel_type=stream` channel with a
+    /// caller-chosen UUID in the community resolved by `http_base` (the relay
+    /// derives community from the request host; UUID is client-supplied per
+    /// kind:9007 semantics, and the community is server-resolved). Returns
+    /// the channel UUID hex (== `channel_uuid` input).
+    ///
+    /// Using a caller-supplied UUID is the load-bearing setup for this row:
+    /// the obligation asserts the *same UUID* in two communities, which the
+    /// channels PK `(community_id, id)` permits. The relay accepts the UUID
+    /// because it is paired with the community-from-host, not with a
+    /// client-supplied tenant — verify by reading the create-channel path in
+    /// `crates/buzz-relay/src/handlers/side_effects.rs::handle_create_group`.
+    async fn create_channel(http_base: &str, keys: &Keys, channel_uuid: uuid::Uuid) -> String {
+        let client = reqwest::Client::new();
+        let pubkey_hex = keys.public_key().to_hex();
+        let event = EventBuilder::new(Kind::Custom(9007), "")
+            .tags(vec![
+                Tag::parse(["h", &channel_uuid.to_string()]).unwrap(),
+                Tag::parse(["name", &format!("conformance-channels-{channel_uuid}")]).unwrap(),
+                Tag::parse(["channel_type", "stream"]).unwrap(),
+                Tag::parse(["visibility", "open"]).unwrap(),
+            ])
+            .sign_with_keys(keys)
+            .unwrap();
+        let resp = client
+            .post(format!("{http_base}/events"))
+            .header("X-Pubkey", &pubkey_hex)
+            .header("Content-Type", "application/json")
+            .body(serde_json::to_string(&event).unwrap())
+            .send()
+            .await
+            .expect("submit create-channel");
+        assert!(
+            resp.status().is_success(),
+            "create-channel HTTP failed against {http_base}: {}",
+            resp.status()
+        );
+        let body: serde_json::Value = resp.json().await.expect("parse create-channel response");
+        assert!(
+            body["accepted"].as_bool().unwrap_or(false),
+            "create-channel not accepted against {http_base}: {body}"
+        );
+        channel_uuid.to_string()
+    }
+
+    /// Post a kind:9 message to `channel_id` over a WS-AUTH'd connection,
+    /// returning the event id hex. The post succeeds because the channel is
+    /// `visibility=open` in its host-derived community; the `#h: channel_id`
+    /// tag is checked against `tenant.community()` (the host-derived
+    /// community), so a post to A's channel via A's connection resolves to
+    /// A's channel row, never B's.
+    async fn post_kind9(
+        client: &mut BuzzTestClient,
+        keys: &Keys,
+        channel_id: &str,
+        content: &str,
+    ) -> String {
+        let h_tag = Tag::parse(["h", channel_id]).unwrap();
+        let event = EventBuilder::new(Kind::Custom(9), content)
+            .tags([h_tag])
+            .sign_with_keys(keys)
+            .unwrap();
+        let id_hex = event.id.to_hex();
+        let ok = client.send_event(event).await.expect("send kind:9");
+        assert!(ok.accepted, "kind:9 not accepted: {}", ok.message);
+        id_hex
+    }
+
+    /// Query kind:9 events on a given channel via REST `POST /query`
+    /// (dev-mode `X-Pubkey` auth — no NIP-98 mint needed under the
+    /// `BUZZ_REQUIRE_AUTH_TOKEN=false` recipe). Returns the events as their
+    /// raw JSON values (typically 0 or more depending on what the
+    /// host-derived community has stored against that channel id).
+    async fn query_kind9_in_channel(
+        http_base: &str,
+        pubkey_hex: &str,
+        channel_id: &str,
+    ) -> Vec<serde_json::Value> {
+        let client = reqwest::Client::new();
+        let filters = serde_json::json!([{
+            "kinds": [9],
+            "#h": [channel_id],
+            "limit": 100,
+        }]);
+        let resp = client
+            .post(format!("{http_base}/query"))
+            .header("X-Pubkey", pubkey_hex)
+            .header("Content-Type", "application/json")
+            .body(serde_json::to_string(&filters).unwrap())
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("POST /query against {http_base} failed: {e}"));
+        assert!(
+            resp.status().is_success(),
+            "POST /query against {http_base} returned {}",
+            resp.status()
+        );
+        resp.json().await.expect("parse /query JSON")
+    }
+
     /// Obligation: the same channel UUID legitimately co-exists in two
     /// communities (DB PK `(community_id, id)`); an `h` tag resolving to a
     /// channel in another community is rejected generically.
+    ///
+    /// # What this row asserts: the **coexistence** half of the obligation
+    ///
+    /// This row's scope is the **positive arm** of the same `is_member_cached`
+    /// scope branch that [`super::row_zero_host_binding::client_supplied_community_cannot_override_host`]
+    /// exercises as the **negative arm**. Sibling-not-replacement, per the
+    /// frame Dawn established when reading row_zero (b):
+    ///
+    ///   * **row_zero (b) (override-attempt)**: channel U exists *only in B*;
+    ///     an A connection `#h`-tagging it is rejected (the negative arm of
+    ///     `is_member_cached(A, U)`, which returns `false` because
+    ///     `get_channel(A, U)` is `None`). Proves: client-supplied claim
+    ///     never overrides host-derived community.
+    ///   * **this row (coexistence)**: channel U exists in *both* A and B
+    ///     as distinct rows (legal under the `(community_id, id)` PK);
+    ///     posts in A land only in A's instance; posts in B land only in
+    ///     B's instance. The positive arm of `is_member_cached`: when U
+    ///     exists in the tenant-derived community, the membership/permission
+    ///     check finds the *right* row, not the other community's.
+    ///
+    /// A bug that resolves `get_channel`/`is_member_cached` against the
+    /// claimed community instead of the host-derived one would pass row_zero
+    /// (b)'s negative-arm test (both sides would still reject A's post
+    /// against B-only's U for some reason) but would fail this row's
+    /// positive-arm test (A's post might land in B's channel, or vice versa).
+    /// So this row catches a class of bugs row_zero (b) structurally cannot,
+    /// even though both share the `is_member_cached` scope branch.
+    ///
+    /// # Wire-observable shape
+    ///
+    /// One keypair shared across both communities — that's load-bearing for
+    /// the test: it proves the fence is `community_id`, not `pubkey`. Same
+    /// channel UUID `U` created in both A and B. Same pubkey posts kind:9 to
+    /// U in A (`"A message"`) and to U in B (`"B message"`).
+    ///
+    /// REST `POST /query` with `{kinds:[9], #h:[U]}` against A's host
+    /// returns *exactly* A's message; same query against B's host returns
+    /// *exactly* B's message. Each side's response has count == 1 and
+    /// content == its own community's. A cross-community leak surfaces as
+    /// either count == 2 OR a hit whose content is the *other* community's.
+    ///
+    /// # Distinct content per community: the setup-equivalence-vacuity defense
+    ///
+    /// Per the named lesson in `landed-on-head-discipline` (Quinn's
+    /// `search_fts` + Dawn's `audit_log`), identical event content collapses
+    /// distinct rows into colliding Nostr event ids (id = hash(pubkey,
+    /// created_at, kind, tags, content); community is server-side provenance,
+    /// not in the id hash). Distinct content per community produces distinct
+    /// event ids and makes the leak observable as
+    /// wrong-content-on-the-wire, not just same-id-different-row (which
+    /// looks identical to the honest path).
+    ///
+    /// # Mutate-bite (would-it-fail-without-the-fix)
+    ///
+    /// Drop `WHERE community_id = $1` from
+    /// `crates/buzz-db/src/event.rs::query_events` (the non-p-tag branch,
+    /// currently lines 266-270 form
+    /// `FROM events WHERE community_id = $1` → `FROM events WHERE TRUE`).
+    /// With distinct content per community + the shared `#h: U` filter, A's
+    /// `/query` now returns BOTH events (different ids, both matching
+    /// `channel_id = U` because U exists as both A's and B's channel rows
+    /// under the same UUID). Either `hits_a.len() == 1` fails (count==2) or
+    /// the content assertion fails (the leaked row substitutes for A's).
+    /// The bite is observable on the wire either way. Restore → GREEN.
+    ///
+    /// # Single-fence-per-path topology
+    ///
+    /// Unlike `search_fts`, which had defense-in-depth (FTS predicate +
+    /// `get_events_by_ids` re-filter), `query_events`'s `WHERE community_id`
+    /// is the only community fence on the `POST /query` read path. Single-
+    /// fence mutation will bite immediately. The `get_channel` fence at
+    /// `channel.rs:275` is the *write/permission-check* fence (exercised by
+    /// `is_member_cached` on the post path), not the read fence; together
+    /// they're the two-layer scoping of the *whole channel system*, but for
+    /// this row's wire-observable read property the load-bearing fence is
+    /// `query_events`.
     #[tokio::test]
     #[ignore]
     async fn same_channel_uuid_in_two_communities_is_isolated() {
-        pending_lane(
-            "buzz-db",
-            "channel UUID U exists in A and B; member/post in A never touches B's U",
+        let ws_a = to_ws(&url_a());
+        let ws_b = to_ws(&url_b());
+        let http_a = to_http(&url_a());
+        let http_b = to_http(&url_b());
+
+        // One keypair shared across both communities — proves the fence is
+        // community, not pubkey.
+        let keys = Keys::generate();
+        let pubkey_hex = keys.public_key().to_hex();
+
+        // Same channel UUID `U` in both communities. The `(community_id, id)`
+        // PK permits this; this row's whole obligation rests on it.
+        let shared_uuid = uuid::Uuid::new_v4();
+        let chan_a = create_channel(&http_a, &keys, shared_uuid).await;
+        let chan_b = create_channel(&http_b, &keys, shared_uuid).await;
+        assert_eq!(
+            chan_a, chan_b,
+            "channels must share UUID — test design (the PK `(community_id, id)` makes this legal)"
         );
+
+        // Community-distinct content. The leak between A's and B's instances
+        // of the same UUID becomes wire-observable only when each side's
+        // message has identifying content; identical content collapses both
+        // events to the same Nostr event id and a leak becomes
+        // indistinguishable from the honest path on the wire.
+        let content_a = "A message in shared-UUID channel".to_string();
+        let content_b = "B message in shared-UUID channel".to_string();
+
+        // Connect each side, post each side's kind:9.
+        let mut client_a = BuzzTestClient::connect(&ws_a, &keys)
+            .await
+            .expect("connect A");
+        let _id_a = post_kind9(&mut client_a, &keys, &chan_a, &content_a).await;
+
+        let mut client_b = BuzzTestClient::connect(&ws_b, &keys)
+            .await
+            .expect("connect B");
+        let _id_b = post_kind9(&mut client_b, &keys, &chan_b, &content_b).await;
+
+        // Let the relay's write-path settle. `events` is committed
+        // synchronously with the OK response, but `received_at`/Redis fan-out
+        // and the channel materialised-row updates may race a fast follow-up
+        // read; the same 500ms wait used by every other row in this file.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // (1) A's query: shared UUID `U` resolves to A's channel row; the
+        // events returned must be A's message, count == 1.
+        let hits_a = query_kind9_in_channel(&http_a, &pubkey_hex, &chan_a).await;
+        assert_eq!(
+            hits_a.len(),
+            1,
+            "A's /query for kind:9 #h:{chan_a} returned {} events; expected exactly 1. \
+             cross-community leak suspected. hit contents: {:?}",
+            hits_a.len(),
+            hits_a
+                .iter()
+                .map(|e| e["content"].as_str().unwrap_or("").to_string())
+                .collect::<Vec<_>>()
+        );
+        let a_content = hits_a[0]["content"].as_str().unwrap_or("");
+        assert_eq!(
+            a_content, content_a,
+            "A's kind:9 content is not A's message — B's message leaked through. \
+             got: {a_content:?}"
+        );
+
+        // (2) Mirror: B's query returns B's message, count == 1.
+        let hits_b = query_kind9_in_channel(&http_b, &pubkey_hex, &chan_b).await;
+        assert_eq!(
+            hits_b.len(),
+            1,
+            "B's /query for kind:9 #h:{chan_b} returned {} events; expected exactly 1. \
+             cross-community leak suspected. hit contents: {:?}",
+            hits_b.len(),
+            hits_b
+                .iter()
+                .map(|e| e["content"].as_str().unwrap_or("").to_string())
+                .collect::<Vec<_>>()
+        );
+        let b_content = hits_b[0]["content"].as_str().unwrap_or("");
+        assert_eq!(
+            b_content, content_b,
+            "B's kind:9 content is not B's message — A's message leaked through. \
+             got: {b_content:?}"
+        );
+
+        client_a.disconnect().await.expect("disconnect A");
+        client_b.disconnect().await.expect("disconnect B");
     }
 }
 
