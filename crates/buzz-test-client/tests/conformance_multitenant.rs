@@ -761,13 +761,30 @@ mod api_tokens_nip98_replay {
             .send()
             .await
             .unwrap_or_else(|e| panic!("second POST to A failed: {e}"));
+        // The assertion below pins the status code (401), not just rejection,
+        // because the system has defense-in-depth across two layers with
+        // distinct rejection signatures:
+        //   * auth-layer replay check (`check_nip98_replay`) — rejects with
+        //     401 + body "NIP-98: replay detected".
+        //   * storage-layer dedup (`events` PK `ON CONFLICT DO NOTHING` in
+        //     `ingest_event`) — accepts with 200 + body `accepted: false,
+        //     message: "duplicate"`.
+        // Both reject a duplicate, but only the 401 path proves the seen-set
+        // is in the request path. A body-only check like `!accepted` would
+        // pass under a noop'd `check_nip98_replay` because storage-dedup
+        // still 200-accepted-false's the second post — the bite would go
+        // vacuous against the layer the obligation actually names. Status-
+        // code is the load-bearing-layer discriminator; do not weaken this
+        // to `!accepted` for "simpler reading."
         assert_eq!(
             second_a.status(),
             reqwest::StatusCode::UNAUTHORIZED,
             "second POST to A with the same NIP-98 event MUST be rejected as \
              replay (got {}) — if this returns 200, the shared seen-set is \
-             not in the request path. Mutate-bite handle: \
-             `check_nip98_replay` in bridge.rs:79.",
+             not in the request path (storage-dedup at `ingest_event` would \
+             return 200-accepted-false on the same input; only the 401 from \
+             `check_nip98_replay` proves the auth-layer replay fence). \
+             Mutate-bite handle: `check_nip98_replay` in bridge.rs:79.",
             second_a.status(),
         );
         let second_a_body = second_a.text().await.unwrap_or_default();
