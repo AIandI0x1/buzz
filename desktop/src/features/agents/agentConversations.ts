@@ -41,6 +41,7 @@ export type AgentConversation = {
 export type OpenAgentConversationInput = {
   agentName: string;
   agentPubkey: string;
+  /** Source message the task was started from. Kept as `agentReply` for link compatibility. */
   agentReply: TimelineMessage;
   channel: Pick<Channel, "id" | "name">;
   contextMessages?: TimelineMessage[];
@@ -258,8 +259,8 @@ function parseStoredAgentConversation(
   }
 
   const id = maybeString(value.id);
-  const agentName = maybeString(value.agentName);
-  const agentPubkey = maybeString(value.agentPubkey);
+  const agentName = maybeString(value.agentName) ?? "Task";
+  const agentPubkey = maybeString(value.agentPubkey) ?? "";
   const channelId = maybeString(value.channelId);
   const channelName = maybeString(value.channelName);
   const threadRootId = maybeString(value.threadRootId);
@@ -289,8 +290,6 @@ function parseStoredAgentConversation(
 
   if (
     !id ||
-    !agentName ||
-    !agentPubkey ||
     !agentReply ||
     !channelId ||
     !channelName ||
@@ -469,7 +468,7 @@ export function parseAgentConversationMarker(
     (typeof content.agentReplyId === "string" ? content.agentReplyId : null);
   const agentPubkey =
     getTagValue(event.tags, "p") ??
-    (typeof content.agentPubkey === "string" ? content.agentPubkey : null);
+    (typeof content.agentPubkey === "string" ? content.agentPubkey : "");
   const parentMessageId =
     typeof content.parentMessageId === "string"
       ? content.parentMessageId
@@ -478,7 +477,7 @@ export function parseAgentConversationMarker(
     typeof content.threadRootMessageId === "string"
       ? content.threadRootMessageId
       : null;
-  const agentName = trimmedString(content.agentName) || agentPubkey || "Agent";
+  const agentName = trimmedString(content.agentName) || agentPubkey || "Task";
   const title =
     trimmedString(content.title) ??
     getTagValue(event.tags, "title") ??
@@ -496,7 +495,7 @@ export function parseAgentConversationMarker(
       ? content.startedAt
       : event.created_at;
 
-  if (!channelId || !threadRootId || !agentReplyId || !agentPubkey) {
+  if (!channelId || !threadRootId || !agentReplyId) {
     return null;
   }
 
@@ -624,16 +623,20 @@ export async function publishAgentConversationMarker(
         }
       : {}),
   });
+  const tags = [
+    ["h", conversation.channelId],
+    ["e", conversation.threadRootId, "", "root"],
+    ["e", conversation.agentReply.id, "", "agent-reply"],
+    ["title", conversation.title],
+  ];
+  if (conversation.agentPubkey) {
+    tags.splice(3, 0, ["p", conversation.agentPubkey]);
+  }
+
   const event = await signRelayEvent({
     kind: KIND_AGENT_CONVERSATION_COMPAT,
     content,
-    tags: [
-      ["h", conversation.channelId],
-      ["e", conversation.threadRootId, "", "root"],
-      ["e", conversation.agentReply.id, "", "agent-reply"],
-      ["p", conversation.agentPubkey],
-      ["title", conversation.title],
-    ],
+    tags,
   });
 
   return relayClient.publishEvent(

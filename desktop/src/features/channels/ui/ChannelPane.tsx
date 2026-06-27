@@ -51,6 +51,7 @@ import * as agentSessionSelection from "@/features/channels/ui/agentSessionSelec
 import { Button } from "@/shared/ui/button";
 import { buildMainTimelineEntries } from "@/features/messages/lib/threadPanel";
 import { isBroadcastReply } from "@/features/messages/lib/threading";
+import { collectMessageMentionPubkeys } from "@/features/messages/lib/formatTimelineMessages";
 import { useRenderScopedReactionHydration } from "@/features/messages/lib/useRenderScopedReactionHydration";
 import type { TimelineMessage } from "@/features/messages/types";
 import { isWelcomeChannel } from "@/features/onboarding/welcome";
@@ -59,6 +60,7 @@ import { useAppShell } from "@/app/AppShellContext";
 import { useIsThreadPanelOverlay } from "@/shared/hooks/use-mobile";
 import { channelChrome } from "@/shared/layout/chromeLayout";
 import { cn } from "@/shared/lib/cn";
+import { normalizePubkey } from "@/shared/lib/pubkey";
 export const ChannelPane = React.memo(function ChannelPane({
   activeChannel,
   agentConversationMarkers,
@@ -280,6 +282,63 @@ export const ChannelPane = React.memo(function ChannelPane({
 
     return pubkeys;
   }, [activityAgents, agentPubkeys, agentSessionAgents]);
+  const knownAgentByPubkey = React.useMemo(() => {
+    const agents = new Map<string, { name: string; pubkey: string }>();
+    const addAgent = (pubkey: string, name?: string | null) => {
+      const key = normalizePubkey(pubkey);
+      if (!key) {
+        return;
+      }
+
+      const profileName = profiles?.[key]?.displayName?.trim();
+      const fallbackName = name?.trim() || profileName || pubkey;
+      const current = agents.get(key);
+      agents.set(key, {
+        name:
+          current?.name && current.name !== current.pubkey
+            ? current.name
+            : fallbackName,
+        pubkey: current?.pubkey ?? pubkey,
+      });
+    };
+
+    for (const agent of agentSessionAgents) {
+      addAgent(agent.pubkey, agent.name);
+    }
+    for (const agent of activityAgents) {
+      addAgent(agent.pubkey, agent.name);
+    }
+    for (const pubkey of agentPubkeys ?? []) {
+      addAgent(pubkey);
+    }
+
+    return agents;
+  }, [activityAgents, agentPubkeys, agentSessionAgents, profiles]);
+  const resolveTaskAgentForMessage = React.useCallback(
+    (message: TimelineMessage) => {
+      if (message.pubkey) {
+        const directAgent = knownAgentByPubkey.get(
+          normalizePubkey(message.pubkey),
+        );
+        if (directAgent) {
+          return {
+            name: message.author?.trim() || directAgent.name,
+            pubkey: directAgent.pubkey,
+          };
+        }
+      }
+
+      for (const pubkey of collectMessageMentionPubkeys([message])) {
+        const mentionedAgent = knownAgentByPubkey.get(normalizePubkey(pubkey));
+        if (mentionedAgent) {
+          return mentionedAgent;
+        }
+      }
+
+      return null;
+    },
+    [knownAgentByPubkey],
+  );
   const completeWelcomeComposerBanner = React.useCallback(() => {
     if (!activeChannelId || !isActiveWelcomeChannel) {
       return;
@@ -341,7 +400,7 @@ export const ChannelPane = React.memo(function ChannelPane({
       if (
         !enableAgentConversations ||
         !activeChannel ||
-        !message.pubkey ||
+        message.pending ||
         !canOpenAgentConversationInChannel({
           channel: activeChannel,
           publishMarker: options?.publishMarker,
@@ -350,6 +409,7 @@ export const ChannelPane = React.memo(function ChannelPane({
         return;
       }
 
+      const taskAgent = resolveTaskAgentForMessage(message);
       const rootId = message.rootId ?? message.parentId ?? message.id;
       const contextMessages = messages.filter(
         (candidate) =>
@@ -360,8 +420,8 @@ export const ChannelPane = React.memo(function ChannelPane({
       );
       openAgentConversation(
         {
-          agentName: message.author,
-          agentPubkey: message.pubkey,
+          agentName: taskAgent?.name ?? "",
+          agentPubkey: taskAgent?.pubkey ?? "",
           agentReply: message,
           channel: activeChannel,
           contextMessages,
@@ -377,7 +437,13 @@ export const ChannelPane = React.memo(function ChannelPane({
         options,
       );
     },
-    [activeChannel, enableAgentConversations, messages, openAgentConversation],
+    [
+      activeChannel,
+      enableAgentConversations,
+      messages,
+      openAgentConversation,
+      resolveTaskAgentForMessage,
+    ],
   );
   const handleGoToTaskMessage = React.useCallback(
     (

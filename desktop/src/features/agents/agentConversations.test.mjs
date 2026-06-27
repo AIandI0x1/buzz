@@ -155,7 +155,12 @@ test("continued conversation mention routing preserves explicit multi-agent ment
   );
 });
 
-function markerEvent({ content = {}, createdAt = 1, id = "marker" } = {}) {
+function markerEvent({
+  content = {},
+  createdAt = 1,
+  id = "marker",
+  includeAgent = true,
+} = {}) {
   return {
     id,
     pubkey: "starter",
@@ -165,15 +170,15 @@ function markerEvent({ content = {}, createdAt = 1, id = "marker" } = {}) {
       ["h", "channel"],
       ["e", "root", "", "root"],
       ["e", "agent-reply", "", "agent-reply"],
-      ["p", "agent"],
+      ...(includeAgent ? [["p", "agent"]] : []),
       ["title", "Data in Buzz app"],
     ],
     content: JSON.stringify({
       version: 1,
       title: "Data in Buzz app",
       titleStatus: "resolved",
-      agentName: "Fizz",
-      agentPubkey: "agent",
+      agentName: includeAgent ? "Fizz" : "",
+      agentPubkey: includeAgent ? "agent" : "",
       threadRootId: "root",
       threadRootMessageId: "root",
       parentMessageId: "root",
@@ -226,6 +231,16 @@ test("continued conversation marker parses summary metadata", () => {
   assert.equal(marker?.summaryCreatedAt, 12);
 });
 
+test("continued conversation marker can anchor a task without a primary agent", () => {
+  const marker = parseAgentConversationMarker(
+    markerEvent({ includeAgent: false }),
+  );
+
+  assert.equal(marker?.agentName, "Task");
+  assert.equal(marker?.agentPubkey, "");
+  assert.equal(marker?.agentReplyId, "agent-reply");
+});
+
 test("continued conversations persist across app restarts", () => {
   withMockLocalStorage(() => {
     const workspaceScope = "wss://relay.example.com";
@@ -262,6 +277,33 @@ test("continued conversations persist across app restarts", () => {
     assert.equal(persisted[0].channelId, "channel");
     assert.equal(persisted[0].agentReply.id, "agent-reply");
     assert.equal(otherWorkspace.length, 0);
+  });
+});
+
+test("message-anchored tasks persist without a primary agent", () => {
+  withMockLocalStorage(() => {
+    const root = message({
+      body: "Can someone turn this into a task?",
+      createdAt: 1,
+      id: "root",
+    });
+    const conversation = buildAgentConversation({
+      agentName: "",
+      agentPubkey: "",
+      agentReply: root,
+      channel: { id: "channel", name: "general" },
+      contextMessages: [root],
+      parentMessage: null,
+      threadRootMessage: root,
+    });
+
+    writePersistedAgentConversations("human", [conversation]);
+    const persisted = readPersistedAgentConversations("human");
+
+    assert.equal(persisted.length, 1);
+    assert.equal(persisted[0].id, conversation.id);
+    assert.equal(persisted[0].agentPubkey, "");
+    assert.equal(persisted[0].agentReply.id, "root");
   });
 });
 

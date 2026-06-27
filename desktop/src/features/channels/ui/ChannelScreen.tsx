@@ -731,7 +731,9 @@ export function ChannelScreen({
   );
   useAgentConversationRouteTarget({
     activeChannel,
-    activeChannelId,
+    agentConversationMarkers,
+    agentPubkeys,
+    enabled: isChannelTasksEnabled,
     goChannel,
     messageProfilesReady,
     openAgentConversation,
