@@ -16,6 +16,7 @@ import type { Channel } from "@/shared/api/types";
 export type ChannelPaneProps = {
   activeChannel: Channel | null;
   agentConversationMarkers?: readonly AgentConversationMarker[];
+  agentLookupReady?: boolean;
   activityAgents?: BotActivityAgent[];
   agentPubkeys?: ReadonlySet<string>;
   agentPubkeysPending?: boolean;

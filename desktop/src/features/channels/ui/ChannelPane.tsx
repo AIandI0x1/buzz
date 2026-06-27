@@ -64,6 +64,7 @@ import { normalizePubkey } from "@/shared/lib/pubkey";
 export const ChannelPane = React.memo(function ChannelPane({
   activeChannel,
   agentConversationMarkers,
+  agentLookupReady = true,
   agentPubkeys,
   agentPubkeysPending = false,
   agentSessionAgents,
@@ -155,6 +156,12 @@ export const ChannelPane = React.memo(function ChannelPane({
   const [taskFocusMessageId, setTaskFocusMessageId] = React.useState<
     string | null
   >(null);
+  const [pendingAgentConversationOpen, setPendingAgentConversationOpen] =
+    React.useState<{
+      channelId: string;
+      messageId: string;
+      publishMarker?: boolean;
+    } | null>(null);
   const previousTaskFocusChannelIdRef = React.useRef<string | null>(null);
   const completedWelcomeBannerChannelIdsRef = React.useRef(new Set<string>());
   const welcomeComposerDismissTimerRef = React.useRef<number | null>(null);
@@ -316,6 +323,19 @@ export const ChannelPane = React.memo(function ChannelPane({
   }, [activityAgents, agentPubkeys, agentSessionAgents, profiles]);
   const resolveTaskAgentForMessage = React.useCallback(
     (message: TimelineMessage) => {
+      const markerAgent = activeAgentConversationMarkers?.find(
+        (marker) =>
+          marker.channelId === activeChannelId &&
+          marker.agentReplyId === message.id &&
+          marker.agentPubkey,
+      );
+      if (markerAgent) {
+        return {
+          name: markerAgent.agentName || markerAgent.agentPubkey,
+          pubkey: markerAgent.agentPubkey,
+        };
+      }
+
       if (message.pubkey) {
         const directAgent = knownAgentByPubkey.get(
           normalizePubkey(message.pubkey),
@@ -324,6 +344,15 @@ export const ChannelPane = React.memo(function ChannelPane({
           return {
             name: message.author?.trim() || directAgent.name,
             pubkey: directAgent.pubkey,
+          };
+        }
+        if (message.role === "bot") {
+          return {
+            name:
+              message.author?.trim() ||
+              message.personaDisplayName?.trim() ||
+              message.pubkey,
+            pubkey: message.pubkey,
           };
         }
       }
@@ -337,7 +366,7 @@ export const ChannelPane = React.memo(function ChannelPane({
 
       return null;
     },
-    [knownAgentByPubkey],
+    [activeAgentConversationMarkers, activeChannelId, knownAgentByPubkey],
   );
   const completeWelcomeComposerBanner = React.useCallback(() => {
     if (!activeChannelId || !isActiveWelcomeChannel) {
@@ -395,8 +424,12 @@ export const ChannelPane = React.memo(function ChannelPane({
     },
     [onOpenAgentSession],
   );
-  const handleOpenAgentConversation = React.useCallback(
-    (message: TimelineMessage, options?: { publishMarker?: boolean }) => {
+  const openResolvedAgentConversation = React.useCallback(
+    (
+      message: TimelineMessage,
+      taskAgent: { name: string; pubkey: string } | null,
+      options?: { publishMarker?: boolean },
+    ) => {
       if (
         !enableAgentConversations ||
         !activeChannel ||
@@ -409,7 +442,6 @@ export const ChannelPane = React.memo(function ChannelPane({
         return;
       }
 
-      const taskAgent = resolveTaskAgentForMessage(message);
       const rootId = message.rootId ?? message.parentId ?? message.id;
       const contextMessages = messages.filter(
         (candidate) =>
@@ -437,14 +469,79 @@ export const ChannelPane = React.memo(function ChannelPane({
         options,
       );
     },
+    [activeChannel, enableAgentConversations, messages, openAgentConversation],
+  );
+  const handleOpenAgentConversation = React.useCallback(
+    (message: TimelineMessage, options?: { publishMarker?: boolean }) => {
+      if (
+        !enableAgentConversations ||
+        !activeChannel ||
+        message.pending ||
+        !canOpenAgentConversationInChannel({
+          channel: activeChannel,
+          publishMarker: options?.publishMarker,
+        })
+      ) {
+        return;
+      }
+
+      const taskAgent = resolveTaskAgentForMessage(message);
+      if (!taskAgent && !agentLookupReady) {
+        setPendingAgentConversationOpen({
+          channelId: activeChannel.id,
+          messageId: message.id,
+          publishMarker: options?.publishMarker,
+        });
+        return;
+      }
+
+      openResolvedAgentConversation(message, taskAgent, options);
+    },
     [
       activeChannel,
+      agentLookupReady,
       enableAgentConversations,
-      messages,
-      openAgentConversation,
+      openResolvedAgentConversation,
       resolveTaskAgentForMessage,
     ],
   );
+  React.useEffect(() => {
+    if (!pendingAgentConversationOpen) {
+      return;
+    }
+    if (
+      !activeChannel ||
+      activeChannel.id !== pendingAgentConversationOpen.channelId
+    ) {
+      setPendingAgentConversationOpen(null);
+      return;
+    }
+    if (!agentLookupReady) {
+      return;
+    }
+
+    const pendingMessage = messages.find(
+      (message) => message.id === pendingAgentConversationOpen.messageId,
+    );
+    if (!pendingMessage || pendingMessage.pending) {
+      setPendingAgentConversationOpen(null);
+      return;
+    }
+
+    setPendingAgentConversationOpen(null);
+    openResolvedAgentConversation(
+      pendingMessage,
+      resolveTaskAgentForMessage(pendingMessage),
+      { publishMarker: pendingAgentConversationOpen.publishMarker },
+    );
+  }, [
+    activeChannel,
+    agentLookupReady,
+    messages,
+    openResolvedAgentConversation,
+    pendingAgentConversationOpen,
+    resolveTaskAgentForMessage,
+  ]);
   const handleGoToTaskMessage = React.useCallback(
     (
       marker: AgentConversationMarker,
