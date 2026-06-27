@@ -1,5 +1,5 @@
 import * as React from "react";
-import { ArrowDown, X } from "lucide-react";
+import { ArrowDown } from "lucide-react";
 
 import {
   buildThreadSummaryFromVisibleEntries,
@@ -16,10 +16,15 @@ import { THREAD_PANEL_MIN_WIDTH_PX } from "@/shared/hooks/useThreadPanelWidth";
 import { cn } from "@/shared/lib/cn";
 import {
   AuxiliaryPanelHeader,
+  AuxiliaryPanelHeaderActions,
+  AuxiliaryPanelHeaderCloseButton,
   AuxiliaryPanelHeaderGroup,
   AuxiliaryPanelTitle,
+  auxiliaryPanelFloatingHeaderBaseClass,
+  auxiliaryPanelFloatingHeaderClass,
+  auxiliaryPanelFloatingHeaderSingleColumnClass,
+  auxiliaryPanelHeaderBodyOffsetClass,
   auxiliaryPanelContentPaddingClass,
-  auxiliaryPanelHeaderPaddingClass,
 } from "@/shared/layout/AuxiliaryPanelHeader";
 import { Button } from "@/shared/ui/button";
 import {
@@ -240,16 +245,12 @@ export function MessageThreadPanelSkeleton({
       >
         <AuxiliaryPanelTitle>Thread</AuxiliaryPanelTitle>
       </AuxiliaryPanelHeaderGroup>
-      <Button
-        aria-label="Close thread"
-        className="ml-auto"
-        onClick={onClose}
-        size="icon"
-        type="button"
-        variant="ghost"
-      >
-        <X />
-      </Button>
+      <AuxiliaryPanelHeaderActions>
+        <AuxiliaryPanelHeaderCloseButton
+          ariaLabel="Close thread"
+          onClose={onClose}
+        />
+      </AuxiliaryPanelHeaderActions>
     </>
   );
 
@@ -258,7 +259,9 @@ export function MessageThreadPanelSkeleton({
       className={cn(
         "min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain pb-24 [overflow-anchor:none]",
         isSplitLayout && auxiliaryPanelContentPaddingClass,
-        !isSplitLayout && !isFloatingOverlay && "pt-13",
+        !isSplitLayout &&
+          !isFloatingOverlay &&
+          auxiliaryPanelHeaderBodyOffsetClass,
       )}
       data-testid="message-thread-loading"
     >
@@ -313,10 +316,10 @@ export function MessageThreadPanelSkeleton({
       >
         <div
           className={cn(
-            "flex cursor-default select-none items-center",
+            auxiliaryPanelFloatingHeaderBaseClass,
             isSinglePanelView
-              ? `relative ${PANEL_SINGLE_COLUMN_HEADER_LAYER_CLASS} -mb-13 min-h-13 shrink-0 gap-2.5 bg-background/80 ${auxiliaryPanelHeaderPaddingClass} backdrop-blur-md supports-backdrop-filter:bg-background/70 dark:bg-background/70 dark:backdrop-blur-xl dark:supports-backdrop-filter:bg-background/55`
-              : `relative z-50 min-h-13 shrink-0 gap-3 bg-background/80 ${auxiliaryPanelHeaderPaddingClass} backdrop-blur-md supports-backdrop-filter:bg-background/70 dark:bg-background/70 dark:backdrop-blur-xl dark:supports-backdrop-filter:bg-background/55`,
+              ? `${PANEL_SINGLE_COLUMN_HEADER_LAYER_CLASS} ${auxiliaryPanelFloatingHeaderSingleColumnClass}`
+              : auxiliaryPanelFloatingHeaderClass,
           )}
           data-tauri-drag-region
         >
@@ -606,7 +609,9 @@ export function MessageThreadPanel({
       className={cn(
         "min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain pb-24 [overflow-anchor:none]",
         isSplitLayout && auxiliaryPanelContentPaddingClass,
-        !isSplitLayout && !isFloatingOverlay && "pt-13",
+        !isSplitLayout &&
+          !isFloatingOverlay &&
+          auxiliaryPanelHeaderBodyOffsetClass,
       )}
       data-testid="message-thread-body"
       onScroll={onScroll}
@@ -909,17 +914,13 @@ export function MessageThreadPanel({
       >
         <AuxiliaryPanelTitle>Thread</AuxiliaryPanelTitle>
       </AuxiliaryPanelHeaderGroup>
-      <Button
-        aria-label="Close thread"
-        className="ml-auto"
-        data-testid="message-thread-close"
-        onClick={onClose}
-        size="icon"
-        type="button"
-        variant="ghost"
-      >
-        <X />
-      </Button>
+      <AuxiliaryPanelHeaderActions>
+        <AuxiliaryPanelHeaderCloseButton
+          ariaLabel="Close thread"
+          onClose={onClose}
+          testId="message-thread-close"
+        />
+      </AuxiliaryPanelHeaderActions>
     </>
   );
 
@@ -951,10 +952,10 @@ export function MessageThreadPanel({
       >
         <div
           className={cn(
-            "flex cursor-default select-none items-center",
+            auxiliaryPanelFloatingHeaderBaseClass,
             isSinglePanelView
-              ? `relative ${PANEL_SINGLE_COLUMN_HEADER_LAYER_CLASS} -mb-13 min-h-13 shrink-0 gap-2.5 bg-background/80 ${auxiliaryPanelHeaderPaddingClass} backdrop-blur-md supports-backdrop-filter:bg-background/70 dark:bg-background/70 dark:backdrop-blur-xl dark:supports-backdrop-filter:bg-background/55`
-              : `relative z-50 min-h-13 shrink-0 gap-3 bg-background/80 ${auxiliaryPanelHeaderPaddingClass} backdrop-blur-md supports-backdrop-filter:bg-background/70 dark:bg-background/70 dark:backdrop-blur-xl dark:supports-backdrop-filter:bg-background/55`,
+              ? `${PANEL_SINGLE_COLUMN_HEADER_LAYER_CLASS} ${auxiliaryPanelFloatingHeaderSingleColumnClass}`
+              : auxiliaryPanelFloatingHeaderClass,
           )}
           data-tauri-drag-region
         >

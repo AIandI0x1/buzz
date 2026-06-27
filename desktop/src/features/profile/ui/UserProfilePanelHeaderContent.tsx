@@ -1,5 +1,4 @@
 import type { ReactNode } from "react";
-import { X } from "lucide-react";
 
 import { CopyButton } from "@/features/agents/ui/CopyButton";
 import { MemoryRefreshButton } from "@/features/agent-memory/ui/MemorySection";
@@ -9,10 +8,10 @@ import {
 } from "@/features/profile/ui/UserProfilePanelUtils";
 import {
   AuxiliaryPanelHeaderActions,
+  AuxiliaryPanelHeaderCloseButton,
   AuxiliaryPanelHeaderGroup,
-  AuxiliaryPanelTitle,
+  AuxiliaryPanelHeaderTitleBlock,
 } from "@/shared/layout/AuxiliaryPanelHeader";
-import { Button } from "@/shared/ui/button";
 
 export function getUserProfilePanelHeaderContent({
   agentSettingsMenu,
@@ -43,21 +42,11 @@ export function getUserProfilePanelHeaderContent({
       className={shouldShowLogDetails ? "items-start" : undefined}
       onBack={view !== "summary" ? onBack : undefined}
     >
-      {shouldShowLogDetails ? (
-        <div className="min-w-0 flex-1">
-          <AuxiliaryPanelTitle className="translate-y-0 leading-5">
-            {title}
-          </AuxiliaryPanelTitle>
-          <p
-            className="min-w-0 truncate font-mono text-2xs text-muted-foreground"
-            title={logSubtitle ?? undefined}
-          >
-            {logSubtitle}
-          </p>
-        </div>
-      ) : (
-        <AuxiliaryPanelTitle>{title}</AuxiliaryPanelTitle>
-      )}
+      <AuxiliaryPanelHeaderTitleBlock
+        subtitle={shouldShowLogDetails ? logSubtitle : null}
+        subtitleTitle={logSubtitle ?? undefined}
+        title={title}
+      />
     </AuxiliaryPanelHeaderGroup>
   );
   const headerActions = (
@@ -80,16 +69,11 @@ export function getUserProfilePanelHeaderContent({
           variant="ghost"
         />
       ) : null}
-      <Button
-        aria-label="Close profile"
-        data-testid="user-profile-panel-close"
-        onClick={onClose}
-        size="icon"
-        type="button"
-        variant="ghost"
-      >
-        <X />
-      </Button>
+      <AuxiliaryPanelHeaderCloseButton
+        ariaLabel="Close profile"
+        onClose={onClose}
+        testId="user-profile-panel-close"
+      />
     </AuxiliaryPanelHeaderActions>
   );
 

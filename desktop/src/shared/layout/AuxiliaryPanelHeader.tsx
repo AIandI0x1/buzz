@@ -1,5 +1,5 @@
 import type * as React from "react";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, X } from "lucide-react";
 
 import { channelChrome } from "@/shared/layout/chromeLayout";
 import { cn } from "@/shared/lib/cn";
@@ -14,10 +14,33 @@ type AuxiliaryPanelHeaderGroupProps = React.ComponentProps<"div"> & {
 type AuxiliaryPanelHeaderActionsProps = {
   children: React.ReactNode;
 };
+type AuxiliaryPanelHeaderCloseButtonProps = {
+  ariaLabel: string;
+  onClose: () => void;
+  onPointerDown?: React.PointerEventHandler<HTMLButtonElement>;
+  testId?: string;
+};
+type AuxiliaryPanelHeaderTitleBlockProps = {
+  subtitle?: React.ReactNode;
+  subtitleTitle?: string;
+  title: React.ReactNode;
+};
 type AuxiliaryPanelTitleProps = React.ComponentProps<"h2">;
 
+export const auxiliaryPanelHeaderHeightClass = "h-13";
+export const auxiliaryPanelHeaderMinHeightClass = "min-h-13";
+export const auxiliaryPanelHeaderNegativeMarginClass = "-mb-13";
+export const auxiliaryPanelHeaderBodyOffsetClass = "pt-13";
 export const auxiliaryPanelHeaderRightPaddingClass = "pr-2";
 export const auxiliaryPanelHeaderPaddingClass = `pl-5 ${auxiliaryPanelHeaderRightPaddingClass} py-2`;
+export const auxiliaryPanelFloatingHeaderBaseClass =
+  "flex cursor-default select-none items-center";
+export const auxiliaryPanelFloatingHeaderSurfaceClass =
+  "backdrop-blur-md supports-backdrop-filter:bg-background/70 dark:bg-background/70 dark:backdrop-blur-xl dark:supports-backdrop-filter:bg-background/55";
+export const auxiliaryPanelFloatingHeaderBackdropClass = `pointer-events-none absolute inset-x-0 top-0 z-40 ${auxiliaryPanelHeaderHeightClass} bg-background/80 ${auxiliaryPanelFloatingHeaderSurfaceClass}`;
+export const auxiliaryPanelFloatingHeaderClass = `relative z-50 ${auxiliaryPanelHeaderMinHeightClass} shrink-0 gap-3 bg-background/80 ${auxiliaryPanelHeaderPaddingClass} ${auxiliaryPanelFloatingHeaderSurfaceClass}`;
+export const auxiliaryPanelFloatingHeaderSingleColumnClass = `relative ${auxiliaryPanelHeaderNegativeMarginClass} ${auxiliaryPanelHeaderMinHeightClass} shrink-0 gap-2.5 bg-background/80 ${auxiliaryPanelHeaderPaddingClass} ${auxiliaryPanelFloatingHeaderSurfaceClass}`;
+export const auxiliaryPanelFloatingHeaderTransparentSingleColumnClass = `relative ${auxiliaryPanelHeaderNegativeMarginClass} ${auxiliaryPanelHeaderMinHeightClass} shrink-0 gap-2.5 bg-transparent ${auxiliaryPanelHeaderPaddingClass}`;
 
 /** Compact title/action row for right auxiliary panels in split layouts. */
 export function AuxiliaryPanelHeader({
@@ -88,6 +111,51 @@ export function AuxiliaryPanelHeaderActions({
 }: AuxiliaryPanelHeaderActionsProps) {
   return (
     <div className="ml-auto flex shrink-0 items-center gap-0.5">{children}</div>
+  );
+}
+
+export function AuxiliaryPanelHeaderCloseButton({
+  ariaLabel,
+  onClose,
+  onPointerDown,
+  testId,
+}: AuxiliaryPanelHeaderCloseButtonProps) {
+  return (
+    <Button
+      aria-label={ariaLabel}
+      data-testid={testId}
+      onClick={onClose}
+      onPointerDown={onPointerDown}
+      size="icon"
+      type="button"
+      variant="ghost"
+    >
+      <X />
+    </Button>
+  );
+}
+
+export function AuxiliaryPanelHeaderTitleBlock({
+  subtitle,
+  subtitleTitle,
+  title,
+}: AuxiliaryPanelHeaderTitleBlockProps) {
+  if (!subtitle) {
+    return <AuxiliaryPanelTitle>{title}</AuxiliaryPanelTitle>;
+  }
+
+  return (
+    <div className="min-w-0 flex-1">
+      <AuxiliaryPanelTitle className="translate-y-0 leading-5">
+        {title}
+      </AuxiliaryPanelTitle>
+      <p
+        className="min-w-0 truncate font-mono text-2xs text-muted-foreground"
+        title={subtitleTitle}
+      >
+        {subtitle}
+      </p>
+    </div>
   );
 }
 

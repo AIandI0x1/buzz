@@ -1,5 +1,5 @@
 import * as React from "react";
-import { CircleDot, Octagon, Settings, TerminalSquare, X } from "lucide-react";
+import { CircleDot, Octagon, Settings, TerminalSquare } from "lucide-react";
 import { toast } from "sonner";
 
 import { ManagedAgentSessionPanel } from "@/features/agents/ui/ManagedAgentSessionPanel";
@@ -13,10 +13,15 @@ import { cn } from "@/shared/lib/cn";
 import {
   AuxiliaryPanelHeader,
   AuxiliaryPanelHeaderActions,
+  AuxiliaryPanelHeaderCloseButton,
   AuxiliaryPanelHeaderGroup,
   AuxiliaryPanelTitle,
+  auxiliaryPanelFloatingHeaderBackdropClass,
+  auxiliaryPanelFloatingHeaderBaseClass,
+  auxiliaryPanelFloatingHeaderClass,
+  auxiliaryPanelFloatingHeaderSingleColumnClass,
+  auxiliaryPanelHeaderBodyOffsetClass,
   auxiliaryPanelContentPaddingClass,
-  auxiliaryPanelHeaderPaddingClass,
 } from "@/shared/layout/AuxiliaryPanelHeader";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
@@ -191,16 +196,11 @@ export function AgentSessionThreadPanel({
           </TooltipContent>
         </Tooltip>
       ) : null}
-      <Button
-        aria-label="Close activity panel"
-        data-testid="agent-session-close"
-        onClick={onClose}
-        size="icon"
-        type="button"
-        variant="ghost"
-      >
-        <X />
-      </Button>
+      <AuxiliaryPanelHeaderCloseButton
+        ariaLabel="Close activity panel"
+        onClose={onClose}
+        testId="agent-session-close"
+      />
     </AuxiliaryPanelHeaderActions>
   );
 
@@ -226,7 +226,8 @@ export function AgentSessionThreadPanel({
       className={cn(
         "min-h-0 flex-1 overflow-y-auto px-3 pb-4",
         isSplitLayout && auxiliaryPanelContentPaddingClass,
-        !isSplitLayout && (isFloatingOverlay ? "pt-4" : "pt-13"),
+        !isSplitLayout &&
+          (isFloatingOverlay ? "pt-4" : auxiliaryPanelHeaderBodyOffsetClass),
       )}
     >
       <ManagedAgentSessionPanel
@@ -275,16 +276,16 @@ export function AgentSessionThreadPanel({
         {!isOverlay ? (
           <div
             aria-hidden="true"
-            className="pointer-events-none absolute inset-x-0 top-0 z-40 h-13 bg-background/75 backdrop-blur-md supports-backdrop-filter:bg-background/65 dark:bg-background/45 dark:backdrop-blur-xl dark:supports-backdrop-filter:bg-background/35"
+            className={auxiliaryPanelFloatingHeaderBackdropClass}
           />
         ) : null}
 
         <div
           className={cn(
-            "flex cursor-default select-none items-center",
+            auxiliaryPanelFloatingHeaderBaseClass,
             isSinglePanelView
-              ? `relative ${PANEL_SINGLE_COLUMN_HEADER_LAYER_CLASS} -mb-13 min-h-13 shrink-0 gap-2.5 bg-background/80 ${auxiliaryPanelHeaderPaddingClass} backdrop-blur-md supports-backdrop-filter:bg-background/70 dark:bg-background/70 dark:backdrop-blur-xl dark:supports-backdrop-filter:bg-background/55`
-              : `relative z-50 min-h-13 shrink-0 gap-3 bg-background/80 ${auxiliaryPanelHeaderPaddingClass} backdrop-blur-md supports-backdrop-filter:bg-background/70 dark:bg-background/70 dark:backdrop-blur-xl dark:supports-backdrop-filter:bg-background/55`,
+              ? `${PANEL_SINGLE_COLUMN_HEADER_LAYER_CLASS} ${auxiliaryPanelFloatingHeaderSingleColumnClass}`
+              : auxiliaryPanelFloatingHeaderClass,
           )}
           data-tauri-drag-region
         >

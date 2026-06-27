@@ -83,8 +83,6 @@ import { useUserStatusQuery } from "@/features/user-status/hooks";
 import { useAgentSession } from "@/shared/context/AgentSessionContext";
 import { useEscapeKey } from "@/shared/hooks/useEscapeKey";
 import { useIsThreadPanelOverlay } from "@/shared/hooks/use-mobile";
-import { auxiliaryPanelContentPaddingClass } from "@/shared/layout/AuxiliaryPanelHeader";
-import { cn } from "@/shared/lib/cn";
 import type {
   AgentPersona,
   Channel,
@@ -93,6 +91,7 @@ import type {
   ManagedAgent,
   UpdatePersonaInput,
 } from "@/shared/api/types";
+import { UserProfilePanelBody } from "@/features/profile/ui/UserProfilePanelBody";
 import { UserProfilePanelFrame } from "@/features/profile/ui/UserProfilePanelFrame";
 import { getUserProfilePanelHeaderContent } from "@/features/profile/ui/UserProfilePanelHeaderContent";
 
@@ -811,15 +810,10 @@ export function UserProfilePanel({
   );
 
   const profileBody = (
-    <div
-      className={cn(
-        "min-h-0 flex-1 px-4 pb-6",
-        isDiagnosticsLikeView
-          ? "flex flex-col overflow-hidden"
-          : "overflow-y-auto",
-        isSplitLayout && auxiliaryPanelContentPaddingClass,
-        !isSplitLayout && !isFloatingOverlay && "pt-13",
-      )}
+    <UserProfilePanelBody
+      isDiagnosticsLikeView={isDiagnosticsLikeView}
+      isFloatingOverlay={isFloatingOverlay}
+      isSplitLayout={isSplitLayout}
     >
       {view === "summary" ? (
         <ProfileSummaryView
@@ -927,7 +921,7 @@ export function UserProfilePanel({
           managedAgent={managedAgent}
         />
       ) : null}
-    </div>
+    </UserProfilePanelBody>
   );
   const editAgentDialog =
     canEditAgent && managedAgent ? (

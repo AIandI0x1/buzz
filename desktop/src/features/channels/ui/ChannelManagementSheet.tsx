@@ -55,6 +55,7 @@ import { Textarea } from "@/shared/ui/textarea";
 import {
   AuxiliaryPanelHeader,
   AuxiliaryPanelHeaderActions,
+  AuxiliaryPanelHeaderCloseButton,
   AuxiliaryPanelHeaderGroup,
   AuxiliaryPanelTitle,
   auxiliaryPanelContentPaddingClass,
@@ -698,22 +699,16 @@ function ChannelManagementPanelContent({
             </DialogPrimitive.Title>
           </AuxiliaryPanelHeaderGroup>
           <AuxiliaryPanelHeaderActions>
-            <Button
-              aria-label="Close channel management"
-              className="relative z-60"
-              data-testid="channel-management-close"
-              onClick={() => onOpenChange(false)}
+            <AuxiliaryPanelHeaderCloseButton
+              ariaLabel="Close channel management"
+              onClose={() => onOpenChange(false)}
               onPointerDown={(event) => {
                 event.preventDefault();
                 event.stopPropagation();
                 onOpenChange(false);
               }}
-              size="icon"
-              type="button"
-              variant="ghost"
-            >
-              <X />
-            </Button>
+              testId="channel-management-close"
+            />
           </AuxiliaryPanelHeaderActions>
           <DialogPrimitive.Description className="sr-only">
             Channel settings
