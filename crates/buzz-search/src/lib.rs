@@ -28,7 +28,7 @@ pub mod query;
 
 pub use buzz_core::CommunityId;
 pub use error::SearchError;
-pub use query::{search, ChannelScope, SearchHit, SearchQuery, SearchResult};
+pub use query::{search, ChannelScope, SearchHit, SearchMode, SearchQuery, SearchResult};
 
 use sqlx::PgPool;
 

@@ -218,6 +218,17 @@ fn extract_feed_types(raw: &Value) -> Option<Vec<String>> {
     }
 }
 
+fn extract_search_mode(raw: &Value) -> buzz_search::SearchMode {
+    match raw
+        .get("search_mode")
+        .or_else(|| raw.get("searchMode"))
+        .and_then(Value::as_str)
+    {
+        Some("prefix") => buzz_search::SearchMode::Prefix,
+        _ => buzz_search::SearchMode::FullText,
+    }
+}
+
 fn event_in_accessible_channel(se: &buzz_core::StoredEvent, accessible: &[uuid::Uuid]) -> bool {
     match se.channel_id {
         Some(ch_id) => accessible.contains(&ch_id),
@@ -410,6 +421,7 @@ pub async fn query_events(
         }
         return handle_bridge_search(
             &state,
+            &raw_filters,
             &filters,
             &accessible_channels,
             &tenant,
@@ -846,6 +858,7 @@ fn search_hit_accepted(
 /// from DB. Returns first page of results (no pagination for bridge MVP).
 async fn handle_bridge_search(
     state: &AppState,
+    raw_filters: &[Value],
     filters: &[nostr::Filter],
     accessible_channels: &[uuid::Uuid],
     tenant: &buzz_core::tenant::TenantContext,
@@ -866,7 +879,8 @@ async fn handle_bridge_search(
     let mut events: Vec<Value> = Vec::new();
     let mut seen_ids: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
 
-    for filter in filters {
+    for (raw, filter) in raw_filters.iter().zip(filters) {
+        let search_mode = extract_search_mode(raw);
         let search_text = match &filter.search {
             Some(s) if !s.is_empty() => s.clone(),
             _ => continue,
@@ -922,6 +936,7 @@ async fn handle_bridge_search(
             until,
             page: 1,
             per_page: limit,
+            mode: search_mode,
         };
 
         let search_result = state
@@ -1266,6 +1281,30 @@ mod tests {
         ];
 
         assert!(!has_mixed_search_filters(&filters));
+    }
+
+    #[test]
+    fn bridge_search_mode_extension_defaults_to_full_text() {
+        assert_eq!(
+            extract_search_mode(&serde_json::json!({ "search": "pro" })),
+            buzz_search::SearchMode::FullText
+        );
+        assert_eq!(
+            extract_search_mode(&serde_json::json!({ "search": "pro", "search_mode": "word" })),
+            buzz_search::SearchMode::FullText
+        );
+    }
+
+    #[test]
+    fn bridge_search_mode_extension_accepts_prefix_snake_or_camel_case() {
+        assert_eq!(
+            extract_search_mode(&serde_json::json!({ "search": "pro", "search_mode": "prefix" })),
+            buzz_search::SearchMode::Prefix
+        );
+        assert_eq!(
+            extract_search_mode(&serde_json::json!({ "search": "pro", "searchMode": "prefix" })),
+            buzz_search::SearchMode::Prefix
+        );
     }
 
     /// Attack 3 proof: two stateless relay pods sharing Redis must share one

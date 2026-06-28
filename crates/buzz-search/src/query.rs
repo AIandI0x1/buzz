@@ -52,6 +52,19 @@ pub enum ChannelScope {
     ChannelsOrChannelLess(Vec<Uuid>),
 }
 
+/// Search matching semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchMode {
+    /// Standard NIP-50-ish word/lexeme search using `websearch_to_tsquery`.
+    FullText,
+    /// Prefix-match the trailing normalized query token (`pro` matches `project`).
+    ///
+    /// Intended for bounded typeahead surfaces such as the desktop topbar. The
+    /// relay still refetches and re-authorizes every hit; this mode changes only
+    /// the candidate tsquery, not the access boundary.
+    Prefix,
+}
+
 /// A community-scoped FTS query.
 ///
 /// The community is REQUIRED at the type level — there is no construction path
@@ -81,6 +94,8 @@ pub struct SearchQuery {
     pub page: u32,
     /// Page size. Clamped at 500 internally.
     pub per_page: u32,
+    /// Matching semantics for the search text.
+    pub mode: SearchMode,
 }
 
 /// A single FTS hit. The relay refetches the canonical `StoredEvent` and
@@ -113,7 +128,7 @@ pub struct SearchResult {
 
 const PER_PAGE_MAX: u32 = 500;
 const PER_PAGE_DEFAULT: u32 = 100;
-/// Hard cap on search text handed to `websearch_to_tsquery`. This keeps a
+/// Hard cap on search text handed to Postgres text-search parsers. This keeps a
 /// single request from spending unbounded parser CPU/memory while still allowing
 /// far longer queries than the desktop UI normally emits.
 const SEARCH_TEXT_MAX_CHARS: usize = 4096;
@@ -122,6 +137,45 @@ const SEARCH_TEXT_MAX_CHARS: usize = 4096;
 /// wire untrusted input into a multi-trillion-row OFFSET.
 const PAGE_MAX: u32 = 1000;
 
+fn push_tsquery(qb: &mut QueryBuilder<sqlx::Postgres>, mode: SearchMode, search_text: &str) {
+    match mode {
+        SearchMode::FullText => {
+            qb.push("websearch_to_tsquery('simple', ");
+            qb.push_bind(search_text);
+            qb.push(")");
+        }
+        SearchMode::Prefix => {
+            // Prefix mode is for typeahead: completed whitespace-delimited tokens
+            // are exact, and only the trailing token is suffixed with `:*`.
+            // Each raw token still goes through Postgres' `simple` parser before
+            // tsquery construction so query-side normalization matches the
+            // `search_tsv` generated column. `quote_literal` prevents tsquery
+            // syntax injection from punctuation/operators in the raw topbar input.
+            qb.push(
+                "(SELECT COALESCE(\
+                 string_agg(\
+                   quote_literal(lexeme) || CASE WHEN token_ord = max_token_ord THEN ':*' ELSE '' END, \
+                   ' & ' ORDER BY token_ord, lex_ord\
+                 ), \
+                 ''\
+                 )::tsquery \
+                 FROM (\
+                   SELECT raw_token.token_ord, normalized.lexeme, normalized.lex_ord, raw_token.max_token_ord \
+                   FROM (\
+                     SELECT token, token_ord, max(token_ord) OVER () AS max_token_ord \
+                     FROM regexp_split_to_table(",
+            );
+            qb.push_bind(search_text);
+            qb.push(
+                ", '\\s+') WITH ORDINALITY AS split(token, token_ord)\
+                   ) AS raw_token \
+                   CROSS JOIN LATERAL unnest(tsvector_to_array(to_tsvector('simple', raw_token.token))) \
+                     WITH ORDINALITY AS normalized(lexeme, lex_ord)\
+                 ) AS prefix_terms)",
+            );
+        }
+    }
+}
 fn normalized_search_text(q: &str) -> Option<String> {
     let trimmed = q.trim();
     if trimmed.is_empty() {
@@ -148,7 +202,7 @@ fn normalized_search_text(q: &str) -> Option<String> {
 /// SELECT id, kind, pubkey, channel_id, EXTRACT(EPOCH FROM created_at)::bigint AS created_at_s,
 ///        ts_rank_cd(search_tsv, query) AS rank
 /// FROM events,
-///      websearch_to_tsquery('simple', $q) AS query
+///      <mode-specific tsquery> AS query
 /// WHERE community_id = $ctx
 ///   AND deleted_at IS NULL
 ///   AND search_tsv @@ query
@@ -179,13 +233,13 @@ pub async fn search(pool: &PgPool, query: &SearchQuery) -> Result<SearchResult, 
     let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
         "SELECT id, kind, pubkey, channel_id, \
          EXTRACT(EPOCH FROM created_at)::bigint AS created_at_s, \
-         ts_rank_cd(search_tsv, query) AS rank \
-         FROM events, websearch_to_tsquery('simple', ",
+         ts_rank_cd(search_tsv, search_query.query) AS rank \
+         FROM events CROSS JOIN LATERAL (SELECT ",
     );
-    qb.push_bind(&search_text);
-    qb.push(") AS query WHERE community_id = ");
+    push_tsquery(&mut qb, query.mode, &search_text);
+    qb.push(" AS query) AS search_query WHERE community_id = ");
     qb.push_bind(*query.community.as_uuid());
-    qb.push(" AND deleted_at IS NULL AND search_tsv @@ query");
+    qb.push(" AND deleted_at IS NULL AND search_tsv @@ search_query.query");
 
     // Channel scope — see `ChannelScope` doc for the four-case mapping. The
     // emitted SQL fragments are identical to the legacy 2x2 tuple for the

@@ -149,6 +149,7 @@ async fn search_finds_event_in_same_community() {
             until: None,
             page: 1,
             per_page: 10,
+            mode: buzz_search::SearchMode::FullText,
         })
         .await
         .expect("search ok");
@@ -196,6 +197,7 @@ async fn search_does_not_return_other_community_events() {
             until: None,
             page: 1,
             per_page: 10,
+            mode: buzz_search::SearchMode::FullText,
         })
         .await
         .unwrap();
@@ -212,6 +214,7 @@ async fn search_does_not_return_other_community_events() {
             until: None,
             page: 1,
             per_page: 10,
+            mode: buzz_search::SearchMode::FullText,
         })
         .await
         .unwrap();
@@ -255,11 +258,247 @@ async fn kind0_search_by_display_name_works_without_flattening() {
                 until: None,
                 page: 1,
                 per_page: 10,
+                mode: buzz_search::SearchMode::FullText,
             })
             .await
             .unwrap();
         assert_eq!(r.hits.len(), 1, "kind:0 query {q:?} should find Alice");
     }
+
+    teardown(pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn prefix_mode_matches_final_token_prefix_without_changing_full_text() {
+    let (pool, schema) = setup().await;
+
+    let c = mk_community(&pool, "prefix.example").await;
+    let project_plan = rand_bytes32();
+    let project_archive = rand_bytes32();
+    let projectile_plan = rand_bytes32();
+    insert_event(
+        &pool,
+        c,
+        project_plan,
+        rand_bytes32(),
+        9,
+        "project planning milestone",
+        None,
+        1_700_000_000,
+    )
+    .await;
+    insert_event(
+        &pool,
+        c,
+        project_archive,
+        rand_bytes32(),
+        9,
+        "project archive",
+        None,
+        1_700_000_001,
+    )
+    .await;
+    insert_event(
+        &pool,
+        c,
+        projectile_plan,
+        rand_bytes32(),
+        9,
+        "projectile planning distractor",
+        None,
+        1_700_000_002,
+    )
+    .await;
+
+    let svc = SearchService::new(pool.clone());
+    let full_text = svc
+        .search(&SearchQuery {
+            community: c,
+            q: "pro".into(),
+            channel_scope: ChannelScope::Any,
+            kinds: Some(vec![9]),
+            authors: None,
+            since: None,
+            until: None,
+            page: 1,
+            per_page: 10,
+            mode: buzz_search::SearchMode::FullText,
+        })
+        .await
+        .expect("full text search ok");
+    assert!(
+        full_text.hits.is_empty(),
+        "plain full-text search must stay word/lexeme-based, got {:?}",
+        full_text
+            .hits
+            .iter()
+            .map(|h| h.event_id)
+            .collect::<Vec<_>>()
+    );
+
+    let prefix = svc
+        .search(&SearchQuery {
+            community: c,
+            q: "pro".into(),
+            channel_scope: ChannelScope::Any,
+            kinds: Some(vec![9]),
+            authors: None,
+            since: None,
+            until: None,
+            page: 1,
+            per_page: 10,
+            mode: buzz_search::SearchMode::Prefix,
+        })
+        .await
+        .expect("prefix search ok");
+    let prefix_ids: Vec<[u8; 32]> = prefix.hits.iter().map(|h| h.event_id).collect();
+    assert!(prefix_ids.contains(&project_plan));
+    assert!(prefix_ids.contains(&project_archive));
+
+    let multi_token_prefix = svc
+        .search(&SearchQuery {
+            community: c,
+            q: "project pla".into(),
+            channel_scope: ChannelScope::Any,
+            kinds: Some(vec![9]),
+            authors: None,
+            since: None,
+            until: None,
+            page: 1,
+            per_page: 10,
+            mode: buzz_search::SearchMode::Prefix,
+        })
+        .await
+        .expect("multi-token prefix search ok");
+    assert_eq!(multi_token_prefix.hits.len(), 1);
+    assert_eq!(multi_token_prefix.hits[0].event_id, project_plan);
+
+    let completed_token_is_exact = svc
+        .search(&SearchQuery {
+            community: c,
+            q: "project pl".into(),
+            channel_scope: ChannelScope::Any,
+            kinds: Some(vec![9]),
+            authors: None,
+            since: None,
+            until: None,
+            page: 1,
+            per_page: 10,
+            mode: buzz_search::SearchMode::Prefix,
+        })
+        .await
+        .expect("completed-token exact + trailing-prefix search ok");
+    let completed_ids: Vec<[u8; 32]> = completed_token_is_exact
+        .hits
+        .iter()
+        .map(|h| h.event_id)
+        .collect();
+    assert!(completed_ids.contains(&project_plan));
+    assert!(
+        !completed_ids.contains(&projectile_plan),
+        "completed tokens must stay exact; only the trailing token gets :*"
+    );
+
+    teardown(pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn prefix_mode_handles_tsquery_boundary_punctuation() {
+    let (pool, schema) = setup().await;
+
+    let c = mk_community(&pool, "prefix-punctuation.example").await;
+    let hit_id = rand_bytes32();
+    insert_event(
+        &pool,
+        c,
+        hit_id,
+        rand_bytes32(),
+        9,
+        "operators ' : & | ( ) ! alpha beta marker",
+        None,
+        1_700_000_000,
+    )
+    .await;
+
+    let svc = SearchService::new(pool.clone());
+    let result = svc
+        .search(&SearchQuery {
+            community: c,
+            q: "operators ' : & | ( ) ! alpha be".into(),
+            channel_scope: ChannelScope::Any,
+            kinds: Some(vec![9]),
+            authors: None,
+            since: None,
+            until: None,
+            page: 1,
+            per_page: 10,
+            mode: buzz_search::SearchMode::Prefix,
+        })
+        .await
+        .expect("prefix punctuation search ok");
+
+    assert_eq!(result.hits.len(), 1);
+    assert_eq!(result.hits[0].event_id, hit_id);
+
+    teardown(pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn prefix_mode_preserves_storage_level_privacy_exclusions() {
+    let (pool, schema) = setup().await;
+
+    let c = mk_community(&pool, "prefix-privacy.example").await;
+    let token = "prefixprivacy_unique_marker";
+    let control_id = rand_bytes32();
+
+    insert_event(
+        &pool,
+        c,
+        control_id,
+        rand_bytes32(),
+        9,
+        &format!("public control {token}"),
+        None,
+        1_700_000_000,
+    )
+    .await;
+
+    for (i, &kind) in [1059_u32, 30300, 30622, 44100, 44101].iter().enumerate() {
+        insert_event(
+            &pool,
+            c,
+            rand_bytes32(),
+            rand_bytes32(),
+            kind as i32,
+            &format!("private kind {kind} {token}"),
+            None,
+            1_700_000_100 + i as i64,
+        )
+        .await;
+    }
+
+    let svc = SearchService::new(pool.clone());
+    let result = svc
+        .search(&SearchQuery {
+            community: c,
+            q: "prefixpriv".into(),
+            channel_scope: ChannelScope::Any,
+            kinds: None,
+            authors: None,
+            since: None,
+            until: None,
+            page: 1,
+            per_page: 10,
+            mode: buzz_search::SearchMode::Prefix,
+        })
+        .await
+        .expect("prefix privacy search ok");
+
+    assert_eq!(result.hits.len(), 1);
+    assert_eq!(result.hits[0].event_id, control_id);
 
     teardown(pool, &schema).await;
 }
@@ -333,6 +572,7 @@ async fn channel_scope_restricts_results() {
             until: None,
             page: 1,
             per_page: 10,
+            mode: buzz_search::SearchMode::FullText,
         })
         .await
         .unwrap();
@@ -351,6 +591,7 @@ async fn channel_scope_restricts_results() {
             until: None,
             page: 1,
             per_page: 10,
+            mode: buzz_search::SearchMode::FullText,
         })
         .await
         .unwrap();
@@ -368,6 +609,7 @@ async fn channel_scope_restricts_results() {
             until: None,
             page: 1,
             per_page: 10,
+            mode: buzz_search::SearchMode::FullText,
         })
         .await
         .unwrap();
@@ -385,6 +627,7 @@ async fn channel_scope_restricts_results() {
             until: None,
             page: 1,
             per_page: 10,
+            mode: buzz_search::SearchMode::FullText,
         })
         .await
         .unwrap();
@@ -423,6 +666,7 @@ async fn deleted_events_are_excluded() {
             until: None,
             page: 1,
             per_page: 10,
+            mode: buzz_search::SearchMode::FullText,
         })
         .await
         .unwrap();
@@ -453,6 +697,7 @@ async fn empty_query_returns_empty_result_no_roundtrip() {
                 until: None,
                 page: 1,
                 per_page: 10,
+                mode: buzz_search::SearchMode::FullText,
             })
             .await
             .unwrap();
@@ -519,6 +764,7 @@ async fn since_until_filters() {
             until: Some(1_700_015_000),
             page: 1,
             per_page: 10,
+            mode: buzz_search::SearchMode::FullText,
         })
         .await
         .unwrap();
@@ -562,6 +808,7 @@ async fn pagination_works() {
             until: None,
             page: 1,
             per_page: 3,
+            mode: buzz_search::SearchMode::FullText,
         })
         .await
         .unwrap();
@@ -578,6 +825,7 @@ async fn pagination_works() {
             until: None,
             page: 3,
             per_page: 3,
+            mode: buzz_search::SearchMode::FullText,
         })
         .await
         .unwrap();
@@ -669,6 +917,7 @@ async fn channel_less_only_excludes_per_channel_events() {
             until: None,
             page: 1,
             per_page: 10,
+            mode: buzz_search::SearchMode::FullText,
         })
         .await
         .unwrap();
@@ -716,6 +965,7 @@ async fn nul_bytes_in_query_are_sanitized() {
             until: None,
             page: 1,
             per_page: 10,
+            mode: buzz_search::SearchMode::FullText,
         })
         .await
         .expect("NUL-containing search query should not bubble a Postgres error");
@@ -758,6 +1008,7 @@ async fn enormous_page_number_is_clamped() {
             until: None,
             page: u32::MAX,
             per_page: 10,
+            mode: buzz_search::SearchMode::FullText,
         })
         .await
         .expect("huge page number should be bounded, not error");
@@ -786,6 +1037,7 @@ async fn very_long_query_is_bounded_before_pg_parse() {
             until: None,
             page: 1,
             per_page: 10,
+            mode: buzz_search::SearchMode::FullText,
         })
         .await
         .expect("long search query should be capped before Postgres parses it");
@@ -912,6 +1164,7 @@ async fn excluded_kinds_are_storage_level_unsearchable() {
             until: None,
             page: 1,
             per_page: 10,
+            mode: buzz_search::SearchMode::FullText,
         })
         .await
         .expect("search ok");
@@ -1006,6 +1259,7 @@ async fn author_only_kinds_are_storage_level_unsearchable() {
             until: None,
             page: 1,
             per_page: 100,
+            mode: buzz_search::SearchMode::FullText,
         })
         .await
         .expect("search ok");
@@ -1112,6 +1366,7 @@ async fn p_gated_persistent_kinds_have_storage_null_tsvector() {
             until: None,
             page: 1,
             per_page: 100,
+            mode: buzz_search::SearchMode::FullText,
         })
         .await
         .expect("search ok");

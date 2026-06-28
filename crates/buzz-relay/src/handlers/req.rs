@@ -555,6 +555,7 @@ async fn handle_search_req(
                 until,
                 page,
                 per_page,
+                mode: buzz_search::SearchMode::FullText,
             };
 
             let search_result = match state.search.search(&search_query).await {
