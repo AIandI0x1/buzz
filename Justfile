@@ -230,6 +230,11 @@ test-unit:
     #!/usr/bin/env bash
     if command -v cargo-nextest &>/dev/null; then
         cargo nextest run -p buzz-core -p buzz-auth --lib
+        # Multi-tenant conformance gate (buzz-conformance): the independent
+        # replay checker + golden fixtures. No infra — pure in-process trace
+        # replay — so it belongs in the unit job. Run all targets (lib + the
+        # tests/replay_fixtures.rs integration test), not just --lib.
+        cargo nextest run -p buzz-conformance
     else
         ./scripts/run-tests.sh unit
     fi
