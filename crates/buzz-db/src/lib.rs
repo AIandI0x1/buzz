@@ -239,7 +239,7 @@ impl Db {
             r#"
             SELECT id, host
             FROM communities
-            WHERE host = $1
+            WHERE lower(host) = lower($1)
             "#,
         )
         .bind(normalized_host)
@@ -2513,6 +2513,37 @@ mod tests {
             .await
             .expect("insert community");
         id
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn lookup_community_by_host_matches_case_insensitive_host_index() {
+        let db = setup_db().await;
+        let id = Uuid::new_v4();
+        let lower_host = format!("lookup-community-{}.example", id.simple());
+        let stored_host = lower_host.to_uppercase();
+
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            .bind(id)
+            .bind(&stored_host)
+            .execute(&db.pool)
+            .await
+            .expect("insert mixed-case community host");
+
+        let found = db
+            .lookup_community_by_host(&lower_host)
+            .await
+            .expect("lookup lower-case host")
+            .expect("community found by lower-case host");
+        assert_eq!(found.id, CommunityId::from_uuid(id));
+        assert_eq!(found.host, stored_host);
+
+        let found = db
+            .lookup_community_by_host(&stored_host)
+            .await
+            .expect("lookup stored-case host")
+            .expect("community found by stored-case host");
+        assert_eq!(found.id, CommunityId::from_uuid(id));
     }
 
     async fn insert_channel(pool: &PgPool, community_id: Uuid, channel_id: Uuid) {
