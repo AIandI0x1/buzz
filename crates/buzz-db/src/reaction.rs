@@ -247,7 +247,7 @@ pub async fn set_reaction_event_id(
 ///
 /// Returns one [`ReactionGroup`] per emoji, each containing the list of reacting
 /// user pubkeys. Display names are NOT resolved here -- callers should enrich via
-/// `get_users_bulk` if needed.
+/// scoped user lookups if needed.
 ///
 /// `cursor` is reserved for future keyset pagination (currently unused).
 pub async fn get_reactions(

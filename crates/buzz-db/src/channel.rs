@@ -894,25 +894,31 @@ pub async fn get_bot_members(
     Ok(out)
 }
 
-/// Bulk-fetch user records by pubkey.
+/// Bulk-fetch user records by pubkey inside one community.
 ///
 /// Returns only users that exist in the `users` table. Ordering matches input order
 /// is NOT guaranteed — callers should index by pubkey if order matters.
 /// Returns an empty vec immediately when `pubkeys` is empty (no query issued).
-pub async fn get_users_bulk(pool: &PgPool, pubkeys: &[Vec<u8>]) -> Result<Vec<UserRecord>> {
+pub async fn get_users_bulk(
+    pool: &PgPool,
+    community_id: CommunityId,
+    pubkeys: &[Vec<u8>],
+) -> Result<Vec<UserRecord>> {
     if pubkeys.is_empty() {
         return Ok(Vec::new());
     }
 
-    // Build a parameterised IN clause: ($1, $2, ...)
-    let placeholders = (1..=pubkeys.len())
+    // Build a parameterised IN clause: ($2, $3, ...); $1 is community_id.
+    let placeholders = (2..(pubkeys.len() + 2))
         .map(|i| format!("${i}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let sql =
-        format!("SELECT pubkey, display_name, avatar_url, nip05_handle FROM users WHERE pubkey IN ({placeholders})");
+    let sql = format!(
+        "SELECT pubkey, display_name, avatar_url, nip05_handle \
+         FROM users WHERE community_id = $1 AND pubkey IN ({placeholders})"
+    );
 
-    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(community_id.as_uuid());
     for pk in pubkeys {
         q = q.bind(pk);
     }
@@ -1462,6 +1468,40 @@ mod tests {
         .execute(pool)
         .await
         .expect("insert channel with fixed id");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn get_users_bulk_is_scoped_when_pubkey_exists_in_multiple_communities() {
+        let pool = setup_pool().await;
+        let community_a = make_test_community(&pool).await;
+        let community_b = make_test_community(&pool).await;
+        let community_a = CommunityId::from_uuid(community_a);
+        let community_b = CommunityId::from_uuid(community_b);
+        let pubkey = random_pubkey();
+
+        sqlx::query(
+            "INSERT INTO users (community_id, pubkey, display_name) VALUES ($1, $2, $3), ($4, $5, $6)",
+        )
+        .bind(community_a.as_uuid())
+        .bind(&pubkey)
+        .bind("community-a-profile")
+        .bind(community_b.as_uuid())
+        .bind(&pubkey)
+        .bind("community-b-profile")
+        .execute(&pool)
+        .await
+        .expect("insert same pubkey in two communities");
+
+        let users = get_users_bulk(&pool, community_a, std::slice::from_ref(&pubkey))
+            .await
+            .expect("bulk fetch users");
+
+        assert_eq!(users.len(), 1);
+        assert_eq!(
+            users[0].display_name.as_deref(),
+            Some("community-a-profile")
+        );
     }
 
     #[tokio::test]

@@ -453,17 +453,29 @@ pub async fn query_events(
             let type_events = match canonical {
                 "mentions" => state
                     .db
-                    .query_feed_mentions(&pubkey_bytes, &accessible_channels, since, remaining)
+                    .query_feed_mentions(
+                        tenant.community(),
+                        &pubkey_bytes,
+                        &accessible_channels,
+                        since,
+                        remaining,
+                    )
                     .await
                     .map_err(|e| internal_error(&format!("feed mentions error: {e}")))?,
                 "needs_action" => state
                     .db
-                    .query_feed_needs_action(&pubkey_bytes, &accessible_channels, since, remaining)
+                    .query_feed_needs_action(
+                        tenant.community(),
+                        &pubkey_bytes,
+                        &accessible_channels,
+                        since,
+                        remaining,
+                    )
                     .await
                     .map_err(|e| internal_error(&format!("feed needs_action error: {e}")))?,
                 "activity" => state
                     .db
-                    .query_feed_activity(&accessible_channels, since, remaining)
+                    .query_feed_activity(tenant.community(), &accessible_channels, since, remaining)
                     .await
                     .map_err(|e| internal_error(&format!("feed activity error: {e}")))?,
                 _ => continue,

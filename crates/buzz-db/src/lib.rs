@@ -723,8 +723,12 @@ impl Db {
     }
 
     /// Bulk-fetch user records by pubkey.
-    pub async fn get_users_bulk(&self, pubkeys: &[Vec<u8>]) -> Result<Vec<channel::UserRecord>> {
-        channel::get_users_bulk(&self.pool, pubkeys).await
+    pub async fn get_users_bulk(
+        &self,
+        community_id: CommunityId,
+        pubkeys: &[Vec<u8>],
+    ) -> Result<Vec<channel::UserRecord>> {
+        channel::get_users_bulk(&self.pool, community_id, pubkeys).await
     }
 
     /// Updates a channel's name and/or description.
@@ -1276,6 +1280,7 @@ impl Db {
     /// Find events that @mention the given pubkey.
     pub async fn query_feed_mentions(
         &self,
+        community: CommunityId,
         pubkey_bytes: &[u8],
         accessible_channel_ids: &[Uuid],
         since: Option<DateTime<Utc>>,
@@ -1283,6 +1288,7 @@ impl Db {
     ) -> Result<Vec<StoredEvent>> {
         feed::query_mentions(
             &self.pool,
+            community,
             pubkey_bytes,
             accessible_channel_ids,
             since,
@@ -1294,6 +1300,7 @@ impl Db {
     /// Find events that require action from the given pubkey.
     pub async fn query_feed_needs_action(
         &self,
+        community: CommunityId,
         pubkey_bytes: &[u8],
         accessible_channel_ids: &[Uuid],
         since: Option<DateTime<Utc>>,
@@ -1301,6 +1308,7 @@ impl Db {
     ) -> Result<Vec<StoredEvent>> {
         feed::query_needs_action(
             &self.pool,
+            community,
             pubkey_bytes,
             accessible_channel_ids,
             since,
@@ -1312,57 +1320,12 @@ impl Db {
     /// Find recent activity across accessible channels.
     pub async fn query_feed_activity(
         &self,
+        community: CommunityId,
         accessible_channel_ids: &[Uuid],
         since: Option<DateTime<Utc>>,
         limit: i64,
     ) -> Result<Vec<StoredEvent>> {
-        feed::query_activity(&self.pool, accessible_channel_ids, since, limit).await
-    }
-
-    /// Find events that @mention the given pubkey (alias).
-    pub async fn query_mentions(
-        &self,
-        pubkey_bytes: &[u8],
-        accessible_channel_ids: &[Uuid],
-        since: Option<DateTime<Utc>>,
-        limit: i64,
-    ) -> Result<Vec<StoredEvent>> {
-        feed::query_mentions(
-            &self.pool,
-            pubkey_bytes,
-            accessible_channel_ids,
-            since,
-            limit,
-        )
-        .await
-    }
-
-    /// Find events that require action from the given pubkey.
-    pub async fn query_needs_action(
-        &self,
-        pubkey_bytes: &[u8],
-        accessible_channel_ids: &[Uuid],
-        since: Option<DateTime<Utc>>,
-        limit: i64,
-    ) -> Result<Vec<StoredEvent>> {
-        feed::query_needs_action(
-            &self.pool,
-            pubkey_bytes,
-            accessible_channel_ids,
-            since,
-            limit,
-        )
-        .await
-    }
-
-    /// Find recent activity across accessible channels.
-    pub async fn query_activity(
-        &self,
-        accessible_channel_ids: &[Uuid],
-        since: Option<DateTime<Utc>>,
-        limit: i64,
-    ) -> Result<Vec<StoredEvent>> {
-        feed::query_activity(&self.pool, accessible_channel_ids, since, limit).await
+        feed::query_activity(&self.pool, community, accessible_channel_ids, since, limit).await
     }
 
     /// Create a new API token record.

@@ -75,6 +75,11 @@ relay:
   allowNipOaAuth: true
   pubkeyAllowlist: false
   corsOrigins: []
+  # Huddle audio is safe only for single-pod relay deployments until an SFU
+  # exists. null lets the chart render false automatically when
+  # replicaCount > 1. Explicit true with replicaCount > 1 means the operator
+  # accepts/owns the external multi-pod audio/SFU behavior.
+  huddleAudioAvailable: null
   ephemeralTtlOverride: 0
 
   livenessProbe:

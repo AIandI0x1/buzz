@@ -143,6 +143,9 @@ spec:
                   key: BUZZ_S3_SECRET_KEY
                   optional: true
 
+            - name: BUZZ_HUDDLE_AUDIO_AVAILABLE
+              value: {{ include "buzz.huddleAudioAvailable" . | quote }}
+
             {{- with .Values.relay.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
