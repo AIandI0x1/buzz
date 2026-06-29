@@ -914,6 +914,59 @@ test("system add and remove rows use agent mention styling for managed agents", 
   ).toHaveText("portal");
 });
 
+test("system agent profile huddle passes profile-only bot pubkey", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+  await waitForMockLiveSubscription(page, "general", SYSTEM_MESSAGE_KIND);
+
+  await page.evaluate(
+    ({ actorPubkey, kind, targetPubkey }) => {
+      window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
+        channelName: "general",
+        content: JSON.stringify({
+          type: "member_joined",
+          actor: actorPubkey,
+          target: targetPubkey,
+        }),
+        kind,
+      });
+    },
+    {
+      actorPubkey: TEST_IDENTITIES.tyler.pubkey,
+      kind: SYSTEM_MESSAGE_KIND,
+      targetPubkey: PROFILE_ONLY_AGENT_PUBKEY,
+    },
+  );
+  await waitForTimelineSettled(page);
+
+  const joinedRow = page
+    .getByTestId("system-message-row")
+    .filter({ hasText: "added mira to the channel" });
+  const agentChip = joinedRow.locator(
+    "[data-mention].agent-mention-highlight",
+    {
+      hasText: "mira",
+    },
+  );
+  await expect(agentChip).toHaveText("mira");
+  await agentChip.hover();
+
+  const profilePopover = page.locator(
+    '[data-testid="user-profile-popover"][data-state="open"]',
+  );
+  await expect(profilePopover).toBeVisible();
+  await profilePopover
+    .getByTestId(`user-profile-popover-huddle-${PROFILE_ONLY_AGENT_PUBKEY}`)
+    .click();
+
+  await expect
+    .poll(() => readStartHuddleMemberPubkeys(page))
+    .toEqual(expect.arrayContaining([PROFILE_ONLY_AGENT_PUBKEY]));
+});
+
 test("system member-joined rows render the joined person as a mention chip", async ({
   page,
 }) => {

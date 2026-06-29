@@ -100,8 +100,15 @@ function ProfileName({
     </span>
   );
 
+  const botIdenticonValue = typeof children === "string" ? children : undefined;
+
   return pubkey ? (
-    <UserProfilePopover pubkey={pubkey} triggerElement="span">
+    <UserProfilePopover
+      botIdenticonValue={botIdenticonValue}
+      pubkey={pubkey}
+      role={isAgent ? "bot" : undefined}
+      triggerElement="span"
+    >
       {node}
     </UserProfilePopover>
   ) : (
