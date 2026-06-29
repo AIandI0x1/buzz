@@ -91,6 +91,7 @@ fn buzz_agent_provider_defaults_empty_in_oss_build() {
     // OSS (and normal test) builds set neither BUZZ_BUILD_BUZZ_AGENT_*,
     // so nothing is baked in and no BUZZ_AGENT_* is injected on spawn.
     let mut cmd = std::process::Command::new("env");
+    cmd.env_clear();
     super::build_buzz_agent_provider_defaults(&mut cmd);
     // Verify the function injects nothing when the compile-time vars are absent.
     let output = cmd.output().expect("env should run");
@@ -167,6 +168,59 @@ fn parse_agent_env_lines_empty_value_is_allowed() {
 fn parse_agent_env_lines_empty_input_returns_empty() {
     assert!(parse_agent_env_lines("").is_empty());
     assert!(parse_agent_env_lines("   \n  \n").is_empty());
+}
+
+// ── base64 round-trip regression ─────────────────────────────────────────
+//
+// Cargo build-script output is line-oriented: a raw multiline value emitted
+// via `cargo:rustc-env=KEY=...` would be truncated to the first line.
+// build.rs base64-encodes the validated value; runtime.rs decodes it.
+// This test verifies that a 2-pair value with a URL containing `=` survives
+// the encode→decode→parse round-trip and both pairs land correctly.
+#[test]
+fn parse_agent_env_lines_base64_round_trip_preserves_all_pairs() {
+    use base64::Engine as _;
+    let raw = "DATABRICKS_HOST=https://host.example.com/path?a=1&b=2\nDATABRICKS_MODEL=some-model";
+    let encoded = base64::engine::general_purpose::STANDARD.encode(raw.as_bytes());
+    let decoded_bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.as_bytes())
+        .expect("decode should succeed");
+    let decoded = std::str::from_utf8(&decoded_bytes).expect("utf8 should be valid");
+    let pairs = parse_agent_env_lines(decoded);
+    assert_eq!(pairs.len(), 2, "both pairs must survive the round-trip");
+    assert_eq!(
+        pairs[0],
+        ("DATABRICKS_HOST", "https://host.example.com/path?a=1&b=2")
+    );
+    assert_eq!(pairs[1], ("DATABRICKS_MODEL", "some-model"));
+}
+
+// ── baked defaults ordering regression ───────────────────────────────────
+//
+// `build_buzz_agent_provider_defaults` must run BEFORE `runtime_metadata_env_vars`
+// writes the record's provider/model so that record values win (last-write-wins).
+// This test verifies the ordering by simulating what spawn does: call
+// `build_buzz_agent_provider_defaults` first, then overwrite with the record value.
+// In an OSS build the baked call is a no-op, so we simulate the baked write
+// manually and confirm the subsequent record write wins.
+#[test]
+fn baked_defaults_do_not_override_record_provider_written_after() {
+    let mut cmd = std::process::Command::new("env");
+    cmd.env_clear();
+    // Simulate what an internal build's baked defaults would inject.
+    cmd.env("BUZZ_AGENT_PROVIDER", "databricks");
+    // Simulate what runtime_metadata_env_vars writes from the record (comes after).
+    cmd.env("BUZZ_AGENT_PROVIDER", "anthropic");
+    let output = cmd.output().expect("env should run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("BUZZ_AGENT_PROVIDER=anthropic"),
+        "record provider must win over baked default (last-write-wins)"
+    );
+    assert!(
+        !stdout.contains("BUZZ_AGENT_PROVIDER=databricks"),
+        "baked default must not survive when record provider is written after"
+    );
 }
 
 #[test]

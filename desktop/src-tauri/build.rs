@@ -2,6 +2,8 @@
 // so the build-time validation below and the runtime parse cannot drift.
 include!("src/commands/reconnect_hook_config.rs");
 
+use base64::Engine as _;
+
 fn main() {
     println!("cargo:rerun-if-env-changed=BUZZ_RELAY_URL");
     println!("cargo:rerun-if-env-changed=BUZZ_RELAY_HTTP");
@@ -32,6 +34,9 @@ fn main() {
     // Generic KEY=VALUE pairs to inject into every spawned agent process.
     // Newline-delimited; each line must be non-empty and contain exactly one
     // `=` separator with a non-empty key.  OSS builds leave this unset.
+    // The validated value is base64-encoded before emitting so the single-line
+    // Cargo build-script output carries all pairs (Cargo output is line-oriented;
+    // a raw multiline value would be silently truncated to the first line).
     if let Ok(raw) = std::env::var("BUZZ_BUILD_AGENT_ENV") {
         for (line_no, line) in raw.lines().enumerate() {
             let line = line.trim();
@@ -54,7 +59,8 @@ fn main() {
                 );
             }
         }
-        println!("cargo:rustc-env=BUZZ_DESKTOP_BUILD_AGENT_ENV={raw}");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(raw.as_bytes());
+        println!("cargo:rustc-env=BUZZ_DESKTOP_BUILD_AGENT_ENV={encoded}");
     }
 
     if let Ok(val) = std::env::var("BUZZ_BUILD_RELAY_RECONNECT_CMD") {

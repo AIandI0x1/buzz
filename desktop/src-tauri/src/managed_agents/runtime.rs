@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use base64::Engine as _;
 use tauri::AppHandle;
 
 use crate::{
@@ -1796,6 +1797,10 @@ pub fn spawn_agent_child(
     } else {
         command.env_remove("BUZZ_ACP_MODEL");
     }
+    // Baked-in provider defaults for internal builds (buzz-releases sets
+    // BUZZ_BUILD_BUZZ_AGENT_* at compile time; OSS builds bake nothing).
+    // Written FIRST so that record/persona metadata env vars below override them.
+    build_buzz_agent_provider_defaults(&mut command);
     if let Some(meta) = runtime_meta {
         for (key, value) in runtime_metadata_env_vars(
             meta.model_env_var,
@@ -1869,11 +1874,6 @@ pub fn spawn_agent_child(
             record.name,
         );
     }
-
-    // Baked-in provider defaults for internal builds (buzz-releases sets
-    // BUZZ_BUILD_BUZZ_AGENT_* at compile time; OSS builds bake nothing).
-    // Written BEFORE user env_vars so a GUI/persona override still wins.
-    build_buzz_agent_provider_defaults(&mut command);
 
     // ── User env vars: the record snapshot ─────────────────────────────
     //
@@ -1970,8 +1970,14 @@ pub(crate) fn build_buzz_agent_provider_defaults(cmd: &mut std::process::Command
         }
     }
     if let Some(raw) = option_env!("BUZZ_DESKTOP_BUILD_AGENT_ENV") {
-        for (key, value) in parse_agent_env_lines(raw) {
-            cmd.env(key, value);
+        // The value was base64-encoded at build time so the single-line Cargo
+        // output carries all KEY=VALUE pairs without truncation.
+        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(raw.as_bytes()) {
+            if let Ok(text) = std::str::from_utf8(&decoded) {
+                for (key, value) in parse_agent_env_lines(text) {
+                    cmd.env(key, value);
+                }
+            }
         }
     }
 }
