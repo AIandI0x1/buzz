@@ -348,7 +348,7 @@ export function UserProfilePopover({
     try {
       const dm = await openDmMutation.mutateAsync({ pubkeys: [pubkey] });
       await goChannel(dm.id);
-      await startHuddle(dm.id, isBotProfile ? [pubkey] : []);
+      await startHuddle(dm.id, isAgentTarget ? [pubkey] : []);
       await queryClient.invalidateQueries({ queryKey: channelsQueryKey });
       if (isMountedRef.current) {
         setOpen(false);
@@ -366,7 +366,7 @@ export function UserProfilePopover({
     clearHoverTimer,
     goChannel,
     isAgentClassificationPending,
-    isBotProfile,
+    isAgentTarget,
     isStartingHuddle,
     openDmMutation,
     pendingAction,
