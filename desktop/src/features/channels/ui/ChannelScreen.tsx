@@ -4,7 +4,10 @@ import { cacheSearchHitEvent } from "@/app/navigation/searchHitEventCache";
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { useActiveChannelHeader } from "@/features/channels/useActiveChannelHeader";
 import { useChannelPaneHandlers } from "@/features/channels/useChannelPaneHandlers";
-import { buildAgentConversationMarkers } from "@/features/agents/agentConversations";
+import {
+  buildAgentConversationMarkers,
+  getHiddenAgentConversationMessageIds,
+} from "@/features/agents/agentConversations";
 import {
   useChannelMembersQuery,
   useJoinChannelMutation,
@@ -446,6 +449,19 @@ export function ChannelScreen({
     () => buildAgentConversationMarkers(resolvedMessages),
     [resolvedMessages],
   );
+  const unreadTimelineMessages = React.useMemo(() => {
+    const hiddenMessageIds = getHiddenAgentConversationMessageIds(
+      timelineMessages,
+      agentConversationMarkers,
+    );
+    if (hiddenMessageIds.size === 0) {
+      return timelineMessages;
+    }
+
+    return timelineMessages.filter(
+      (message) => !hiddenMessageIds.has(message.id),
+    );
+  }, [agentConversationMarkers, timelineMessages]);
   const channelFind = useChannelFind({
     channelId: activeChannelId,
     messages: timelineMessages,
@@ -468,7 +484,7 @@ export function ChannelScreen({
     unreadCount,
   } = useChannelUnreadState({
     activeChannelId,
-    timelineMessages,
+    timelineMessages: unreadTimelineMessages,
     currentPubkey,
     openThreadHeadId,
     threadReplyTargetId,
