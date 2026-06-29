@@ -556,6 +556,9 @@ export function AgentConversationScreen({
       mediaTags?: string[][],
     ) => {
       await sendMessageMutation.mutateAsync({
+        clientTags: [
+          ["client", "agent-conversation", conversation.agentReply.id],
+        ],
         content,
         mediaTags,
         mentionPubkeys: buildAgentConversationMentionPubkeys({
@@ -565,7 +568,12 @@ export function AgentConversationScreen({
         parentEventId: replyParentEventId,
       });
     },
-    [autoRoutedAgentPubkeys, replyParentEventId, sendMessageMutation],
+    [
+      autoRoutedAgentPubkeys,
+      conversation.agentReply.id,
+      replyParentEventId,
+      sendMessageMutation,
+    ],
   );
 
   const isComposerDisabled =

@@ -883,8 +883,7 @@ export const MessageRow = React.memo(
     prev.onCollapseDescendants === next.onCollapseDescendants &&
     prev.onCollapseDescendantsHoverChange ===
       next.onCollapseDescendantsHoverChange &&
-    Boolean(prev.onOpenAgentConversation) ===
-      Boolean(next.onOpenAgentConversation) &&
+    prev.onOpenAgentConversation === next.onOpenAgentConversation &&
     prev.profiles === next.profiles &&
     prev.searchQuery === next.searchQuery &&
     prev.videoReviewContext === next.videoReviewContext,

@@ -91,8 +91,8 @@ const overrides = new Map([
   // applyWorkspace reposDir parameter plus the validateReposDir binding,
   // threaded through Tauri invokes for configurable repos_dir, plus the
   // harness-persona-sync `harnessOverride` create-input bit — load-bearing
-  // parameter plumbing, not generic debt growth. Approved override; still
-  // queued to split.
+  // parameter plumbing, plus continued-agent-conversations client task-anchor
+  // tags on message sends. Approved override; still queued to split.
   ["src/shared/api/tauri.ts", 1235],
   // harness-persona-sync feature growth, queued to split in the resolver-unify
   // refactor followup. discovery.rs is dominated by the new test module

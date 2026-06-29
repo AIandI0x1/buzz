@@ -265,6 +265,7 @@ const MessageTimelineBase = React.forwardRef<
     isLoading: showTimelineSkeleton,
     messages: deferredMessages,
     onTargetReached,
+    resetKey: scrollRouteKey,
     scrollContainerRef,
     targetMessageId,
   });
