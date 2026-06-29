@@ -63,9 +63,8 @@ export function UserProfileAgentSettingsMenu({
     onToggleAutoStart !== undefined;
   const autoStartSwitchId = `user-profile-agent-auto-start-${actionKey}`;
   const hasPrimaryActions = Boolean(onDuplicatePersona || onExportPersona);
-  const hasArchiveAction =
-    archiveActions?.canArchive === true &&
-    archiveActions.isArchived !== undefined;
+  const hasArchiveAction = archiveActions?.canArchive === true;
+  const archiveStateKnown = archiveActions?.isArchived !== undefined;
   const shouldConfirmAgentDelete =
     managedAgent !== undefined && onDelete !== undefined;
   const hasManageActions = hasArchiveAction || Boolean(onDelete);
@@ -146,7 +145,7 @@ export function UserProfileAgentSettingsMenu({
             <DropdownMenuSeparator />
           ) : null}
           {hasArchiveAction && archiveActions ? (
-            archiveActions.isArchived ? (
+            archiveActions.isArchived === true ? (
               <DropdownMenuItem
                 data-testid="user-profile-unarchive-identity"
                 disabled={isPending}
@@ -158,11 +157,21 @@ export function UserProfileAgentSettingsMenu({
             ) : (
               <DropdownMenuItem
                 data-testid="user-profile-archive-identity"
-                disabled={isPending}
-                onSelect={() => setArchiveConfirmOpen(true)}
+                disabled={isPending || !archiveStateKnown}
+                onSelect={(event) => {
+                  if (!archiveStateKnown) {
+                    event.preventDefault();
+                    return;
+                  }
+                  setArchiveConfirmOpen(true);
+                }}
               >
                 <Archive className="h-4 w-4" />
-                {archiveActions.isPending ? "Archiving…" : archiveLabel}
+                {archiveActions.isPending
+                  ? "Archiving…"
+                  : archiveStateKnown
+                    ? archiveLabel
+                    : "Checking archive status…"}
               </DropdownMenuItem>
             )
           ) : null}
@@ -186,11 +195,12 @@ export function UserProfileAgentSettingsMenu({
           ) : null}
         </DropdownMenuContent>
       </DropdownMenu>
-      {hasArchiveAction && archiveActions ? (
+      {hasArchiveAction && archiveActions && archiveStateKnown ? (
         <ArchiveConfirmDialog
           isBot={isBot}
           isPending={archiveActions.isPending}
           onConfirm={() => {
+            if (archiveActions.isArchived !== false) return;
             archiveActions.archive();
             setArchiveConfirmOpen(false);
           }}
@@ -245,8 +255,7 @@ export function UserProfileAgentSettingsMenuSlot({
   personaActionKey?: string;
   viewerIsOwner: boolean;
 }) {
-  const canShowArchiveAction =
-    archiveActions.canArchive && archiveActions.isArchived !== undefined;
+  const canShowArchiveAction = archiveActions.canArchive;
   const settingsActionPending =
     isAgentActionPending || archiveActions.isPending;
   const sharedProps = {

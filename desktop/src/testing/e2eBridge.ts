@@ -106,12 +106,13 @@ type E2eConfig = {
     stallWebsocketSends?: boolean;
     userSearchDelayMs?: number;
     // NIP-IA gate inputs — see tests/helpers/bridge.ts:MockBridgeOptions for
-    // semantics. These three drive the archive-button gate matrix in
+    // semantics. These options drive the archive-button gate matrix in
     // tests/e2e/identity-archive.spec.ts; they're plumbed into:
-    // - `list_archived_identities` (archivedIdentities)
+    // - `list_archived_identities` (archivedIdentities / archivedIdentitiesDelayMs)
     // - `resolve_oa_owner` (oaOwnerIsMe)
     // - `resetMockRelayMembers` (relayRole)
     archivedIdentities?: string[];
+    archivedIdentitiesDelayMs?: number;
     oaOwnerIsMe?: boolean;
     relayRole?: "owner" | "admin" | "member" | null;
     // Descriptors returned by the mocked `pick_and_upload_media` /
@@ -7649,6 +7650,10 @@ export function maybeInstallE2eTauriMocks() {
         return { owner, is_me: isMe };
       }
       case "list_archived_identities": {
+        const delayMs = activeConfig?.mock?.archivedIdentitiesDelayMs ?? 0;
+        if (delayMs > 0) {
+          await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+        }
         const archived = activeConfig?.mock?.archivedIdentities ?? [];
         return { archived };
       }

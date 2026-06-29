@@ -101,7 +101,7 @@ export function useUnarchiveIdentityMutation() {
 export type IdentityArchiveActions = {
   /** Render guard only — the relay re-verifies authority on submit. */
   canArchive: boolean;
-  /** `undefined` while the snapshot loads — defer flair + Manage until known. */
+  /** `undefined` while the snapshot loads — defer flair + mutation affordances until known. */
   isArchived: boolean | undefined;
   isPending: boolean;
   archive: () => void;

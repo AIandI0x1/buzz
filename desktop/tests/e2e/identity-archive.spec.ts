@@ -97,6 +97,26 @@ test.describe("NIP-IA archive button gate", () => {
     ).toBeVisible();
   });
 
+  test("case 3b — verified OA owner viewing Alice while snapshot is pending: Archive visible but disabled", async ({
+    page,
+  }) => {
+    await installMockBridge(page, {
+      relayRole: null,
+      oaOwnerIsMe: true,
+      archivedIdentities: [],
+      archivedIdentitiesDelayMs: 60_000,
+    });
+    await openAliceProfile(page);
+    await openProfileSettingsMenu(page);
+
+    const archiveButton = page.getByTestId("user-profile-archive-identity");
+    await expect(archiveButton).toBeVisible();
+    await expect(archiveButton).toBeDisabled();
+    await expect(archiveButton).toContainText("Checking archive status…");
+    await archiveButton.click({ force: true });
+    await expect(page.getByTestId("archive-confirm-dialog")).toHaveCount(0);
+  });
+
   test("case 4 — no authority viewing Alice: Archive hidden", async ({
     page,
   }) => {

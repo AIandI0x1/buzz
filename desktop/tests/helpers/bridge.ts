@@ -134,6 +134,8 @@ type MockBridgeOptions = {
    * "Archived on this relay" flair + Unarchive button.
    */
   archivedIdentities?: string[];
+  /** Delay (ms) for `list_archived_identities`; lets specs assert pending snapshot UI. */
+  archivedIdentitiesDelayMs?: number;
   /**
    * Drives the `is_me` field of `resolve_oa_owner`. When true, the harness
    * reports the active identity as the verified NIP-OA owner of the viewee
