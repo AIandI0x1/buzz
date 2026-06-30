@@ -59,6 +59,37 @@ function CalendarMenuItem({
   const showJoin = Boolean(isOngoing && joinUrl);
   const canOpenJoinUrl = Boolean(showJoin && joinUrl);
   const meta = event ? formatCalendarStart(event, now) : null;
+  const content = (
+    <>
+      <CalendarDays className="h-4 w-4" />
+      <span className="min-w-0 flex-1 truncate pr-2">{title}</span>
+      {showJoin ? (
+        <>
+          <span className="shrink-0 text-2xs font-medium text-sidebar-foreground/60 group-hover/calendar:hidden group-focus-visible/calendar:hidden">
+            Now
+          </span>
+          <span className="hidden shrink-0 items-center gap-1 rounded-full bg-primary/10 px-1.5 py-0.5 text-2xs font-medium text-primary group-hover/calendar:inline-flex group-focus-visible/calendar:inline-flex">
+            <Video className="h-3 w-3" />
+            Join
+          </span>
+        </>
+      ) : meta ? (
+        <span className="shrink-0 text-2xs font-medium text-sidebar-foreground/60">
+          {meta}
+        </span>
+      ) : null}
+    </>
+  );
+
+  if (!canOpenJoinUrl) {
+    return (
+      <SidebarMenuItem>
+        <SidebarMenuButton asChild className="group/calendar" tooltip={title}>
+          <div data-testid="sidebar-calendar-status">{content}</div>
+        </SidebarMenuButton>
+      </SidebarMenuItem>
+    );
+  }
 
   return (
     <SidebarMenuItem>
@@ -73,23 +104,7 @@ function CalendarMenuItem({
         tooltip={title}
         type="button"
       >
-        <CalendarDays className="h-4 w-4" />
-        <span className="min-w-0 flex-1 truncate pr-2">{title}</span>
-        {showJoin ? (
-          <>
-            <span className="shrink-0 text-2xs font-medium text-sidebar-foreground/60 group-hover/calendar:hidden group-focus-visible/calendar:hidden">
-              Now
-            </span>
-            <span className="hidden shrink-0 items-center gap-1 rounded-full bg-primary/10 px-1.5 py-0.5 text-2xs font-medium text-primary group-hover/calendar:inline-flex group-focus-visible/calendar:inline-flex">
-              <Video className="h-3 w-3" />
-              Join
-            </span>
-          </>
-        ) : meta ? (
-          <span className="shrink-0 text-2xs font-medium text-sidebar-foreground/60">
-            {meta}
-          </span>
-        ) : null}
+        {content}
       </SidebarMenuButton>
     </SidebarMenuItem>
   );

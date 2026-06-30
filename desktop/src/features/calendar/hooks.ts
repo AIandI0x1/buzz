@@ -8,7 +8,6 @@ import {
   getGoogleCalendarStatus,
   type GoogleCalendarEvent,
 } from "@/features/calendar/api";
-import { useNow } from "@/shared/lib/useNow";
 
 export const googleCalendarStatusQueryKey = ["google-calendar-status"] as const;
 
@@ -21,6 +20,20 @@ const calendarBusyTimeFormatter = new Intl.DateTimeFormat(undefined, {
   hour: "numeric",
   minute: "2-digit",
 });
+
+function useCalendarNow(enabled: boolean): number {
+  const [now, setNow] = React.useState(() => Date.now());
+
+  React.useEffect(() => {
+    if (!enabled) return;
+
+    setNow(Date.now());
+    const interval = window.setInterval(() => setNow(Date.now()), 60_000);
+    return () => window.clearInterval(interval);
+  }, [enabled]);
+
+  return now;
+}
 
 export function useGoogleCalendarStatusQuery({
   enabled = true,
@@ -150,7 +163,7 @@ export function useCurrentGoogleCalendarEvent({
 }: {
   enabled?: boolean;
 } = {}) {
-  const now = useNow(60_000);
+  const now = useCalendarNow(enabled);
   const statusQuery = useGoogleCalendarStatusQuery({ enabled });
   const window = React.useMemo(() => todayCalendarWindow(now), [now]);
   const eventsQuery = useGoogleCalendarEventsQuery({

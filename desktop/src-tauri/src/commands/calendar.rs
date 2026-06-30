@@ -266,8 +266,8 @@ async fn wait_for_oauth_callback(
 
     let (title, body) = if result.is_ok() {
         (
-            "Google Calendar connected",
-            "You can close this browser tab and return to Buzz.",
+            "Google Calendar authorization received",
+            "Return to Buzz to finish connecting Google Calendar.",
         )
     } else {
         (

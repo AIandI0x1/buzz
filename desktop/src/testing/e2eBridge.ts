@@ -7522,16 +7522,6 @@ export function maybeInstallE2eTauriMocks() {
         return mockSpotifyStatus();
       case "disconnect_spotify":
         return mockSpotifyStatus();
-      case "get_spotify_devices":
-        return [];
-      case "get_spotify_playback_state":
-        return null;
-      case "start_spotify_playback":
-      case "pause_spotify_playback":
-      case "skip_spotify_next":
-      case "skip_spotify_previous":
-      case "seek_spotify_playback":
-        return;
       case "pick_and_upload_media":
         return await resolveMockUploadDescriptors(activeConfig);
       case "upload_media_bytes":
