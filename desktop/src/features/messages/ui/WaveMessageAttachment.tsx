@@ -53,16 +53,26 @@ export function WaveMessageAttachment({
       return true;
     });
   }, [huddleMemberPubkeys, targetAgentPubkey]);
+  const resolvedIncludesTarget =
+    normalizedTargetPubkey !== null &&
+    resolvedHuddleMemberPubkeys.some(
+      (pubkey) => normalizePubkey(pubkey) === normalizedTargetPubkey,
+    );
   const targetAgentLookupPending =
-    targetIsAgent &&
     normalizedTargetPubkey !== null &&
     huddleMemberPubkeysPending &&
     targetAgentPubkey === null &&
-    !resolvedHuddleMemberPubkeys.some(
-      (pubkey) => normalizePubkey(pubkey) === normalizedTargetPubkey,
-    );
+    !resolvedIncludesTarget;
+  const legacyAgentLookupPending =
+    normalizedTargetPubkey === null &&
+    !targetIsAgent &&
+    huddleMemberPubkeysPending &&
+    resolvedHuddleMemberPubkeys.length === 0;
   const startHuddleDisabled =
-    !channelId || isStarting || targetAgentLookupPending;
+    !channelId ||
+    isStarting ||
+    targetAgentLookupPending ||
+    legacyAgentLookupPending;
 
   const handleStartHuddle = React.useCallback(
     async (event: React.MouseEvent<HTMLButtonElement>) => {
