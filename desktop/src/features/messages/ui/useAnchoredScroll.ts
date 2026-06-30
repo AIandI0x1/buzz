@@ -270,6 +270,7 @@ export function useAnchoredScroll({
   // guard runs on a native scroll event, outside React's render cycle.
   const settlingRef = React.useRef(false);
   const anchorUpdateLockedRef = React.useRef(false);
+  const userScrollIntentRef = React.useRef(false);
 
   // Reset everything when the route's scroll identity changes — the layout
   // effect that runs immediately after this reset is responsible for either
@@ -284,6 +285,7 @@ export function useAnchoredScroll({
       const anchor = container ? computeAnchor(container) : anchorRef.current;
       pendingPrependAnchorRef.current = anchor;
       anchorRef.current = anchor;
+      userScrollIntentRef.current = false;
       anchorUpdateLockedRef.current = true;
     }
   }, [isHistoryPrependPending, scrollContainerRef]);
@@ -303,6 +305,7 @@ export function useAnchoredScroll({
     forceBottomOnNextAppendRef.current = false;
     settlingRef.current = false;
     anchorUpdateLockedRef.current = false;
+    userScrollIntentRef.current = false;
     if (highlightTimeoutRef.current !== null) {
       window.clearTimeout(highlightTimeoutRef.current);
       highlightTimeoutRef.current = null;
@@ -316,6 +319,33 @@ export function useAnchoredScroll({
       prependRestoreRafIdRef.current = null;
     }
   }, [resetKey]);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: resetKey re-subscribes when the keyed scroll container remounts.
+  React.useEffect(() => {
+    const container = scrollContainerRef.current;
+    if (!container) return;
+
+    const markUserScrollIntent = () => {
+      userScrollIntentRef.current = true;
+      anchorUpdateLockedRef.current = false;
+    };
+
+    container.addEventListener("wheel", markUserScrollIntent, {
+      passive: true,
+    });
+    container.addEventListener("touchmove", markUserScrollIntent, {
+      passive: true,
+    });
+    container.addEventListener("pointerdown", markUserScrollIntent);
+    container.addEventListener("keydown", markUserScrollIntent);
+
+    return () => {
+      container.removeEventListener("wheel", markUserScrollIntent);
+      container.removeEventListener("touchmove", markUserScrollIntent);
+      container.removeEventListener("pointerdown", markUserScrollIntent);
+      container.removeEventListener("keydown", markUserScrollIntent);
+    };
+  }, [resetKey, scrollContainerRef]);
 
   const scrollToBottomImperative = React.useCallback(
     (behavior: ScrollBehavior = "auto") => {
@@ -424,8 +454,14 @@ export function useAnchoredScroll({
     }
     const nextAnchor = computeAnchor(container);
     const atBottom = nextAnchor.kind === "at-bottom";
-    if (!anchorUpdateLockedRef.current || atBottom) {
+    if (
+      !anchorUpdateLockedRef.current ||
+      atBottom ||
+      userScrollIntentRef.current
+    ) {
       anchorRef.current = nextAnchor;
+    } else {
+      anchorUpdateLockedRef.current = false;
     }
     setIsAtBottom((prev) => (prev === atBottom ? prev : atBottom));
     if (atBottom) {
