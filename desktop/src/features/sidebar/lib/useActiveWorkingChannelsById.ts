@@ -20,6 +20,12 @@ import type {
 } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
+console.log("[pill-diag] module loaded", {
+  loadedAt: new Date().toISOString(),
+});
+
+let pillDiagRenderCount = 0;
+
 type WorkingAgentName = Pick<ManagedAgent, "pubkey" | "name">;
 type WorkingAgent = Pick<ManagedAgent, "pubkey" | "name" | "status">;
 type PillDiagProfile = UserProfileSummary & {
@@ -164,6 +170,12 @@ export function useActiveWorkingChannelsById(): ReadonlyMap<
   string,
   ActiveChannelTurnSummary
 > {
+  pillDiagRenderCount += 1;
+  console.log("[pill-diag] hook render", {
+    renderCount: pillDiagRenderCount,
+    renderedAt: new Date().toISOString(),
+  });
+
   const identityQuery = useIdentityQuery();
   const currentPubkey = identityQuery.data?.pubkey;
   const managedAgentsQuery = useManagedAgentsQuery();
