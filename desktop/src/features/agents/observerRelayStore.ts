@@ -151,6 +151,16 @@ function pillDiagEvent(event: RelayEvent) {
   };
 }
 
+function pillDiagBridgeAgents(
+  agents: readonly Pick<ManagedAgent, "pubkey" | "status">[],
+) {
+  return agents.map((agent) => ({
+    pubkey: normalizePubkey(agent.pubkey),
+    status: agent.status,
+    startsObserver: agent.status === "running" || agent.status === "deployed",
+  }));
+}
+
 function notifyListeners() {
   for (const listener of listeners) {
     listener();
@@ -498,6 +508,12 @@ export function useManagedAgentObserverBridge(
       ),
     [agents],
   );
+
+  pillDiagLog("bridge render", {
+    subscriptionId,
+    hasActiveAgent,
+    agents: pillDiagBridgeAgents(agents),
+  });
 
   const agentPubkeys = React.useMemo(
     () => agents.map((agent) => agent.pubkey),
