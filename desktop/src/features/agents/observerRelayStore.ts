@@ -84,26 +84,17 @@ function registerKnownAgents(
   subscriptionId: string,
   pubkeys: readonly string[],
 ) {
-  const normalizedPubkeys = pubkeys.map((pubkey) => normalizePubkey(pubkey));
-  knownAgentsBySubscription.set(subscriptionId, new Set(normalizedPubkeys));
-  recomputeKnownAgentPubkeys();
-  pillDiagLog("registerKnownAgents", {
+  knownAgentsBySubscription.set(
     subscriptionId,
-    subscriptionPubkeys: pillDiagPubkeys(normalizedPubkeys),
-  });
+    new Set(pubkeys.map((pubkey) => normalizePubkey(pubkey))),
+  );
+  recomputeKnownAgentPubkeys();
 }
 
 function unregisterKnownAgents(subscriptionId: string) {
-  const removedPubkeys = knownAgentsBySubscription.get(subscriptionId);
-  const removed = knownAgentsBySubscription.delete(subscriptionId);
-  if (removed) {
+  if (knownAgentsBySubscription.delete(subscriptionId)) {
     recomputeKnownAgentPubkeys();
   }
-  pillDiagLog("unregisterKnownAgents", {
-    subscriptionId,
-    removed,
-    removedPubkeys: removedPubkeys ? pillDiagPubkeys(removedPubkeys) : [],
-  });
 }
 
 let connectionState: ConnectionState = "idle";
@@ -112,54 +103,6 @@ let unsubscribeRelay: (() => Promise<void>) | null = null;
 let startPromise: Promise<void> | null = null;
 let eventProcessingQueue: Promise<void> = Promise.resolve();
 let generation = 0;
-
-function pillDiagPubkeys(pubkeys: Iterable<string>) {
-  return [...pubkeys].map((pubkey) => normalizePubkey(pubkey)).sort();
-}
-
-function pillDiagState(extra: Record<string, unknown> = {}) {
-  return {
-    generation,
-    connectionState,
-    hasRelaySubscription: Boolean(unsubscribeRelay),
-    hasStartPromise: Boolean(startPromise),
-    knownAgentCount: knownAgentPubkeys.size,
-    knownAgents: pillDiagPubkeys(knownAgentPubkeys),
-    subscriptionCount: knownAgentsBySubscription.size,
-    subscriptionSizes: Object.fromEntries(
-      [...knownAgentsBySubscription.entries()].map(
-        ([subscriptionId, pubkeys]) => [subscriptionId, pubkeys.size],
-      ),
-    ),
-    at: new Date().toISOString(),
-    ...extra,
-  };
-}
-
-function pillDiagLog(label: string, extra: Record<string, unknown> = {}) {
-  console.log(`[pill-diag] observer ${label}`, pillDiagState(extra));
-}
-
-function pillDiagEvent(event: RelayEvent) {
-  const agentPubkey = observerTag(event, "agent");
-  return {
-    eventId: event.id,
-    eventPubkey: normalizePubkey(event.pubkey),
-    agentPubkey: agentPubkey ? normalizePubkey(agentPubkey) : null,
-    frame: observerTag(event, "frame"),
-    createdAt: event.created_at,
-  };
-}
-
-function pillDiagBridgeAgents(
-  agents: readonly Pick<ManagedAgent, "pubkey" | "status">[],
-) {
-  return agents.map((agent) => ({
-    pubkey: normalizePubkey(agent.pubkey),
-    status: agent.status,
-    startsObserver: agent.status === "running" || agent.status === "deployed",
-  }));
-}
 
 function notifyListeners() {
   for (const listener of listeners) {
@@ -248,52 +191,26 @@ async function handleRelayObserverEvent(
   const agentPubkey = observerTag(event, "agent");
   const frame = observerTag(event, "frame");
   if (!agentPubkey || frame !== "telemetry") {
-    pillDiagLog("drop nonTelemetryFrame", {
-      activeGeneration,
-      event: pillDiagEvent(event),
-    });
     return;
   }
 
   // Verify agent is known/trusted before decrypting.
   // Silently drop events from agents we are not managing.
   if (!knownAgentPubkeys.has(normalizePubkey(agentPubkey))) {
-    pillDiagLog("drop unknownAgent", {
-      activeGeneration,
-      event: pillDiagEvent(event),
-    });
     return;
   }
 
   // Defense-in-depth: verify the event sender matches the claimed agent pubkey.
   // The relay gates on is_agent_owner, but a compromised relay could misroute.
   if (normalizePubkey(event.pubkey) !== normalizePubkey(agentPubkey)) {
-    pillDiagLog("drop senderMismatch", {
-      activeGeneration,
-      event: pillDiagEvent(event),
-    });
     return;
   }
 
   try {
     const parsed = (await decryptObserverEvent(event)) as ObserverEvent;
     if (activeGeneration !== generation) {
-      pillDiagLog("drop staleGenerationAfterDecrypt", {
-        activeGeneration,
-        event: pillDiagEvent(event),
-        parsedKind: parsed.kind,
-        parsedSeq: parsed.seq,
-        parsedTimestamp: parsed.timestamp,
-      });
       return;
     }
-    pillDiagLog("appendFrame", {
-      activeGeneration,
-      event: pillDiagEvent(event),
-      parsedKind: parsed.kind,
-      parsedSeq: parsed.seq,
-      parsedTimestamp: parsed.timestamp,
-    });
     appendAgentEvent(agentPubkey, parsed);
     if (parsed.kind === "session_config_captured") {
       void putAgentSessionConfig(agentPubkey, parsed.payload);
@@ -303,18 +220,8 @@ async function handleRelayObserverEvent(
     }
   } catch (error) {
     if (activeGeneration !== generation) {
-      pillDiagLog("drop staleGenerationAfterError", {
-        activeGeneration,
-        event: pillDiagEvent(event),
-        error: error instanceof Error ? error.message : String(error),
-      });
       return;
     }
-    pillDiagLog("decryptError", {
-      activeGeneration,
-      event: pillDiagEvent(event),
-      error: error instanceof Error ? error.message : String(error),
-    });
     setConnectionState(
       "error",
       error instanceof Error
@@ -326,44 +233,25 @@ async function handleRelayObserverEvent(
 
 export function ensureRelayObserverSubscription() {
   if (unsubscribeRelay) {
-    pillDiagLog("ensure reuseOpenSubscription");
     return Promise.resolve();
   }
   if (startPromise) {
-    pillDiagLog("ensure reuseStartPromise");
     return startPromise;
   }
 
   const activeGeneration = generation;
-  pillDiagLog("ensure start", { activeGeneration });
   setConnectionState("connecting", null);
   startPromise = (async () => {
     const identity = await getIdentity();
-    pillDiagLog("subscribeToAgentObserverFrames start", {
-      activeGeneration,
-      identityPubkey: normalizePubkey(identity.pubkey),
-    });
     const unsubscribe = await subscribeToAgentObserverFrames(
       identity.pubkey,
       (event) => {
-        pillDiagLog("frame received", {
-          activeGeneration,
-          event: pillDiagEvent(event),
-        });
         eventProcessingQueue = eventProcessingQueue
           .then(() => handleRelayObserverEvent(event, activeGeneration))
           .catch((error) => {
             if (activeGeneration !== generation) {
-              pillDiagLog("drop staleGenerationInQueueCatch", {
-                activeGeneration,
-                error: error instanceof Error ? error.message : String(error),
-              });
               return;
             }
-            pillDiagLog("eventHandlingError", {
-              activeGeneration,
-              error: error instanceof Error ? error.message : String(error),
-            });
             setConnectionState(
               "error",
               error instanceof Error
@@ -374,19 +262,13 @@ export function ensureRelayObserverSubscription() {
       },
     );
     if (activeGeneration !== generation) {
-      pillDiagLog("subscribe resolved staleGeneration", { activeGeneration });
       await unsubscribe();
       return;
     }
     unsubscribeRelay = unsubscribe;
-    pillDiagLog("subscribe open", { activeGeneration });
     setConnectionState("open", null);
   })()
     .catch((error) => {
-      pillDiagLog("subscribe error", {
-        activeGeneration,
-        error: error instanceof Error ? error.message : String(error),
-      });
       if (activeGeneration === generation) {
         setConnectionState(
           "error",
@@ -397,7 +279,6 @@ export function ensureRelayObserverSubscription() {
       }
     })
     .finally(() => {
-      pillDiagLog("ensure finally", { activeGeneration });
       if (activeGeneration === generation) {
         startPromise = null;
       }
@@ -509,12 +390,6 @@ export function useManagedAgentObserverBridge(
     [agents],
   );
 
-  pillDiagLog("bridge render", {
-    subscriptionId,
-    hasActiveAgent,
-    agents: pillDiagBridgeAgents(agents),
-  });
-
   const agentPubkeys = React.useMemo(
     () => agents.map((agent) => agent.pubkey),
     [agents],
@@ -531,7 +406,6 @@ export function useManagedAgentObserverBridge(
   }, [subscriptionId, agentPubkeys]);
 
   React.useEffect(() => {
-    pillDiagLog("bridge activeEffect", { hasActiveAgent });
     if (!hasActiveAgent) {
       return;
     }
@@ -551,7 +425,6 @@ export function useManagedAgentObserverBridge(
 }
 
 export function resetAgentObserverStore() {
-  pillDiagLog("reset start", { nextGeneration: generation + 1 });
   generation += 1;
   const unsubscribe = unsubscribeRelay;
   unsubscribeRelay = null;
@@ -566,6 +439,5 @@ export function resetAgentObserverStore() {
   connectionState = "idle";
   errorMessage = null;
   notifyListeners();
-  pillDiagLog("reset afterClear", { hadUnsubscribe: Boolean(unsubscribe) });
   void unsubscribe?.();
 }

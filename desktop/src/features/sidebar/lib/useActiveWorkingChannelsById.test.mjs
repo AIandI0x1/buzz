@@ -124,7 +124,7 @@ describe("getOwnedRelayWorkingAgents", () => {
 });
 
 describe("mergeWorkingAgents", () => {
-  it("dedupes owned relay agents behind locally managed agents", () => {
+  it("keeps active managed agents ahead of owned relay duplicates", () => {
     assert.deepEqual(
       mergeWorkingAgents(
         [{ pubkey: "AAAA", name: "Ned", status: "running" }],
@@ -141,6 +141,28 @@ describe("mergeWorkingAgents", () => {
         { pubkey: "AAAA", name: "Ned", status: "running" },
         { pubkey: OWNED_RELAY_AGENT_PUBKEY, name: "nadia", status: "deployed" },
       ],
+    );
+  });
+
+  it("uses owned relay status when a duplicate managed agent is stopped", () => {
+    assert.deepEqual(
+      mergeWorkingAgents(
+        [
+          {
+            pubkey: OWNED_RELAY_AGENT_PUBKEY.toUpperCase(),
+            name: "Local Nadia",
+            status: "stopped",
+          },
+        ],
+        [
+          {
+            pubkey: OWNED_RELAY_AGENT_PUBKEY,
+            name: "nadia",
+            status: "deployed",
+          },
+        ],
+      ),
+      [{ pubkey: OWNED_RELAY_AGENT_PUBKEY, name: "nadia", status: "deployed" }],
     );
   });
 });

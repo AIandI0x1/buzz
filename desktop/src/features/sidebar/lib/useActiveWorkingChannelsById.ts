@@ -20,17 +20,8 @@ import type {
 } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
-console.log("[pill-diag] module loaded", {
-  loadedAt: new Date().toISOString(),
-});
-
-let pillDiagRenderCount = 0;
-
 type WorkingAgentName = Pick<ManagedAgent, "pubkey" | "name">;
 type WorkingAgent = Pick<ManagedAgent, "pubkey" | "name" | "status">;
-type PillDiagProfile = UserProfileSummary & {
-  pubkey?: string;
-};
 type OwnedRelayWorkingAgent = Pick<RelayAgent, "pubkey" | "name"> & {
   status: "deployed";
 };
@@ -69,113 +60,35 @@ export function getOwnedRelayWorkingAgents(
   });
 }
 
+function agentCanStartObserver(agent: WorkingAgent) {
+  return agent.status === "running" || agent.status === "deployed";
+}
+
 export function mergeWorkingAgents(
   managedAgents: readonly WorkingAgent[],
   ownedRelayAgents: readonly WorkingAgent[],
 ): WorkingAgent[] {
-  const seenPubkeys = new Set<string>();
-  const merged: WorkingAgent[] = [];
+  const mergedByPubkey = new Map<string, WorkingAgent>();
 
-  for (const agent of [...managedAgents, ...ownedRelayAgents]) {
-    const pubkey = normalizePubkey(agent.pubkey);
-    if (seenPubkeys.has(pubkey)) continue;
-    seenPubkeys.add(pubkey);
-    merged.push(agent);
+  for (const agent of managedAgents) {
+    mergedByPubkey.set(normalizePubkey(agent.pubkey), agent);
   }
 
-  return merged;
-}
+  for (const agent of ownedRelayAgents) {
+    const pubkey = normalizePubkey(agent.pubkey);
+    const managedAgent = mergedByPubkey.get(pubkey);
+    if (!managedAgent || !agentCanStartObserver(managedAgent)) {
+      mergedByPubkey.set(pubkey, agent);
+    }
+  }
 
-function summarizeAgent(agent: WorkingAgentName & { status?: string }) {
-  return {
-    pubkey: normalizePubkey(agent.pubkey),
-    name: agent.name,
-    status: agent.status ?? null,
-  };
-}
-
-function summarizeRelayProfile(
-  pubkey: string,
-  profile: PillDiagProfile | undefined,
-  currentPubkey: string | undefined,
-) {
-  return {
-    pubkey: normalizePubkey(pubkey),
-    profileKeyPubkey: profile?.pubkey ? normalizePubkey(profile.pubkey) : null,
-    displayName: profile?.displayName ?? null,
-    isAgent: profile?.isAgent ?? null,
-    ownerPubkey: profile?.ownerPubkey
-      ? normalizePubkey(profile.ownerPubkey)
-      : null,
-    ownsAuthorAgent: ownsAuthorAgent(profile, currentPubkey),
-  };
-}
-
-function logPillDiagnostics({
-  currentPubkey,
-  managedAgents,
-  relayAgents,
-  profiles,
-  ownedRelayAgents,
-  workingAgents,
-  activeWorkingChannels,
-}: {
-  currentPubkey: string | undefined;
-  managedAgents: readonly WorkingAgent[];
-  relayAgents: readonly Pick<RelayAgent, "pubkey" | "name">[];
-  profiles: Record<string, UserProfileSummary> | undefined;
-  ownedRelayAgents: readonly WorkingAgent[];
-  workingAgents: readonly WorkingAgent[];
-  activeWorkingChannels: readonly ActiveChannelTurnSummary[];
-}) {
-  const normalizedProfiles = Object.fromEntries(
-    relayAgents.map((agent) => {
-      const pubkey = normalizePubkey(agent.pubkey);
-      const profile = profiles?.[pubkey] as PillDiagProfile | undefined;
-      return [
-        pubkey,
-        summarizeRelayProfile(agent.pubkey, profile, currentPubkey),
-      ];
-    }),
-  );
-
-  console.groupCollapsed("[pill-diag] active working channels inputs", {
-    currentPubkey: currentPubkey ? normalizePubkey(currentPubkey) : null,
-    managedAgentCount: managedAgents.length,
-    relayAgentCount: relayAgents.length,
-    ownedRelayAgentCount: ownedRelayAgents.length,
-    workingAgentCount: workingAgents.length,
-    activeChannelCount: activeWorkingChannels.length,
-  });
-  console.log("[pill-diag] currentPubkey", {
-    currentPubkey: currentPubkey ? normalizePubkey(currentPubkey) : null,
-  });
-  console.table(managedAgents.map(summarizeAgent));
-  console.log("[pill-diag] managedAgents", managedAgents.map(summarizeAgent));
-  console.table(relayAgents.map(summarizeAgent));
-  console.log("[pill-diag] relayAgents", relayAgents.map(summarizeAgent));
-  console.log("[pill-diag] profilesByRelayAgent", normalizedProfiles);
-  console.table(ownedRelayAgents.map(summarizeAgent));
-  console.log(
-    "[pill-diag] ownedRelayAgents",
-    ownedRelayAgents.map(summarizeAgent),
-  );
-  console.table(workingAgents.map(summarizeAgent));
-  console.log("[pill-diag] workingAgents", workingAgents.map(summarizeAgent));
-  console.log("[pill-diag] activeWorkingChannels", activeWorkingChannels);
-  console.groupEnd();
+  return [...mergedByPubkey.values()];
 }
 
 export function useActiveWorkingChannelsById(): ReadonlyMap<
   string,
   ActiveChannelTurnSummary
 > {
-  pillDiagRenderCount += 1;
-  console.log("[pill-diag] hook render", {
-    renderCount: pillDiagRenderCount,
-    renderedAt: new Date().toISOString(),
-  });
-
   const identityQuery = useIdentityQuery();
   const currentPubkey = identityQuery.data?.pubkey;
   const managedAgentsQuery = useManagedAgentsQuery();
@@ -213,26 +126,6 @@ export function useActiveWorkingChannelsById(): ReadonlyMap<
   useActiveAgentTurnsBridge(workingAgents);
 
   const activeWorkingChannels = useActiveAgentTurnsByChannel();
-
-  React.useEffect(() => {
-    logPillDiagnostics({
-      currentPubkey,
-      managedAgents,
-      relayAgents,
-      profiles: relayAgentProfilesQuery.data?.profiles,
-      ownedRelayAgents,
-      workingAgents,
-      activeWorkingChannels,
-    });
-  }, [
-    activeWorkingChannels,
-    currentPubkey,
-    managedAgents,
-    ownedRelayAgents,
-    relayAgentProfilesQuery.data?.profiles,
-    relayAgents,
-    workingAgents,
-  ]);
 
   return React.useMemo(
     () =>
