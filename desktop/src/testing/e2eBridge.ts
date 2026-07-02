@@ -659,6 +659,7 @@ declare global {
       tags: string[][];
     }>;
     __BUZZ_E2E_SET_RELAY_CONNECTION_STATE__?: (state: ConnectionState) => void;
+    __BUZZ_E2E_GET_RELAY_CONNECTION_STATE__?: () => ConnectionState;
     __BUZZ_E2E_SET_STALL_WEBSOCKET_SENDS__?: (stall: boolean) => void;
     __BUZZ_E2E_DISCONNECT_MOCK_WEBSOCKETS__?: () => number;
     __BUZZ_E2E_SET_MESH__?: (mesh: {
@@ -7240,6 +7241,8 @@ export function maybeInstallE2eTauriMocks() {
       }
     ).connectionStateEmitter.set(state);
   };
+  window.__BUZZ_E2E_GET_RELAY_CONNECTION_STATE__ = () =>
+    relayClient.getConnectionState();
 
   window.__BUZZ_E2E_SEED_MOCK_REMINDERS__ = (reminders) => {
     mockReminderEvents.length = 0;

@@ -31,11 +31,38 @@ type ConnectionState =
   | "stalled"
   | "disconnected";
 
-/** Directly emit "reconnecting" on the relay client singleton via the E2E test seam. */
+/** Directly drive the relay client singleton state via the E2E test seam. */
 async function driveConnectionDegraded(
   page: import("@playwright/test").Page,
   state: ConnectionState = "reconnecting",
 ) {
+  if (state !== "connected") {
+    // When driving to a degraded state, wait for the relay to reach "connected"
+    // first. Without this guard, the mock relay's async auth handshake can race
+    // the state override and write "connected" back over it.
+    await page.waitForFunction(() => {
+      const win = window as Window & {
+        __BUZZ_E2E_GET_RELAY_CONNECTION_STATE__?: () => string;
+        __BUZZ_E2E_SET_RELAY_CONNECTION_STATE__?: unknown;
+      };
+      return (
+        typeof win.__BUZZ_E2E_SET_RELAY_CONNECTION_STATE__ === "function" &&
+        typeof win.__BUZZ_E2E_GET_RELAY_CONNECTION_STATE__ === "function" &&
+        win.__BUZZ_E2E_GET_RELAY_CONNECTION_STATE__() === "connected"
+      );
+    });
+  } else {
+    // When driving to "connected", just wait for the seam to be installed —
+    // no need to gate on current state since we're overriding it directly.
+    await page.waitForFunction(
+      () =>
+        typeof (
+          window as Window & {
+            __BUZZ_E2E_SET_RELAY_CONNECTION_STATE__?: unknown;
+          }
+        ).__BUZZ_E2E_SET_RELAY_CONNECTION_STATE__ === "function",
+    );
+  }
   await page.evaluate((s) => {
     const setter = (
       window as Window & {
