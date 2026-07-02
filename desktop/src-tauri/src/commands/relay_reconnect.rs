@@ -12,7 +12,7 @@ include!("reconnect_hook_config.rs");
 
 /// Returns `true` when an internal build has a reconnect hook configured.
 ///
-/// Used by the frontend to decide whether to show "Waiting for network sign-in…"
+/// Used by the frontend to decide whether to show "Waiting to reconnect…"
 /// copy and to skip escalation in OSS builds where the hook is a no-op.
 #[tauri::command]
 pub fn relay_reconnect_hook_configured() -> bool {
