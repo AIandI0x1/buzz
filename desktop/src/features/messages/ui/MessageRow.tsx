@@ -447,6 +447,7 @@ export const MessageRow = React.memo(
                 truncatePubkey(message.agentOwner.pubkey)
               }
               size="2xs"
+              testId="message-agent-owner-avatar"
             />
           </span>
         </TooltipTrigger>

@@ -14,6 +14,12 @@ const SCOUT_B_PUBKEY =
 const SOLO_PUBKEY =
   "aaaa000000000000000000000000000000000000000000000000000000000003";
 
+// 8x8 solid teal PNG. A data URL keeps the avatar-image path hermetic — no
+// network fetch, no relay proxy — while still exercising Radix's real
+// image-load lifecycle (AvatarImage only renders once the img has loaded).
+const ALICE_AVATAR_DATA_URL =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAFElEQVR4nGMUWTCNARtgwio6aCUABdEBWlX6zykAAAAASUVORK5CYII=";
+
 async function emitMockMessage(page: Page, content: string, pubkey: string) {
   const event = await page.evaluate(
     ({ msg, pk }) => {
@@ -87,7 +93,8 @@ test("duplicate-named agents get an inline owner avatar; unique agents do not", 
       },
     ],
     // Seeded after managed agents, so these override the default
-    // owner (the mock viewer) with two distinct humans.
+    // owner (the mock viewer) with two distinct humans. Alice carries an
+    // avatar image; bob has none, exercising the initials fallback.
     searchProfiles: [
       {
         pubkey: SCOUT_A_PUBKEY,
@@ -100,6 +107,15 @@ test("duplicate-named agents get an inline owner avatar; unique agents do not", 
         displayName: "Scout",
         ownerPubkey: TEST_IDENTITIES.bob.pubkey,
         isAgent: true,
+      },
+      {
+        pubkey: TEST_IDENTITIES.alice.pubkey,
+        displayName: "alice",
+        avatarUrl: ALICE_AVATAR_DATA_URL,
+      },
+      {
+        pubkey: TEST_IDENTITIES.bob.pubkey,
+        displayName: "bob",
       },
     ],
   });
@@ -123,13 +139,33 @@ test("duplicate-named agents get an inline owner avatar; unique agents do not", 
     .getByTestId("message-row")
     .filter({ hasText: "Ranger here, no twin." });
 
-  // Both same-named agents carry the inline owner avatar…
-  await expect(
-    scoutARow.getByTestId("message-agent-owner-avatar"),
-  ).toBeVisible();
-  await expect(
-    scoutBRow.getByTestId("message-agent-owner-avatar"),
-  ).toBeVisible();
+  // Both same-named agents carry the inline owner avatar. The wrapper being
+  // visible is not enough — assert actual painted content. Owner profiles
+  // arrive via a second-level batch fetch, so give the cold first render
+  // time to settle instead of racing it.
+  const scoutABadge = scoutARow.getByTestId("message-agent-owner-avatar");
+  const scoutBBadge = scoutBRow.getByTestId("message-agent-owner-avatar");
+  await expect(scoutABadge).toBeVisible({ timeout: 15_000 });
+  await expect(scoutBBadge).toBeVisible({ timeout: 15_000 });
+
+  // Alice has an avatar image — a real, fully loaded <img> must render.
+  const aliceImage = scoutABadge.getByTestId(
+    "message-agent-owner-avatar-image",
+  );
+  await expect(aliceImage).toBeVisible({ timeout: 15_000 });
+  expect(
+    await aliceImage.evaluate(
+      (img: HTMLImageElement) => img.complete && img.naturalWidth > 0,
+    ),
+  ).toBe(true);
+
+  // Bob has no avatar URL — the initials fallback must paint visible text.
+  const bobFallback = scoutBBadge.getByTestId(
+    "message-agent-owner-avatar-fallback",
+  );
+  await expect(bobFallback).toBeVisible({ timeout: 15_000 });
+  await expect(bobFallback).toHaveText("B");
+
   // …the uniquely named agent does not.
   await expect(rangerRow.getByTestId("message-agent-owner-avatar")).toHaveCount(
     0,

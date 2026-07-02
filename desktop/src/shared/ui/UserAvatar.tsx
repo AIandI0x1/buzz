@@ -68,7 +68,10 @@ export function UserAvatar({
             : "bg-secondary text-secondary-foreground",
         )}
         data-testid={testId ? `${testId}-fallback` : undefined}
-        delayMs={200}
+        // The delay exists to avoid an initials flash while an image loads.
+        // With no image source there is nothing to wait for — render the
+        // initials immediately or the avatar paints as an empty box.
+        delayMs={src ? 200 : undefined}
       >
         {initials}
       </AvatarFallback>
