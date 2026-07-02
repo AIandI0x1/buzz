@@ -335,6 +335,7 @@ test("swaps the avatar preview and mode tabs while editing", async ({
   if (!closedPreviewBox) {
     throw new Error("Profile avatar preview did not render bounds.");
   }
+
   await page.getByTestId("profile-avatar-edit").click();
   const tabList = page.getByRole("tablist", { name: "Avatar type" });
   await expect(tabList).toBeVisible();
@@ -360,7 +361,14 @@ test("swaps the avatar preview and mode tabs while editing", async ({
   await waitForAvatarEditorToClose(page);
   await expect(tabList).toHaveCount(0);
 
-  await expect(previewFrame).toBeVisible();
+  // Closing the editor must return the settings scroller to its pre-edit
+  // position — ProfileSettingsCard snapshots the scrollTop on open and
+  // re-applies it on close, so the preview lands back where it started.
+  const restoredPreviewBox = await previewFrame.boundingBox();
+  if (!restoredPreviewBox) {
+    throw new Error("Profile avatar preview did not restore bounds.");
+  }
+  expect(Math.abs(restoredPreviewBox.y - closedPreviewBox.y)).toBeLessThan(8);
   await expect(page.getByTestId("profile-avatar-edit")).toBeVisible();
 });
 
