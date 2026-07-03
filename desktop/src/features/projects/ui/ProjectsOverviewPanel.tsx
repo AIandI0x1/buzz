@@ -291,65 +291,6 @@ export function ProjectsOverviewPanel({
             className="mt-3"
           />
         </div>
-        <div className="grid gap-4 sm:grid-cols-2">
-          <div className="rounded-2xl border border-border/50 bg-muted/20 p-4">
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-              Top Languages
-            </h3>
-            <div className="mt-3">
-              {languages.length > 0 ? (
-                <LanguageChips languages={languages} />
-              ) : (
-                <p className="text-sm text-muted-foreground">
-                  {scanning
-                    ? "Scanning repositories..."
-                    : "No language data is available yet."}
-                </p>
-              )}
-            </div>
-          </div>
-          <div className="rounded-2xl border border-border/50 bg-muted/20 p-4">
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-              Repositories
-            </h3>
-            <dl className="mt-3 space-y-2 text-sm">
-              <RepoTotalRow
-                icon={FolderGit2}
-                label="Repositories"
-                value={projects.length}
-              />
-              <RepoTotalRow
-                icon={GitCommitHorizontal}
-                label="Latest"
-                mono
-                value={
-                  repoTotals.latestCommit
-                    ? repoTotals.latestCommit.shortHash
-                    : scanning
-                      ? "..."
-                      : "None"
-                }
-              />
-              <RepoTotalRow
-                icon={FileCode2}
-                label="Files"
-                value={
-                  scanning && repoTotals.files === 0 ? "..." : repoTotals.files
-                }
-              />
-              <RepoTotalRow
-                icon={Users}
-                label="Contributors"
-                value={
-                  scanning && repoTotals.contributors === 0
-                    ? "..."
-                    : repoTotals.contributors
-                }
-              />
-              <RepoTotalRow label="PRs" value={stats.prs} />
-            </dl>
-          </div>
-        </div>
       </div>
       <aside className="space-y-4 rounded-xl border border-border/50 bg-card/60 p-4">
         <OverviewRailSection title="People">
@@ -374,6 +315,55 @@ export function ProjectsOverviewPanel({
               );
             })}
           </div>
+        </OverviewRailSection>
+        <OverviewRailSection title="Top Languages">
+          {languages.length > 0 ? (
+            <LanguageChips languages={languages} />
+          ) : (
+            <p className="text-sm text-muted-foreground">
+              {scanning
+                ? "Scanning repositories..."
+                : "No language data is available yet."}
+            </p>
+          )}
+        </OverviewRailSection>
+        <OverviewRailSection title="Repositories">
+          <dl className="space-y-2 text-sm">
+            <RepoTotalRow
+              icon={FolderGit2}
+              label="Repositories"
+              value={projects.length}
+            />
+            <RepoTotalRow
+              icon={GitCommitHorizontal}
+              label="Latest"
+              mono
+              value={
+                repoTotals.latestCommit
+                  ? repoTotals.latestCommit.shortHash
+                  : scanning
+                    ? "..."
+                    : "None"
+              }
+            />
+            <RepoTotalRow
+              icon={FileCode2}
+              label="Files"
+              value={
+                scanning && repoTotals.files === 0 ? "..." : repoTotals.files
+              }
+            />
+            <RepoTotalRow
+              icon={Users}
+              label="Contributors"
+              value={
+                scanning && repoTotals.contributors === 0
+                  ? "..."
+                  : repoTotals.contributors
+              }
+            />
+            <RepoTotalRow label="PRs" value={stats.prs} />
+          </dl>
         </OverviewRailSection>
       </aside>
     </section>
