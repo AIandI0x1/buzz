@@ -74,7 +74,7 @@ export function templateAgentDraft(template: AgentTemplate): AgentDraft {
     systemPrompt: template.systemPrompt,
     runtime: template.runtime,
     model: template.model,
-    provider: null,
+    provider: template.provider,
     envVars: {},
   };
 }

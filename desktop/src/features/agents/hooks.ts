@@ -33,6 +33,7 @@ import {
 import {
   exportAgentToJson,
   listAgentTemplates,
+  saveAgentAsTemplate,
   setManagedAgentStartOnAppLaunch,
 } from "@/shared/api/tauriManagedAgents";
 import {
@@ -193,6 +194,19 @@ export function useAgentTemplatesQuery(options?: { enabled?: boolean }) {
 export function useExportAgentJsonMutation() {
   return useMutation({
     mutationFn: (pubkey: string) => exportAgentToJson(pubkey),
+  });
+}
+
+export function useSaveAgentAsTemplateMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (pubkey: string) => saveAgentAsTemplate(pubkey),
+    onSuccess: () => {
+      // Refresh the New Agent catalog so the saved template appears without
+      // reopening the app. Personas back saved templates, so refresh both.
+      void queryClient.invalidateQueries({ queryKey: agentTemplatesQueryKey });
+      void queryClient.invalidateQueries({ queryKey: personasQueryKey });
+    },
   });
 }
 

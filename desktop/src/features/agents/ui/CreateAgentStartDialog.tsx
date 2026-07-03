@@ -76,6 +76,12 @@ export function CreateAgentStartDialog({
       templates[0]
     );
   }, [templates, selectedTemplateId]);
+  const builtinTemplates = templates.filter(
+    (template) => template.source === "builtin",
+  );
+  const savedTemplates = templates.filter(
+    (template) => template.source === "saved",
+  );
 
   React.useEffect(() => {
     if (!open) {
@@ -172,39 +178,35 @@ export function CreateAgentStartDialog({
 
               {isLoading ? <TemplateListSkeleton /> : null}
 
-              {!isLoading && templates.length > 0 ? (
+              {!isLoading && builtinTemplates.length > 0 ? (
                 <div className="space-y-1">
-                  {templates.map((template) => {
-                    const isCurrent = template.id === selectedTemplate?.id;
-
-                    return (
-                      <button
-                        aria-current={isCurrent ? "true" : undefined}
-                        className={cn(
-                          sidebarRowClassName,
-                          isCurrent
-                            ? "bg-sidebar-active text-sidebar-active-foreground"
-                            : sidebarRowIdleClassName,
-                        )}
-                        data-testid={`create-agent-template-${template.id}`}
-                        key={template.id}
-                        onClick={() => {
-                          setSelectedTemplateId(template.id);
-                        }}
-                        type="button"
-                      >
-                        <ProfileAvatar
-                          avatarUrl={template.avatarUrl}
-                          className="h-6 w-6 text-3xs"
-                          label={template.displayName}
-                        />
-                        <span className="min-w-0 flex-1 truncate text-sm font-medium">
-                          {template.displayName}
-                        </span>
-                      </button>
-                    );
-                  })}
+                  {builtinTemplates.map((template) => (
+                    <TemplateRow
+                      isCurrent={template.id === selectedTemplate?.id}
+                      key={template.id}
+                      onSelect={setSelectedTemplateId}
+                      template={template}
+                    />
+                  ))}
                 </div>
+              ) : null}
+
+              {!isLoading && savedTemplates.length > 0 ? (
+                <>
+                  <p className="px-4 pb-1 pt-4 text-xs font-medium uppercase tracking-wide text-sidebar-foreground/60">
+                    Saved
+                  </p>
+                  <div className="space-y-1">
+                    {savedTemplates.map((template) => (
+                      <TemplateRow
+                        isCurrent={template.id === selectedTemplate?.id}
+                        key={template.id}
+                        onSelect={setSelectedTemplateId}
+                        template={template}
+                      />
+                    ))}
+                  </div>
+                </>
               ) : null}
             </div>
           </div>
@@ -272,6 +274,42 @@ export function CreateAgentStartDialog({
   );
 }
 
+function TemplateRow({
+  template,
+  isCurrent,
+  onSelect,
+}: {
+  template: AgentTemplate;
+  isCurrent: boolean;
+  onSelect: (templateId: string) => void;
+}) {
+  return (
+    <button
+      aria-current={isCurrent ? "true" : undefined}
+      className={cn(
+        sidebarRowClassName,
+        isCurrent
+          ? "bg-sidebar-active text-sidebar-active-foreground"
+          : sidebarRowIdleClassName,
+      )}
+      data-testid={`create-agent-template-${template.id}`}
+      onClick={() => {
+        onSelect(template.id);
+      }}
+      type="button"
+    >
+      <ProfileAvatar
+        avatarUrl={template.avatarUrl}
+        className="h-6 w-6 text-3xs"
+        label={template.displayName}
+      />
+      <span className="min-w-0 flex-1 truncate text-sm font-medium">
+        {template.displayName}
+      </span>
+    </button>
+  );
+}
+
 function TemplateDetail({ template }: { template: AgentTemplate }) {
   return (
     <div className="space-y-6">
@@ -290,7 +328,13 @@ function TemplateDetail({ template }: { template: AgentTemplate }) {
 
       <TemplateMetaGroup
         items={[
-          { label: "Type", value: "Built-in template" },
+          {
+            label: "Type",
+            value:
+              template.source === "saved"
+                ? "Saved template"
+                : "Built-in template",
+          },
           {
             label: "Preferred model",
             value: template.model ?? "Use app default",

@@ -87,7 +87,7 @@ fn merge_personas_demotes_legacy_builtin_records() {
         .find(|record| record.id == "builtin:fizz")
         .expect("legacy fizz record should be retained as a custom persona");
     assert!(!fizz.is_builtin);
-    // Local activation state survives — the flatten migration handles it.
+    // Local activation state survives demotion untouched.
     assert!(fizz.is_active);
     assert_eq!(fizz.created_at, original_created_at);
     assert_eq!(fizz.updated_at, "2026-03-19T00:00:00Z");

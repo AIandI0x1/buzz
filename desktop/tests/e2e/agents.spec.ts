@@ -197,7 +197,7 @@ test("blank starting point opens an empty create agent form", async ({
   await expect(page.getByTestId("create-agent-submit")).toBeDisabled();
 });
 
-test("agent cards expose edit, duplicate, channel, export, and remove actions", async ({
+test("agent cards expose edit, duplicate, channel, template, export, and remove actions", async ({
   page,
 }) => {
   await installMockBridge(page, {
@@ -221,9 +221,48 @@ test("agent cards expose edit, duplicate, channel, export, and remove actions", 
     "Edit",
     "Duplicate",
     "Add to channel",
+    "Save as template",
     "Export",
     "Remove",
   ]);
+});
+
+test("save as template surfaces the agent in the create wizard's Saved group", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    managedAgents: [
+      {
+        pubkey: TEST_IDENTITIES.alice.pubkey,
+        name: "Honey",
+        status: "stopped",
+      },
+    ],
+  });
+  await gotoApp(page);
+
+  await page.getByTestId("open-agents-view").click();
+  await page.getByLabel("Open actions for Honey").click();
+  await page.getByRole("menuitem", { name: "Save as template" }).click();
+
+  await expect(
+    page.getByText("Saved Honey as a template", { exact: false }),
+  ).toBeVisible();
+
+  await openCreateAgentStart(page);
+  await expect(
+    page.getByTestId("create-agent-start-dialog-scroll-area"),
+  ).toContainText("Saved");
+  const savedRow = page
+    .getByTestId("create-agent-start-dialog-scroll-area")
+    .getByRole("button", { name: "Honey" });
+  await expect(savedRow).toBeVisible();
+
+  // Selecting the saved template shows its detail pane with the Saved type.
+  await savedRow.click();
+  await expect(
+    page.getByTestId("create-agent-start-detail-pane"),
+  ).toContainText("Saved template");
 });
 
 test("duplicate opens the create form prefilled from the agent", async ({

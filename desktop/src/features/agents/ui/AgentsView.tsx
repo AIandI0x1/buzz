@@ -106,6 +106,7 @@ export function AgentsView() {
               onDuplicateAgent={agents.openDuplicateAgent}
               onEditAgent={setAgentToEdit}
               onExportAgent={agents.handleExportAgent}
+              onSaveAgentAsTemplate={agents.handleSaveAsTemplate}
               onImportAgentFile={(fileBytes, fileName) => {
                 void agents.handleImportAgentFile(fileBytes, fileName);
               }}

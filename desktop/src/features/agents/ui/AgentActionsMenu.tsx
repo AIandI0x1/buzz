@@ -1,4 +1,5 @@
 import {
+  BookmarkPlus,
   CopyPlus,
   Ellipsis,
   FileDown,
@@ -24,6 +25,7 @@ export function AgentActionsMenu({
   onDuplicate,
   onEdit,
   onExport,
+  onSaveAsTemplate,
 }: {
   agent: ManagedAgent;
   disabled: boolean;
@@ -32,6 +34,7 @@ export function AgentActionsMenu({
   onDuplicate: (agent: ManagedAgent) => void;
   onEdit: (agent: ManagedAgent) => void;
   onExport: (agent: ManagedAgent) => void;
+  onSaveAsTemplate: (agent: ManagedAgent) => void;
 }) {
   return (
     <DropdownMenu modal={false}>
@@ -65,6 +68,13 @@ export function AgentActionsMenu({
         >
           <MessageSquarePlus className="h-4 w-4" />
           Add to channel
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          disabled={disabled}
+          onClick={() => onSaveAsTemplate(agent)}
+        >
+          <BookmarkPlus className="h-4 w-4" />
+          Save as template
         </DropdownMenuItem>
         <DropdownMenuItem disabled={disabled} onClick={() => onExport(agent)}>
           <FileDown className="h-4 w-4" />

@@ -265,25 +265,6 @@ pub async fn delete_team(id: String, app: AppHandle) -> Result<(), String> {
     .map_err(|e| format!("spawn_blocking failed: {e}"))?
 }
 
-/// Materialize stopped agents for freshly installed/synced pack personas so
-/// they immediately appear in the agents-only grid. Best-effort: the install
-/// or sync result stands even if materialization fails. Caller MUST hold the
-/// managed-agents store lock.
-fn materialize_pack_agents_locked(app: &AppHandle, state: &AppState) {
-    let owner_keys = match state.keys.lock() {
-        Ok(keys) => keys.clone(),
-        Err(e) => {
-            eprintln!("buzz-desktop: team-materialize: keys lock poisoned: {e}");
-            return;
-        }
-    };
-    if let Err(e) =
-        crate::managed_agents::materialize_agents_for_active_personas_locked(app, &owner_keys)
-    {
-        eprintln!("buzz-desktop: team-materialize: {e}");
-    }
-}
-
 #[tauri::command]
 pub async fn install_team_from_directory(
     app: AppHandle,
@@ -302,7 +283,6 @@ pub async fn install_team_from_directory(
             return Err(format!("team path is not a directory: {path}"));
         }
         let result = do_import_team(&app, &source, symlink.unwrap_or(false))?;
-        materialize_pack_agents_locked(&app, &state);
         try_regenerate_nest(&app);
         Ok(result)
     })
@@ -320,7 +300,6 @@ pub async fn sync_team_directory(app: AppHandle, team_id: String) -> Result<Sync
             .lock()
             .map_err(|e| e.to_string())?;
         let result = do_sync_team(&app, &team_id)?;
-        materialize_pack_agents_locked(&app, &state);
         try_regenerate_nest(&app);
         Ok(result)
     })

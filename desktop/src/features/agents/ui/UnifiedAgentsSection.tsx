@@ -43,6 +43,7 @@ type UnifiedAgentsSectionProps = {
   onDuplicateAgent: (agent: ManagedAgent) => void;
   onEditAgent: (agent: ManagedAgent) => void;
   onExportAgent: (agent: ManagedAgent) => void;
+  onSaveAgentAsTemplate: (agent: ManagedAgent) => void;
   onImportAgentFile: (fileBytes: number[], fileName: string) => void;
 };
 
@@ -68,6 +69,7 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
     onDuplicateAgent,
     onEditAgent,
     onExportAgent,
+    onSaveAgentAsTemplate,
     onImportAgentFile,
   } = props;
 
@@ -124,6 +126,7 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
                     onDuplicate={onDuplicateAgent}
                     onEdit={onEditAgent}
                     onExport={onExportAgent}
+                    onSaveAsTemplate={onSaveAgentAsTemplate}
                   />
                 }
                 agent={agent}

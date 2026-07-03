@@ -240,28 +240,6 @@ pub fn run() {
                 .map(|k| k.clone())
                 .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
 
-            // Agents-first flattening: materialize stopped agents for
-            // persona-only cards, rewrite team membership to agent pubkeys,
-            // pin persona config onto linked agents, and deactivate the
-            // flattened (non-pack) personas. Runs BEFORE run_event_sync so
-            // the rewritten teams/personas are what gets reconciled into
-            // retention and published. Needs the owner keys (auth tags for
-            // materialized agents). Best-effort — a failure must not block
-            // launch.
-            match managed_agents::flatten_personas_into_agents(&app_handle, &owner_keys) {
-                Ok(report) if !report.is_noop() => {
-                    eprintln!(
-                        "buzz-desktop: flatten: {} agent(s) materialized, {} flattened, {} team(s) rewritten, {} persona(s) deactivated",
-                        report.agents_materialized,
-                        report.agents_flattened,
-                        report.teams_rewritten,
-                        report.personas_deactivated,
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => eprintln!("buzz-desktop: flatten migration failed: {e}"),
-            }
-
             migration::run_event_sync(&app_handle, &owner_keys);
 
             // Backfill the pinned persona snapshot for any pre-existing agent
@@ -569,6 +547,7 @@ pub fn run() {
             set_persona_active,
             reconcile_inbound_persona_event,
             list_agent_templates,
+            save_agent_as_template,
             export_agent_to_json,
             list_channel_templates,
             create_channel_template,

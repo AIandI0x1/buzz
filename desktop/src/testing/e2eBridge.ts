@@ -5884,11 +5884,13 @@ type MockAgentTemplate = {
   systemPrompt: string;
   runtime: string | null;
   model: string | null;
+  provider: string | null;
   namePool: string[];
+  source: "builtin" | "saved";
 };
 
 async function handleListAgentTemplates(): Promise<MockAgentTemplate[]> {
-  return [
+  const builtins: MockAgentTemplate[] = [
     {
       id: "builtin:fizz",
       displayName: "Fizz",
@@ -5896,7 +5898,9 @@ async function handleListAgentTemplates(): Promise<MockAgentTemplate[]> {
       systemPrompt: "You are Fizz.",
       runtime: "goose",
       model: null,
+      provider: null,
       namePool: ["Nectar", "Comet", "Bramble"],
+      source: "builtin",
     },
     {
       id: "builtin:product-strategist",
@@ -5906,7 +5910,9 @@ async function handleListAgentTemplates(): Promise<MockAgentTemplate[]> {
         "You are a product strategy agent. You help turn broad ideas into clear product and design direction.",
       runtime: null,
       model: null,
+      provider: null,
       namePool: ["Product Strategist"],
+      source: "builtin",
     },
     {
       id: "builtin:qa-reviewer",
@@ -5916,9 +5922,35 @@ async function handleListAgentTemplates(): Promise<MockAgentTemplate[]> {
         "You are a QA reviewer agent. You look for the ways a change might break.",
       runtime: null,
       model: null,
+      provider: null,
       namePool: ["QA Reviewer"],
+      source: "builtin",
     },
   ];
+  // Mirror the real command: active personas surface as saved templates,
+  // skipping records that shadow a built-in id, sorted by display name.
+  // The mock also skips its seeded is_builtin records — the real store no
+  // longer contains built-in personas at all.
+  const saved: MockAgentTemplate[] = mockPersonas
+    .filter((persona) => persona.is_active && !persona.is_builtin)
+    .filter((persona) => !builtins.some((builtin) => builtin.id === persona.id))
+    .map((persona) => ({
+      id: persona.id,
+      displayName: persona.display_name,
+      avatarUrl: persona.avatar_url ?? null,
+      systemPrompt: persona.system_prompt,
+      runtime: persona.runtime ?? null,
+      model: persona.model ?? null,
+      provider: persona.provider ?? null,
+      namePool: persona.name_pool ?? [],
+      source: "saved" as const,
+    }))
+    .sort((a, b) =>
+      a.displayName
+        .toLowerCase()
+        .localeCompare(b.displayName.toLowerCase(), "en"),
+    );
+  return [...builtins, ...saved];
 }
 
 async function handleExportAgentToJson(args: {
@@ -5931,6 +5963,66 @@ async function handleExportAgentToJson(args: {
     throw new Error(`agent ${args.pubkey} not found`);
   }
   return true;
+}
+
+async function handleSaveAgentAsTemplate(args: {
+  pubkey: string;
+}): Promise<MockAgentTemplate> {
+  const agent = mockManagedAgents.find(
+    (candidate) => candidate.pubkey === args.pubkey,
+  );
+  if (!agent) {
+    throw new Error(`agent ${args.pubkey} not found`);
+  }
+  const name = agent.name.trim();
+  if (!name) {
+    throw new Error("agent has no name to save as a template");
+  }
+  const now = new Date().toISOString();
+  // Mirror the real command: update an existing active in-app persona with
+  // the same display name, otherwise insert a fresh record.
+  let persona = mockPersonas.find(
+    (candidate) =>
+      candidate.is_active &&
+      !candidate.source_team &&
+      candidate.display_name.trim().toLowerCase() === name.toLowerCase(),
+  );
+  if (persona) {
+    persona.display_name = name;
+    persona.avatar_url = agent.avatar_url;
+    persona.system_prompt = agent.system_prompt ?? "";
+    persona.runtime = agent.agent_command || null;
+    persona.model = agent.model;
+    persona.updated_at = now;
+  } else {
+    persona = {
+      id: crypto.randomUUID(),
+      display_name: name,
+      avatar_url: agent.avatar_url,
+      system_prompt: agent.system_prompt ?? "",
+      runtime: agent.agent_command || null,
+      model: agent.model,
+      provider: null,
+      name_pool: [],
+      is_builtin: false,
+      is_active: true,
+      source_team: null,
+      created_at: now,
+      updated_at: now,
+    };
+    mockPersonas.push(persona);
+  }
+  return {
+    id: persona.id,
+    displayName: persona.display_name,
+    avatarUrl: persona.avatar_url ?? null,
+    systemPrompt: persona.system_prompt,
+    runtime: persona.runtime ?? null,
+    model: persona.model ?? null,
+    provider: persona.provider ?? null,
+    namePool: persona.name_pool ?? [],
+    source: "saved",
+  };
 }
 
 async function handleListTeams(): Promise<RawTeam[]> {
@@ -7855,6 +7947,8 @@ export function maybeInstallE2eTauriMocks() {
         return handleListAgentTemplates();
       case "export_agent_to_json":
         return handleExportAgentToJson(payload as { pubkey: string });
+      case "save_agent_as_template":
+        return handleSaveAgentAsTemplate(payload as { pubkey: string });
       case "list_managed_agents":
         return handleListManagedAgents(activeConfig);
       case "get_agent_memory":

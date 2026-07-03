@@ -648,9 +648,9 @@ export type UpdatePersonaInput = {
 };
 
 /**
- * A built-in agent template: static starter data for the Create Agent
- * wizard. Selecting a template prefills the create form — no persona record
- * is created.
+ * An agent template for the Create Agent wizard: a static built-in starter
+ * or a saved template backed by a persona record. Selecting a template
+ * prefills the create form; the submit creates a plain managed agent.
  */
 export type AgentTemplate = {
   id: string;
@@ -659,7 +659,10 @@ export type AgentTemplate = {
   systemPrompt: string;
   runtime: string | null;
   model: string | null;
+  provider: string | null;
   namePool: string[];
+  /** "builtin" = static starter data; "saved" = persona record (relay-synced). */
+  source: "builtin" | "saved";
 };
 
 // ── Team types ────────────────────────────────────────────────────────────────

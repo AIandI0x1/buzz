@@ -7,9 +7,11 @@ use crate::{
     util::now_iso,
 };
 
-/// A built-in agent template: static starter data for the Create Agent
-/// wizard. Templates are NOT persona records — selecting one prefills the
-/// create form and the submit creates a plain managed agent.
+/// An agent template: starter data for the Create Agent wizard. Selecting
+/// one prefills the create form and the submit creates a plain managed
+/// agent. Built-in templates are static data; saved templates are backed by
+/// persona records (relay-synced, kind:30175) but the wizard treats both
+/// identically.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentTemplate {
@@ -19,7 +21,18 @@ pub struct AgentTemplate {
     pub system_prompt: String,
     pub runtime: Option<String>,
     pub model: Option<String>,
+    pub provider: Option<String>,
     pub name_pool: Vec<String>,
+    pub source: AgentTemplateSource,
+}
+
+/// Where a template comes from: compiled-in starter data or a saved persona
+/// record (device-local + relay-synced).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentTemplateSource {
+    Builtin,
+    Saved,
 }
 
 struct BuiltInPersona {
@@ -246,9 +259,28 @@ pub fn builtin_agent_templates() -> Vec<AgentTemplate> {
             system_prompt: persona.system_prompt.to_string(),
             runtime: persona.runtime.map(|s| s.to_string()),
             model: persona.model.map(|s| s.to_string()),
+            provider: None,
             name_pool: persona.name_pool.iter().map(|s| s.to_string()).collect(),
+            source: AgentTemplateSource::Builtin,
         })
         .collect()
+}
+
+/// Map a saved persona record onto the template shape the Create Agent
+/// wizard consumes. `env_vars` are deliberately not part of a template —
+/// they may carry credentials and never prefill the wizard.
+pub fn agent_template_from_persona(persona: &PersonaRecord) -> AgentTemplate {
+    AgentTemplate {
+        id: persona.id.clone(),
+        display_name: persona.display_name.clone(),
+        avatar_url: persona.avatar_url.clone(),
+        system_prompt: persona.system_prompt.clone(),
+        runtime: persona.runtime.clone(),
+        model: persona.model.clone(),
+        provider: persona.provider.clone(),
+        name_pool: persona.name_pool.clone(),
+        source: AgentTemplateSource::Saved,
+    }
 }
 
 fn sort_personas(records: &mut [PersonaRecord]) {
@@ -264,8 +296,7 @@ fn sort_personas(records: &mut [PersonaRecord]) {
 /// seeded as records — they live on as static agent templates
 /// ([`builtin_agent_templates`]) — so any record still flagged `is_builtin`
 /// is demoted to a plain custom persona. The record stays so existing
-/// managed-agent and team references keep working until the flatten
-/// migration rewrites them.
+/// managed-agent and team references keep working.
 fn merge_personas(mut stored: Vec<PersonaRecord>, now: &str) -> (Vec<PersonaRecord>, bool) {
     let mut changed = false;
 

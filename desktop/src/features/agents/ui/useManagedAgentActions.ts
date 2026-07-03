@@ -6,6 +6,7 @@ import {
   useManagedAgentLogQuery,
   useManagedAgentsQuery,
   useRelayAgentsQuery,
+  useSaveAgentAsTemplateMutation,
   useSetManagedAgentStartOnAppLaunchMutation,
   useStartManagedAgentMutation,
   useStopManagedAgentMutation,
@@ -52,6 +53,7 @@ export function useManagedAgentActions() {
   const deleteMutation = useDeleteManagedAgentMutation();
   const startOnLaunchMutation = useSetManagedAgentStartOnAppLaunchMutation();
   const exportAgentJsonMutation = useExportAgentJsonMutation();
+  const saveAsTemplateMutation = useSaveAgentAsTemplateMutation();
   const [isCreateStartOpen, setIsCreateStartOpen] = React.useState(false);
   const [createDraft, setCreateDraft] = React.useState<AgentDraft | null>(null);
   const [batchImportResult, setBatchImportResult] =
@@ -250,6 +252,24 @@ export function useManagedAgentActions() {
     });
   }
 
+  function handleSaveAsTemplate(agent: ManagedAgent) {
+    clearFeedback();
+    saveAsTemplateMutation.mutate(agent.pubkey, {
+      onSuccess: (template) => {
+        setActionNoticeMessage(
+          `Saved ${template.displayName} as a template. It will show under New agent.`,
+        );
+      },
+      onError: (error) => {
+        setActionErrorMessage(
+          error instanceof Error
+            ? error.message
+            : "Failed to save agent as a template.",
+        );
+      },
+    });
+  }
+
   async function getChannelsForAction() {
     if (channelsQuery.data) {
       return channelsQuery.data;
@@ -437,6 +457,7 @@ export function useManagedAgentActions() {
     stopMutation.isPending ||
     startOnLaunchMutation.isPending ||
     exportAgentJsonMutation.isPending ||
+    saveAsTemplateMutation.isPending ||
     deleteMutation.isPending;
   const startingAgentPubkey =
     startMutation.isPending && typeof startMutation.variables === "string"
@@ -478,6 +499,7 @@ export function useManagedAgentActions() {
     handleImportAgentFile,
     handleBatchImportComplete,
     handleExportAgent,
+    handleSaveAsTemplate,
     handleStart,
     handleStop,
     handleDelete,

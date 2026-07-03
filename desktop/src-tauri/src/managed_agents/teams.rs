@@ -964,8 +964,7 @@ mod tests {
             .expect("legacy built-in should be retained as a custom team");
         assert!(!fizz.is_builtin);
         assert_eq!(fizz.updated_at, "2026-05-07T00:00:00Z");
-        // Membership is preserved; the flatten migration rewrites it to
-        // agent pubkeys separately.
+        // Membership is preserved as-is — demotion never rewrites members.
         assert_eq!(fizz.persona_ids, vec!["builtin:fizz".to_string()]);
     }
 

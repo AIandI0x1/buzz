@@ -19,9 +19,20 @@ export async function setManagedAgentStartOnAppLaunch(
   return fromRawManagedAgent(response);
 }
 
-/** Built-in starter templates for the Create Agent wizard (static data). */
+/** Templates for the Create Agent wizard: built-ins plus saved templates. */
 export async function listAgentTemplates(): Promise<AgentTemplate[]> {
   return invokeTauri<AgentTemplate[]>("list_agent_templates");
+}
+
+/**
+ * Save a managed agent's pinned config as a reusable template so it shows
+ * in the New Agent catalog. Re-saving an agent with the same name updates
+ * the existing template instead of duplicating it.
+ */
+export async function saveAgentAsTemplate(
+  pubkey: string,
+): Promise<AgentTemplate> {
+  return invokeTauri<AgentTemplate>("save_agent_as_template", { pubkey });
 }
 
 /**
