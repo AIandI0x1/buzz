@@ -142,17 +142,33 @@ function onboardingCompletionStorageKey(pubkey: string) {
 
 function readOnboardingCompletion(pubkey: string | null) {
   if (typeof window === "undefined" || !pubkey) {
+    console.debug("[onboarding-gate] readOnboardingCompletion: no window or no pubkey", { pubkey });
     return false;
   }
 
-  return (
-    window.localStorage.getItem(onboardingCompletionStorageKey(pubkey)) ===
-    "true"
-  );
+  const storageKey = onboardingCompletionStorageKey(pubkey);
+  const rawValue = window.localStorage.getItem(storageKey);
+  const result = rawValue === "true";
+  console.debug("[onboarding-gate] readOnboardingCompletion", {
+    pubkey: pubkey.slice(0, 8) + "...",
+    storageKey,
+    rawValue,
+    result,
+    timestamp: new Date().toISOString(),
+  });
+  return result;
 }
 
 function createOnboardingGateState(pubkey: string | null): OnboardingGateState {
   const hasCompletedCurrentPubkey = readOnboardingCompletion(pubkey);
+
+  console.debug("[onboarding-gate] createOnboardingGateState", {
+    pubkey: pubkey ? pubkey.slice(0, 8) + "..." : null,
+    hasCompletedCurrentPubkey,
+    hasSettledCurrentPubkey: hasCompletedCurrentPubkey,
+    calledFrom: new Error().stack?.split("\n")[2]?.trim() ?? "unknown",
+    timestamp: new Date().toISOString(),
+  });
 
   return {
     currentPubkey: pubkey,
@@ -199,19 +215,34 @@ function resolveOnboardingGateStage({
     !gateState.hasCompletedCurrentPubkey &&
     (gateState.isOpen || !gateState.hasSettledCurrentPubkey);
 
-  if (gateState.isOpen) {
-    return "onboarding";
-  }
+  let stage: OnboardingGateStage;
 
-  if (
+  if (gateState.isOpen) {
+    stage = "onboarding";
+  } else if (
     identityIsFetching ||
     !isSettledQueryStatus(identityStatus) ||
     isBlockingCurrentPubkey
   ) {
-    return "blocking";
+    stage = "blocking";
+  } else {
+    stage = "ready";
   }
 
-  return "ready";
+  console.debug("[onboarding-gate] resolveOnboardingGateStage", {
+    stage,
+    currentPubkey: currentPubkey ? currentPubkey.slice(0, 8) + "..." : null,
+    identityStatus,
+    identityIsFetching,
+    isBlockingCurrentPubkey,
+    gateState: {
+      hasCompletedCurrentPubkey: gateState.hasCompletedCurrentPubkey,
+      hasSettledCurrentPubkey: gateState.hasSettledCurrentPubkey,
+      isOpen: gateState.isOpen,
+    },
+  });
+
+  return stage;
 }
 
 export function useFirstRunOnboardingGate({
@@ -223,9 +254,14 @@ export function useFirstRunOnboardingGate({
   profileIsFetching,
   profileStatus,
 }: UseFirstRunOnboardingGateOptions) {
-  const [gateState, setGateState] = React.useState<OnboardingGateState>(() =>
-    createOnboardingGateState(currentPubkey),
-  );
+  const [gateState, setGateState] = React.useState<OnboardingGateState>(() => {
+    console.debug("[onboarding-gate] useState initializer running", {
+      currentPubkey: currentPubkey ? currentPubkey.slice(0, 8) + "..." : null,
+      identityStatus,
+      timestamp: new Date().toISOString(),
+    });
+    return createOnboardingGateState(currentPubkey);
+  });
   const activeGateState = resolveActiveGateState(gateState, currentPubkey);
   const { hasCompletedCurrentPubkey, hasSettledCurrentPubkey } =
     activeGateState;
@@ -248,6 +284,9 @@ export function useFirstRunOnboardingGate({
       identityStatus === "success" &&
       !hasCompletedCurrentPubkey
     ) {
+      console.debug("[onboarding-gate] fast-path: shared identity, skipping onboarding", {
+        pubkey: currentPubkey.slice(0, 8) + "...",
+      });
       if (typeof window !== "undefined") {
         window.localStorage.setItem(
           onboardingCompletionStorageKey(currentPubkey),
@@ -267,10 +306,15 @@ export function useFirstRunOnboardingGate({
 
     // Original guard — restored to simple form.
     if (hasSettledCurrentPubkey || !currentPubkey) {
+      console.debug("[onboarding-gate] gate effect: early return (settled or no pubkey)", {
+        hasSettledCurrentPubkey,
+        currentPubkey: currentPubkey ? currentPubkey.slice(0, 8) + "..." : null,
+      });
       return;
     }
 
     if (identityStatus === "error") {
+      console.debug("[onboarding-gate] gate effect: identityStatus=error, marking settled (no onboarding)");
       setGateState((current) =>
         updateActiveGateState(current, currentPubkey, (activeGateState) => ({
           ...activeGateState,
@@ -281,10 +325,15 @@ export function useFirstRunOnboardingGate({
     }
 
     if (identityStatus !== "success") {
+      console.debug("[onboarding-gate] gate effect: waiting for identity", { identityStatus });
       return;
     }
 
     if (!isSettledQueryStatus(profileStatus) || profileIsFetching) {
+      console.debug("[onboarding-gate] gate effect: waiting for profile", {
+        profileStatus,
+        profileIsFetching,
+      });
       return;
     }
 
@@ -296,6 +345,20 @@ export function useFirstRunOnboardingGate({
       profileStatus === "success" &&
       typeof profileDisplayName === "string" &&
       profileDisplayName.trim().length > 0;
+
+    console.debug("[onboarding-gate] gate effect: evaluating final decision", {
+      pubkey: currentPubkey.slice(0, 8) + "...",
+      identityStatus,
+      profileStatus,
+      profileDisplayName,
+      profileDisplayNameType: typeof profileDisplayName,
+      profileDisplayNameTrimLength: typeof profileDisplayName === "string" ? profileDisplayName.trim().length : "N/A",
+      hasExistingProfile,
+      hasCompletedCurrentPubkey,
+      alreadyOnboarded: hasCompletedCurrentPubkey || hasExistingProfile,
+      willOpenOnboarding: !(hasCompletedCurrentPubkey || hasExistingProfile),
+      timestamp: new Date().toISOString(),
+    });
 
     setGateState((current) =>
       updateActiveGateState(current, currentPubkey, (activeGateState) => {
