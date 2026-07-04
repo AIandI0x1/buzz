@@ -22,6 +22,7 @@ import {
 } from "@/shared/lib/githubPullRequest";
 import { parseSupportedLinkPreview } from "@/shared/lib/linkPreview";
 import { cn } from "@/shared/lib/cn";
+import { AnimatedTitleText } from "@/shared/ui/animated-title-text";
 import { Checkbox } from "@/shared/ui/checkbox";
 import { GithubPullRequestCard } from "@/shared/ui/link-preview-attachment";
 
@@ -36,11 +37,14 @@ const CHIP_CLASS =
  * chat's agent automatically (deduped per head sha / open-thread watermark).
  */
 export function ChatWorkPanel({
+  branch = null,
   chatId,
   onAutomationPrompt,
   open = true,
   prHref,
 }: {
+  /** Live branch from the agent's worktree/checkout activity, if any. */
+  branch?: string | null;
   chatId: string;
   onAutomationPrompt?: (content: string) => void;
   open?: boolean;
@@ -55,6 +59,9 @@ export function ChatWorkPanel({
   const commentStateQuery = useGithubCommentStateQuery(ref);
   const openThreads = commentStateQuery.data?.openThreads ?? 0;
   const automation = useChatWorkAutomation(chatId);
+  // Live activity wins over the PR's head ref: the agent may have moved to a
+  // new worktree since opening the PR, and activity updates immediately.
+  const currentBranch = branch?.trim() || pr?.headRef?.trim() || null;
 
   // Automation: prompt the agent on CI failure / newly-open review threads.
   // Watermarks in storage keep this to one nudge per failing sha and per
@@ -101,13 +108,15 @@ export function ChatWorkPanel({
         <div className="flex flex-col gap-2">
           <div className={CHIP_CLASS}>
             <GitBranch className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-            {pr?.headRef?.trim() ? (
-              <span className="min-w-0 truncate font-mono">
-                {pr.headRef.trim()}
-              </span>
-            ) : (
-              <span className="text-muted-foreground">No current branch</span>
-            )}
+            {/* Swaps with the title animation when the agent moves to a new
+                worktree/branch (or the placeholder resolves to a branch). */}
+            <AnimatedTitleText
+              className={cn(
+                "min-w-0",
+                currentBranch ? "font-mono" : "text-muted-foreground",
+              )}
+              text={currentBranch ?? "No current branch"}
+            />
           </div>
           {preview ? (
             <GithubPullRequestCard className="w-full" preview={preview} />

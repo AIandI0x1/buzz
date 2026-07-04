@@ -26,6 +26,7 @@ import {
   NO_PROJECT_SELECTION_ID,
 } from "@/features/chats/lib/chatSetup";
 import { ChatActivityTranscript } from "@/features/chats/ui/ChatActivityTranscript";
+import { deriveChatWorkBranch } from "@/features/chats/lib/chatWorkBranch";
 import { ChatWorkPanel } from "@/features/chats/ui/ChatWorkPanel";
 import { isHumanFacingAssistantText } from "@/features/chats/ui/chatActivityText";
 import { entranceClassForCreatedAt } from "@/features/chats/ui/messageEntrance";
@@ -143,6 +144,12 @@ export function ChatDetail({
         transcript: scopedTranscript,
       }),
     [defaultAgent?.pubkey, messages, scopedTranscript],
+  );
+  // Branch the agent is on, straight from its worktree/checkout commands —
+  // the work panel shows it live, before any PR exists to report head.ref.
+  const workBranch = React.useMemo(
+    () => deriveChatWorkBranch(scopedTranscript),
+    [scopedTranscript],
   );
   const selectedProject = React.useMemo(
     () => chatProjectForMetadata(metadata),
@@ -625,6 +632,7 @@ export function ChatDetail({
           </div>
         </div>
         <ChatWorkPanel
+          branch={workBranch}
           chatId={chat.id}
           onAutomationPrompt={(content) => void onSend(content, [])}
           open={showWorkPanel}
