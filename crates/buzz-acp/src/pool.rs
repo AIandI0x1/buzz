@@ -1493,10 +1493,34 @@ pub async fn run_prompt_task(
     // 💬 — fire-and-forget so the prompt fires immediately.
     // The guard's cleanup (spawned on drop) removes 💬 after the turn completes.
     // A brief race where 💬 appears slightly after the agent starts is acceptable.
+    // Chats skip the reaction entirely: their UI carries live working
+    // indicators, and reaction emoji on the user's message reads as noise.
+    // The chat check resolves inside the spawned task (cache first, REST
+    // fallback for channels created after startup) so the prompt still fires
+    // immediately.
     if !reaction_ids.is_empty() {
         let rest = ctx.rest_client.clone();
         let ids = reaction_ids.clone();
+        let cached_is_chat = batch.as_ref().map(|b| {
+            ctx.channel_info
+                .get(&b.channel_id)
+                .map(|info| info.channel_type == "chat")
+        });
+        let batch_channel_id = batch.as_ref().map(|b| b.channel_id);
         tokio::spawn(async move {
+            let is_chat = match cached_is_chat {
+                Some(Some(known)) => known,
+                Some(None) => match batch_channel_id {
+                    Some(channel_id) => fetch_channel_info(channel_id, &rest)
+                        .await
+                        .is_some_and(|info| info.channel_type == "chat"),
+                    None => false,
+                },
+                None => false,
+            };
+            if is_chat {
+                return;
+            }
             react_working(&rest, &ids).await;
         });
     }

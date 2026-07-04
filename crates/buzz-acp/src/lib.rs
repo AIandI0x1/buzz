@@ -2080,7 +2080,15 @@ async fn tokio_main() -> Result<()> {
                             // Fire-and-forget: on rare fast-failure paths the
                             // guard's cleanup may race with this add, leaving a
                             // cosmetic stale 👀. Acceptable — see ReactionGuard docs.
-                            if accepted {
+                            // Chats skip it: their UI has live working
+                            // indicators, and reaction emoji on the user's
+                            // message reads as noise there.
+                            if accepted
+                                && !channel_is_chat(
+                                    &event_channel_info,
+                                    buzz_event.channel_id,
+                                )
+                            {
                                 let rc = ctx.rest_client.clone();
                                 let eid = event_id_hex.clone();
                                 tokio::spawn(async move {
