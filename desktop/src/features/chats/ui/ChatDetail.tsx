@@ -679,6 +679,7 @@ export function ChatDetail({
           onAutomationPrompt={(content) => void onSend(content, [])}
           open={showWorkPanel}
           prHref={workPanelHref}
+          projectPath={metadata?.projectPath ?? selectedProject?.path ?? null}
         />
       </div>
     </>

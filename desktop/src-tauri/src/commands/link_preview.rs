@@ -293,6 +293,129 @@ pub async fn fetch_github_pr_comment_state(
     Ok(Some(GithubCommentState { open_threads }))
 }
 
+/// Discover the pull request for a branch when no PR link has been posted in
+/// the chat: read the project's `origin` remote to find the GitHub repo, then
+/// look the branch up via the pulls API. Returns the PR's html_url.
+#[tauri::command]
+pub async fn find_github_pr_for_branch(
+    project_path: String,
+    branch: String,
+) -> Result<Option<String>, String> {
+    if branch.is_empty()
+        || branch.len() > 255
+        || !branch
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+    {
+        return Err("invalid branch name".to_string());
+    }
+
+    let remote = tokio::task::spawn_blocking(move || {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&project_path)
+            .args(["remote", "get-url", "origin"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|error| format!("git failed to run: {error}"))?;
+        if !output.status.success() {
+            return Ok::<Option<String>, String>(None);
+        }
+        Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        ))
+    })
+    .await
+    .map_err(|error| format!("git task failed: {error}"))??;
+
+    let Some(remote) = remote else {
+        return Ok(None);
+    };
+    let Some((owner, repo)) = parse_github_remote(&remote) else {
+        return Ok(None);
+    };
+    if !is_valid_github_name(&owner) || !is_valid_github_name(&repo) {
+        return Ok(None);
+    }
+
+    let client = reqwest::Client::builder()
+        .pool_idle_timeout(Duration::from_secs(10))
+        .pool_max_idle_per_host(1)
+        .build()
+        .map_err(|error| format!("github client failed: {error}"))?;
+    let build = |url: String| {
+        let mut request = client
+            .get(url)
+            .timeout(GITHUB_API_TIMEOUT)
+            .header(ACCEPT, "application/vnd.github+json")
+            .header(USER_AGENT, "Buzz Desktop link preview")
+            .header("X-GitHub-Api-Version", "2022-11-28");
+        if let Some(token) = ambient_github_token() {
+            request = request.header(AUTHORIZATION, format!("Bearer {token}"));
+        }
+        request
+    };
+
+    // Same-repo branches first (the common case), then a scan of open PRs to
+    // cover fork-headed pull requests.
+    let head = format!("{owner}:{branch}");
+    let direct = build(format!(
+        "https://api.github.com/repos/{owner}/{repo}/pulls?head={head}&state=all&per_page=1"
+    ))
+    .send()
+    .await
+    .map_err(|error| format!("github request failed: {error}"))?;
+    if direct.status().is_success() {
+        let pulls: serde_json::Value = direct
+            .json()
+            .await
+            .map_err(|error| format!("github response parse failed: {error}"))?;
+        if let Some(url) = pulls[0]["html_url"].as_str() {
+            return Ok(Some(url.to_string()));
+        }
+    }
+
+    let open = build(format!(
+        "https://api.github.com/repos/{owner}/{repo}/pulls?state=open&per_page=100"
+    ))
+    .send()
+    .await
+    .map_err(|error| format!("github request failed: {error}"))?;
+    if !open.status().is_success() {
+        return Ok(None);
+    }
+    let pulls: serde_json::Value = open
+        .json()
+        .await
+        .map_err(|error| format!("github response parse failed: {error}"))?;
+    for pull in pulls.as_array().cloned().unwrap_or_default() {
+        if pull["head"]["ref"].as_str() == Some(branch.as_str()) {
+            if let Some(url) = pull["html_url"].as_str() {
+                return Ok(Some(url.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Extract `(owner, repo)` from a GitHub remote URL — ssh
+/// (`git@github.com:owner/repo.git`) or https
+/// (`https://github.com/owner/repo[.git]`).
+fn parse_github_remote(remote: &str) -> Option<(String, String)> {
+    let rest = remote
+        .strip_prefix("git@github.com:")
+        .or_else(|| remote.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| remote.strip_prefix("https://github.com/"))
+        .or_else(|| remote.strip_prefix("http://github.com/"))?;
+    let mut parts = rest.trim_end_matches('/').splitn(2, '/');
+    let owner = parts.next()?.to_string();
+    let repo = parts.next()?.trim_end_matches(".git").to_string();
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some((owner, repo))
+}
+
 fn ambient_github_token() -> Option<String> {
     ["GITHUB_TOKEN", "GH_TOKEN"].iter().find_map(|name| {
         std::env::var(name)

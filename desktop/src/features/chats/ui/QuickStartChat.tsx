@@ -55,6 +55,7 @@ import { MessageComposer } from "@/features/messages/ui/MessageComposer";
 import {
   ensureWelcomeGuideAgentInChannel,
   WELCOME_GUIDE_AGENT_NAME,
+  WELCOME_GUIDE_PERSONA_ID,
 } from "@/features/onboarding/welcomeGuide";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { addChannelMembers, sendChannelMessage } from "@/shared/api/tauri";
@@ -139,6 +140,17 @@ export function QuickStartChat({
   const usableTeams = React.useMemo(
     () => getUsableTeams(teamsQuery.data ?? [], personasQuery.data ?? []),
     [personasQuery.data, teamsQuery.data],
+  );
+  // The welcome guide already has the "Default agent" row — listing its
+  // managed instance again reads as a duplicate Fizz.
+  const pickableAgents = React.useMemo(
+    () =>
+      (managedAgentsQuery.data ?? []).filter(
+        (agent) =>
+          agent.personaId !== WELCOME_GUIDE_PERSONA_ID &&
+          agent.name !== WELCOME_GUIDE_AGENT_NAME,
+      ),
+    [managedAgentsQuery.data],
   );
   const templates = templatesQuery.data ?? [];
   const allProjects = projects;
@@ -430,7 +442,7 @@ export function QuickStartChat({
           </div>
           <ChatStartPresets
             agentPreset={agentPreset}
-            agents={managedAgentsQuery.data ?? []}
+            agents={pickableAgents}
             defaultAgentName={WELCOME_GUIDE_AGENT_NAME}
             invited={invited}
             onAgentPresetChange={setAgentPreset}

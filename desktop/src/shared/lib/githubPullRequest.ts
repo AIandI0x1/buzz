@@ -127,6 +127,29 @@ export function useGithubCheckSummaryQuery(
   });
 }
 
+/**
+ * Discover the PR for a branch via the project's git remote — the fallback
+ * when no PR link was ever posted in the chat. Polls slowly so a PR opened
+ * mid-conversation surfaces on its own.
+ */
+export function useGithubPrForBranchQuery(
+  projectPath: string | null | undefined,
+  branch: string | null | undefined,
+) {
+  return useQuery({
+    enabled: Boolean(projectPath) && Boolean(branch),
+    queryKey: ["github-pr-for-branch", projectPath ?? "", branch ?? ""],
+    queryFn: async () =>
+      (await invokeTauri<string | null>("find_github_pr_for_branch", {
+        projectPath: projectPath ?? "",
+        branch: branch ?? "",
+      })) ?? null,
+    staleTime: 60_000,
+    refetchInterval: 90_000,
+    retry: 1,
+  });
+}
+
 export function useGithubCommentStateQuery(ref: GithubPullRequestRef | null) {
   return useQuery({
     enabled: ref !== null,

@@ -18,6 +18,7 @@ import {
   parseGithubPullRequestRef,
   useGithubCheckSummaryQuery,
   useGithubCommentStateQuery,
+  useGithubPrForBranchQuery,
   useGithubPullRequestQuery,
 } from "@/shared/lib/githubPullRequest";
 import { parseSupportedLinkPreview } from "@/shared/lib/linkPreview";
@@ -42,6 +43,7 @@ export function ChatWorkPanel({
   onAutomationPrompt,
   open = true,
   prHref,
+  projectPath = null,
 }: {
   /** Live branch from the agent's worktree/checkout activity, if any. */
   branch?: string | null;
@@ -49,9 +51,20 @@ export function ChatWorkPanel({
   onAutomationPrompt?: (content: string) => void;
   open?: boolean;
   prHref?: string | null;
+  /** Project directory — enables PR discovery by branch via the git remote. */
+  projectPath?: string | null;
 }) {
-  const preview = prHref ? parseSupportedLinkPreview(prHref) : null;
-  const ref = prHref ? parseGithubPullRequestRef(prHref) : null;
+  // No PR link in the chat yet? Discover it from the branch via the
+  // project's git remote (agents don't always paste the URL).
+  const discoveredPrQuery = useGithubPrForBranchQuery(
+    prHref ? null : projectPath,
+    branch,
+  );
+  const effectiveHref = prHref ?? discoveredPrQuery.data ?? null;
+  const preview = effectiveHref
+    ? parseSupportedLinkPreview(effectiveHref)
+    : null;
+  const ref = effectiveHref ? parseGithubPullRequestRef(effectiveHref) : null;
   const prQuery = useGithubPullRequestQuery(ref);
   const pr = prQuery.data ?? null;
   const checksQuery = useGithubCheckSummaryQuery(ref, pr?.headSha);
@@ -68,7 +81,7 @@ export function ChatWorkPanel({
   // rise in open threads; the thread watermark re-arms once everything has
   // been replied to (count back at zero).
   React.useEffect(() => {
-    if (!onAutomationPrompt || !prHref || !pr) {
+    if (!onAutomationPrompt || !effectiveHref || !pr) {
       return;
     }
     if (
@@ -80,7 +93,7 @@ export function ChatWorkPanel({
     ) {
       updateChatWorkAutomation(chatId, { lastCiNudgeSha: pr.headSha });
       onAutomationPrompt(
-        `CI is failing on ${prHref} (${checks.failed} of ${checks.total} checks). Investigate the failures and push fixes until the checks pass.`,
+        `CI is failing on ${effectiveHref} (${checks.failed} of ${checks.total} checks). Investigate the failures and push fixes until the checks pass.`,
       );
     }
     const threadWatermark = automation.lastCommentNudgeCount ?? 0;
@@ -89,10 +102,18 @@ export function ChatWorkPanel({
     } else if (automation.addressComments && openThreads > threadWatermark) {
       updateChatWorkAutomation(chatId, { lastCommentNudgeCount: openThreads });
       onAutomationPrompt(
-        `There are unanswered review comments on ${prHref}. Address each comment and its replies, push any needed changes, reply to the threads, and resolve every conversation that has been addressed.`,
+        `There are unanswered review comments on ${effectiveHref}. Address each comment and its replies, push any needed changes, reply to the threads, and resolve every conversation that has been addressed.`,
       );
     }
-  }, [automation, chatId, checks, onAutomationPrompt, openThreads, pr, prHref]);
+  }, [
+    automation,
+    chatId,
+    checks,
+    effectiveHref,
+    onAutomationPrompt,
+    openThreads,
+    pr,
+  ]);
 
   return (
     <aside

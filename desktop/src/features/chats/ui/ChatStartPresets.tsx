@@ -11,12 +11,8 @@ import {
 } from "lucide-react";
 
 import type { ChatProject } from "@/features/chats/lib/chatSetup";
-import type {
-  AgentTeam,
-  ManagedAgent,
-  UserSearchResult,
-} from "@/shared/api/types";
-import { searchUsers } from "@/shared/api/tauri";
+import { useUserSearchQuery } from "@/features/profile/hooks";
+import type { AgentTeam, ManagedAgent } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { Input } from "@/shared/ui/input";
@@ -106,7 +102,7 @@ export function PresetCard({
 }: PresetCardProps) {
   return (
     <button
-      className="flex h-28 w-64 shrink-0 flex-col rounded-2xl border border-border/70 bg-background/70 p-4 text-left transition-colors hover:bg-muted/60 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+      className="flex h-32 w-64 shrink-0 flex-col rounded-2xl border border-border/70 bg-background/70 p-4 text-left transition-colors hover:bg-muted/60 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
       data-testid={testId}
       type="button"
       {...props}
@@ -114,7 +110,7 @@ export function PresetCard({
       <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-muted/70 text-muted-foreground [&_svg]:h-4 [&_svg]:w-4">
         {icon}
       </span>
-      <span className="mt-auto min-w-0">
+      <span className="mt-auto min-w-0 pt-3">
         <span className="block truncate text-base font-medium leading-6 text-foreground">
           {title}
         </span>
@@ -312,41 +308,15 @@ function InviteCard({
 }) {
   const [open, setOpen] = React.useState(false);
   const [query, setQuery] = React.useState("");
-  const [results, setResults] = React.useState<UserSearchResult[]>([]);
-  const [isSearching, setIsSearching] = React.useState(false);
-
-  React.useEffect(() => {
-    const trimmed = query.trim();
-    if (!open || trimmed.length === 0) {
-      setResults([]);
-      setIsSearching(false);
-      return;
-    }
-    setIsSearching(true);
-    let cancelled = false;
-    const handle = window.setTimeout(() => {
-      searchUsers(trimmed)
-        .then((users) => {
-          if (!cancelled) {
-            setResults(users);
-          }
-        })
-        .catch(() => {
-          if (!cancelled) {
-            setResults([]);
-          }
-        })
-        .finally(() => {
-          if (!cancelled) {
-            setIsSearching(false);
-          }
-        });
-    }, 250);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(handle);
-    };
-  }, [open, query]);
+  // Same search path as the channel invite (MembersSidebar): shared hook,
+  // normalized query, cached results.
+  const deferredQuery = React.useDeferredValue(query.trim());
+  const searchQuery = useUserSearchQuery(deferredQuery, {
+    enabled: open && deferredQuery.length > 0,
+    limit: 8,
+  });
+  const results = searchQuery.data ?? [];
+  const isSearching = searchQuery.isFetching;
 
   const invitedPubkeys = new Set(
     invited.map((person) => normalizePubkey(person.pubkey)),

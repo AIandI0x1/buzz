@@ -8903,6 +8903,10 @@ export function maybeInstallE2eTauriMocks() {
         };
       case "fetch_github_pr_comment_state":
         return { openThreads: 2 };
+      case "find_github_pr_for_branch":
+        // Specs drive the work panel through posted links; branch discovery
+        // resolves to nothing in mocks.
+        return null;
       case "build_observer_control_event": {
         // Specs assert the invocation (via __BUZZ_E2E_COMMANDS__); the event
         // itself only needs to be publishable over the mock websocket.
