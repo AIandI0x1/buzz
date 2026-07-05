@@ -338,8 +338,8 @@ export function ChatsScreen({
     return null;
   }, [messages]);
   // The drawer's open state is a single persisted preference — switching
-  // chats must NOT reset it (the panel used to re-animate open on every
-  // switch). null = never toggled: auto-open when the chat has a PR.
+  // chats must NOT reset it or re-derive it (auto-open-on-PR re-animated
+  // the drawer on every switch). Purely remembered; default closed.
   const [workPanelPreference, setWorkPanelPreference] = React.useState<
     boolean | null
   >(() => {
@@ -358,7 +358,7 @@ export function ChatsScreen({
       // Best-effort persistence.
     }
   }, []);
-  const isWorkPanelOpen = workPanelPreference ?? agentPullRequestHref !== null;
+  const isWorkPanelOpen = workPanelPreference ?? false;
   const startManagedAgentMutation = useStartManagedAgentMutation();
   const [isEnsuringDefaultAgent, setIsEnsuringDefaultAgent] =
     React.useState(false);

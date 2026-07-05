@@ -184,7 +184,11 @@ test("first message in a new chat is sent and rendered", async ({ page }) => {
   await expect(
     page.locator("[data-link-preview='github-pull-request-agent']"),
   ).toHaveCount(1, { timeout: 10_000 });
+  // The drawer is purely a remembered preference (default closed) — open
+  // it explicitly; the choice persists across chats and restarts.
   const workPanel = page.getByTestId("chat-work-panel");
+  await expect(workPanel).not.toBeVisible();
+  await page.getByTestId("toggle-work-panel").click();
   await expect(workPanel).toBeVisible();
   await expect(workPanel).toContainText("kennylopez-chatmode");
   await expect(
