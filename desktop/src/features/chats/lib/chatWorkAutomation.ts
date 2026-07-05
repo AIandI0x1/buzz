@@ -99,7 +99,20 @@ export function useChatWorkAutomation(chatId: string): ChatWorkAutomation {
   );
 
   React.useEffect(() => {
-    const refresh = () => setState(readChatWorkAutomation(chatId));
+    // Content-compare: a fresh object per storage event would re-run every
+    // consumer effect (and re-render every panel) even when nothing changed.
+    const refresh = () =>
+      setState((current) => {
+        const next = readChatWorkAutomation(chatId);
+        return current.autoFixCi === next.autoFixCi &&
+          current.addressComments === next.addressComments &&
+          current.lastCiNudgeSha === next.lastCiNudgeSha &&
+          current.lastCommentNudgeCount === next.lastCommentNudgeCount &&
+          current.lastCiNudgeAt === next.lastCiNudgeAt &&
+          current.lastCommentNudgeAt === next.lastCommentNudgeAt
+          ? current
+          : next;
+      });
     refresh();
     window.addEventListener(STORAGE_EVENT, refresh);
     window.addEventListener("storage", refresh);

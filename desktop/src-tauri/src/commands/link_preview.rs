@@ -11,6 +11,23 @@ const MAX_TITLE_FETCH_BYTES: usize = 256 * 1024;
 const TITLE_FETCH_TIMEOUT: Duration = Duration::from_secs(4);
 const GITHUB_API_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// Shared HTTP client for GitHub API commands: the PR monitor polls on
+/// short intervals, and building a fresh client (connection pool + TLS
+/// session cache) per call threw away keep-alive reuse on every tick.
+fn github_client() -> Result<&'static reqwest::Client, String> {
+    static CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .pool_idle_timeout(Duration::from_secs(90))
+                .pool_max_idle_per_host(2)
+                .build()
+                .ok()
+        })
+        .as_ref()
+        .ok_or_else(|| "github client failed to initialize".to_string())
+}
+
 /// Live pull-request details for the rich GitHub PR link card.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -82,11 +99,7 @@ pub async fn fetch_github_pull_request(
         return Err("invalid GitHub repository reference".to_string());
     }
 
-    let client = reqwest::Client::builder()
-        .pool_idle_timeout(Duration::from_secs(10))
-        .pool_max_idle_per_host(1)
-        .build()
-        .map_err(|error| format!("github client failed: {error}"))?;
+    let client = github_client()?;
 
     let url = format!("https://api.github.com/repos/{owner}/{repo}/pulls/{number}");
     let mut request = client
@@ -149,11 +162,7 @@ pub async fn fetch_github_check_summary(
         return Err("invalid GitHub check reference".to_string());
     }
 
-    let client = reqwest::Client::builder()
-        .pool_idle_timeout(Duration::from_secs(10))
-        .pool_max_idle_per_host(1)
-        .build()
-        .map_err(|error| format!("github client failed: {error}"))?;
+    let client = github_client()?;
 
     let url = format!(
         "https://api.github.com/repos/{owner}/{repo}/commits/{sha}/check-runs?per_page=100"
@@ -235,11 +244,7 @@ pub async fn fetch_github_pr_comment_state(
         return Err("invalid GitHub repository reference".to_string());
     }
 
-    let client = reqwest::Client::builder()
-        .pool_idle_timeout(Duration::from_secs(10))
-        .pool_max_idle_per_host(1)
-        .build()
-        .map_err(|error| format!("github client failed: {error}"))?;
+    let client = github_client()?;
 
     let base = format!("https://api.github.com/repos/{owner}/{repo}");
     let build = |url: String| {
@@ -357,11 +362,7 @@ pub async fn find_github_pr_for_branch(
         return Ok(None);
     }
 
-    let client = reqwest::Client::builder()
-        .pool_idle_timeout(Duration::from_secs(10))
-        .pool_max_idle_per_host(1)
-        .build()
-        .map_err(|error| format!("github client failed: {error}"))?;
+    let client = github_client()?;
     let build = |url: String| {
         let mut request = client
             .get(url)

@@ -35,7 +35,10 @@ function profileName(
   );
 }
 
-export function ChatMessageRow({
+// Memoized: ChatDetail re-renders on every observer frame during a live
+// turn, and without this every persisted message re-renders its whole
+// Markdown tree each time. All props are identity-stable between events.
+export const ChatMessageRow = React.memo(function ChatMessageRow({
   event,
   isAgent,
   isOwn,
@@ -138,7 +141,7 @@ export function ChatMessageRow({
       </MessageContent>
     </Message>
   );
-}
+});
 
 // Following the stream is owned entirely by the MessageScroller's built-in
 // autoScroll (content mutation + resize observers). This anchor only handles

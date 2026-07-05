@@ -87,47 +87,52 @@ function isSetupLifecycleItem(item: TranscriptItem) {
   );
 }
 
-export function ChatActivityTranscript({
-  activeTurnIds,
-  agent,
-  blocks,
-  identityPubkey,
-  profiles,
-  showAgentIdentity = true,
-}: {
-  /** Turn ids currently live in this channel — drives per-turn rendering. */
-  activeTurnIds?: ReadonlySet<string>;
-  agent: ManagedAgent | null;
-  blocks: ChatActivityRenderBlock[];
-  identityPubkey?: string;
-  profiles?: UserProfileLookup;
-  /** Hidden in solo chats so agent replies read as part of the stream. */
-  showAgentIdentity?: boolean;
-}) {
-  if (blocks.length === 0) {
-    return null;
-  }
+// Memoized: rendered once per anchored message; placement recomputes on
+// every transcript event, but rows whose props didn't change must not
+// re-render their Markdown trees.
+export const ChatActivityTranscript = React.memo(
+  function ChatActivityTranscript({
+    activeTurnIds,
+    agent,
+    blocks,
+    identityPubkey,
+    profiles,
+    showAgentIdentity = true,
+  }: {
+    /** Turn ids currently live in this channel — drives per-turn rendering. */
+    activeTurnIds?: ReadonlySet<string>;
+    agent: ManagedAgent | null;
+    blocks: ChatActivityRenderBlock[];
+    identityPubkey?: string;
+    profiles?: UserProfileLookup;
+    /** Hidden in solo chats so agent replies read as part of the stream. */
+    showAgentIdentity?: boolean;
+  }) {
+    if (blocks.length === 0) {
+      return null;
+    }
 
-  return (
-    <>
-      {blocks.map((renderBlock) => (
-        <ChatActivityBlockView
-          agent={agent}
-          block={renderBlock.block}
-          identityPubkey={identityPubkey}
-          isTurnActive={
-            renderBlock.block.kind === "turn" &&
-            (activeTurnIds?.has(renderBlock.block.turnId) ?? false)
-          }
-          key={renderBlock.id}
-          profiles={profiles}
-          showAgentIdentity={showAgentIdentity}
-          suppressPromptMessage={renderBlock.suppressPromptMessage}
-        />
-      ))}
-    </>
-  );
-}
+    return (
+      <>
+        {blocks.map((renderBlock) => (
+          <ChatActivityBlockView
+            agent={agent}
+            block={renderBlock.block}
+            identityPubkey={identityPubkey}
+            isTurnActive={
+              renderBlock.block.kind === "turn" &&
+              (activeTurnIds?.has(renderBlock.block.turnId) ?? false)
+            }
+            key={renderBlock.id}
+            profiles={profiles}
+            showAgentIdentity={showAgentIdentity}
+            suppressPromptMessage={renderBlock.suppressPromptMessage}
+          />
+        ))}
+      </>
+    );
+  },
+);
 
 function ChatActivityBlockView({
   agent,

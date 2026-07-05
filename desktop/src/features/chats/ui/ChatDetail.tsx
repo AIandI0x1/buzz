@@ -125,15 +125,22 @@ export function ChatDetail({
   // Every active managed agent, not just the default: a chat can have
   // several agents working and all of their activity must render.
   const managedAgentsQuery = useManagedAgentsQuery();
-  const activeAgentPubkeys = React.useMemo(() => {
+  // Key-stabilized: the managed-agents query refetches on a 30s interval and
+  // a fresh array identity would resubscribe the transcript store each time
+  // even when the active set is unchanged.
+  const activeAgentPubkeysKey = React.useMemo(() => {
     const pubkeys = (managedAgentsQuery.data ?? [])
       .filter(isManagedAgentActive)
       .map((agent) => normalizePubkey(agent.pubkey));
     if (defaultAgent && isManagedAgentActive(defaultAgent)) {
       pubkeys.push(normalizePubkey(defaultAgent.pubkey));
     }
-    return [...new Set(pubkeys)].sort();
+    return [...new Set(pubkeys)].sort().join(",");
   }, [defaultAgent, managedAgentsQuery.data]);
+  const activeAgentPubkeys = React.useMemo(
+    () => activeAgentPubkeysKey.split(",").filter(Boolean),
+    [activeAgentPubkeysKey],
+  );
   const hasObserver = activeAgentPubkeys.length > 0;
   const activeChannelTurns = useActiveAgentTurnsByChannel();
   // Per-turn ids, not a channel-wide boolean: while a new turn runs, older
