@@ -532,7 +532,6 @@ impl AppState {
                     .build(),
             ),
             transcribe_rate_limiter: Arc::new(DashMap::new()),
-            transcribe_sessions: Arc::new(DashMap::new()),
             media_uploads_in_flight: Arc::new(DashMap::new()),
             observer_owner_cache: Arc::new(
                 moka::sync::Cache::builder()
