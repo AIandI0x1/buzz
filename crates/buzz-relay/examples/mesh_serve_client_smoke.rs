@@ -50,7 +50,9 @@ async fn main() -> anyhow::Result<()> {
     {
         anyhow::bail!("MeshLLM native runtime for MeshLLM {current} is not installed; run `just mesh-e2e-hardware` to prepare it");
     }
+    // initialize_host_runtime became async upstream.
     mesh_llm_host_runtime::initialize_host_runtime()
+        .await
         .map_err(|error| anyhow::anyhow!("MeshLLM host runtime init failed: {error}"))?;
     eprintln!("[smoke] MeshLLM host runtime initialized");
 
