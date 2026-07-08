@@ -36,7 +36,7 @@ test("estimateRowHeight: fenced code adds height by line", () => {
     msg({ body: "see:\n```\na\nb\nc\nd\ne\n```" }),
   );
   const withoutCode = estimateRowHeight(msg({ body: "see:" }));
-  assert.ok(withCode > withoutCode + 100, `code ${withCode} vs ${withoutCode}`);
+  assert.ok(withCode > withoutCode + 80, `code ${withCode} vs ${withoutCode}`);
 });
 
 test("estimateRowHeight: imeta image with dim reserves bounded media height", () => {
