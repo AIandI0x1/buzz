@@ -35,7 +35,6 @@ const CONTINUATION_ROW_CHROME = 8; // dense row padding only; header/avatar are 
 const MEDIA_BLOCK_MARGIN_TOP = 4; // image/video blocks use mt-1 in markdown
 const REACTION_ROW = 24;
 const PREVIEW_CARD = 70;
-const CODE_BLOCK_CHROME = 18; // pre border/padding above the mono line boxes
 const THREAD_SUMMARY_ROW = 38;
 const FOOTER_ROW = 32;
 const MESSAGE_ITEM_BOTTOM_PADDING = 10; // TimelineMessageList pb-2.5
@@ -99,23 +98,20 @@ function wrappedLineCount(text: string, charsPerLine: number): number {
  */
 function splitFencedCode(body: string): {
   prose: string;
-  codeBlockCount: number;
   codeLines: number;
 } {
   const parts = body.split(/```/);
   // Even indices are prose, odd indices are inside a fence.
   let prose = "";
-  let codeBlockCount = 0;
   let codeLines = 0;
   for (let i = 0; i < parts.length; i += 1) {
     if (i % 2 === 1) {
-      codeBlockCount += 1;
       codeLines += parts[i].split("\n").length;
     } else {
       prose += parts[i];
     }
   }
-  return { prose, codeBlockCount, codeLines };
+  return { prose, codeLines };
 }
 
 // Image/video file extensions the markdown renderer turns into inline media.
@@ -153,7 +149,6 @@ function stripMediaOnlyLines(text: string): string {
 function markdownStructureExtraHeight(text: string): number {
   let extra = 0;
   let tableRunLines = 0;
-  let listRunLines = 0;
 
   const flushTableRun = () => {
     if (tableRunLines >= 2) {
@@ -163,35 +158,19 @@ function markdownStructureExtraHeight(text: string): number {
     }
     tableRunLines = 0;
   };
-  const flushListRun = () => {
-    if (listRunLines >= 2) {
-      // The renderer applies `space-y-1` between list items.
-      extra += (listRunLines - 1) * 4;
-    }
-    listRunLines = 0;
-  };
 
   for (const line of text.split("\n")) {
     const trimmed = line.trim();
     const isTableLine =
       /^\|.+\|$/.test(trimmed) || /\S\s+\|\s+\S/.test(trimmed);
-    const isListLine = /^(?:[-+*]|\d+[.)])\s+\S/.test(trimmed);
 
     if (isTableLine) tableRunLines += 1;
     else flushTableRun();
 
-    if (isListLine) listRunLines += 1;
-    else flushListRun();
-
-    if (/^#{1,3}\s+\S/.test(trimmed)) extra += 8;
-    else if (/^#{4,6}\s+\S/.test(trimmed)) extra += 4;
-
-    if (/^>\s?\S/.test(trimmed)) extra += 4;
     if (/^(?:---+|\*\*\*+|___+)\s*$/.test(trimmed)) extra += 12;
   }
 
   flushTableRun();
-  flushListRun();
   return extra;
 }
 
@@ -204,7 +183,7 @@ export function estimateRowHeight(
   }: EstimateRowHeightOptions = {},
 ): number {
   const body = message.body ?? "";
-  const { prose, codeBlockCount, codeLines } = splitFencedCode(body);
+  const { prose, codeLines } = splitFencedCode(body);
   const proseForLineCount = stripMediaOnlyLines(prose);
   const charsPerLine = charsPerLineFromColumnWidth(columnWidthPx);
 
@@ -215,7 +194,6 @@ export function estimateRowHeight(
       charsPerLine,
     ) * TEXT_LINE_HEIGHT;
   height += codeLines * CODE_LINE_HEIGHT;
-  height += codeBlockCount * CODE_BLOCK_CHROME;
   height += markdownStructureExtraHeight(proseForLineCount);
 
   const imetaUrls = new Set<string>();
