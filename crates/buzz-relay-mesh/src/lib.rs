@@ -74,6 +74,36 @@ pub enum MeshError {
         frame_generation: u64,
         known_generation: u64,
     },
+    // The three variants below complete the fence-rejection taxonomy alongside
+    // `StaleGeneration` (Wren's chaos-gate ruling: every fence-visible reject
+    // is a typed variant, never a generic `Transport`, so live kill-9 /
+    // partition / replay evidence is unambiguous). Counter surface:
+    // `mesh_fence_rejections_total{reason=...}` with reasons
+    // `stale_generation` | `no_active_lease` | `owner_mismatch` |
+    // `future_generation`. None of these are serialized — the wire-level fence
+    // signal remains `GoodbyeReason::StaleGeneration`.
+    #[error("no active lease for session {session_id}: frame generation {frame_generation}, known generation {known_generation}, claimed owner {frame_owner_runtime_id}")]
+    NoActiveLease {
+        session_id: uuid::Uuid,
+        frame_generation: u64,
+        known_generation: u64,
+        /// The owner the *frame* claimed — there is no current owner by
+        /// definition when no live lease exists.
+        frame_owner_runtime_id: RuntimeId,
+    },
+    #[error("owner mismatch for session {session_id} generation {generation}: frame owner {frame_owner_runtime_id} != current owner {current_owner_runtime_id}")]
+    OwnerMismatch {
+        session_id: uuid::Uuid,
+        generation: u64,
+        frame_owner_runtime_id: RuntimeId,
+        current_owner_runtime_id: RuntimeId,
+    },
+    #[error("future generation for session {session_id}: frame {frame_generation} > known {known_generation}")]
+    FutureGeneration {
+        session_id: uuid::Uuid,
+        frame_generation: u64,
+        known_generation: u64,
+    },
     #[error("mesh is disabled (BUZZ_MESH=off)")]
     Disabled,
     #[error("transport: {0}")]
