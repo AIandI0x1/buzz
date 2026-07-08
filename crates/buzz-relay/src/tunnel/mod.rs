@@ -5,3 +5,4 @@
 //! validation, and profile-specific routing decisions for tunnel consumers.
 
 pub mod directory;
+pub mod reliable;
