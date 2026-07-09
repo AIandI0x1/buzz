@@ -49,7 +49,51 @@ type UseAnchoredScrollOptions = {
   /** When set, scroll to and highlight this message on mount and on change. */
   targetMessageId?: string | null;
   onTargetReached?: (messageId: string) => void;
+
+  /**
+   * Opt-in, default-off polled settle gate for the mid-history prepend
+   * re-anchor. When `enabled`, the prepend drift-correction (`scrollBy`) is
+   * deferred while a user fling is in progress and applied only once the scroll
+   * has quiesced — see {@link SettleGateOptions}. When absent/off, the timeline
+   * behaves byte-identically to main: the correction runs immediately on the
+   * prepend commit, as it always has.
+   */
+  settleGate?: SettleGateOptions;
 };
+
+/**
+ * Configuration for the polled quiet-window settle gate.
+ *
+ * The gate exists because there is no event-driven "user fling has ended"
+ * signal that survives WebKit's momentum-event coalescing — a debounce on
+ * `scroll` events starves on WebKit exactly when a fling is fastest. So we
+ * poll `scrollTop` on `requestAnimationFrame` and declare settle only after
+ * `quietFrames` *consecutive* frames of zero movement.
+ *
+ * Design edge (#1): WebKit freezes scroll-position reads for ~2 coalesced
+ * frames mid-fling. A gate that fires on the first still frame would read that
+ * freeze as "settled" and re-anchor mid-momentum — recreating the walk-blind
+ * jump this gate is meant to remove. `quietFrames` MUST exceed that freeze
+ * window; the default of 3 clears the ~2-frame freeze with one frame of margin.
+ * Tune against the classifier, not by eye.
+ */
+export type SettleGateOptions = {
+  /** Master switch. Off (or option omitted) ⇒ zero behavior change vs. main. */
+  enabled: boolean;
+  /**
+   * Consecutive zero-delta rAF frames required to declare the scroll settled.
+   * Must exceed WebKit's coalesced-freeze window (~2). Defaults to
+   * {@link DEFAULT_SETTLE_QUIET_FRAMES}.
+   */
+  quietFrames?: number;
+};
+
+/**
+ * Default consecutive-still-frame count for the settle gate. Chosen to clear
+ * WebKit's ~2-frame coalesced-freeze window (design edge #1) with a one-frame
+ * margin, so the gate never mistakes the freeze for a genuine settle.
+ */
+export const DEFAULT_SETTLE_QUIET_FRAMES = 3;
 
 type UseAnchoredScrollResult = {
   /** Pass through to the scroll container's `onScroll`. */
@@ -96,6 +140,65 @@ function isAtTrueBottom(
     container.scrollHeight - container.clientHeight - container.scrollTop <=
     TRUE_BOTTOM_THRESHOLD_PX
   );
+}
+
+/**
+ * Poll `container.scrollTop` on `requestAnimationFrame` and invoke `onSettle`
+ * once the position has held still for `quietFrames` *consecutive* frames.
+ *
+ * This is the settle gate's core. It exists because WebKit coalesces momentum
+ * `scroll` events, so an event-debounce never fires at the true end of a fling
+ * (design context in {@link SettleGateOptions}). Polling the position directly
+ * side-steps the event stream entirely: a fling is "over" when the number stops
+ * changing, and the consecutive-frame requirement is what makes it robust to
+ * WebKit's mid-fling ~2-frame position-read freeze — a single still frame is
+ * not enough, so the freeze cannot be mistaken for a settle.
+ *
+ * Returns a `cancel` function; call it if the observation is superseded (e.g. a
+ * newer prepend arrives, or the component unmounts) so the rAF loop stops and
+ * `onSettle` never fires for stale work.
+ */
+export function observeScrollSettle(
+  container: Pick<HTMLDivElement, "scrollTop">,
+  quietFrames: number,
+  onSettle: () => void,
+  scheduleFrame: (cb: () => void) => number = requestAnimationFrame,
+  cancelFrame: (id: number) => void = cancelAnimationFrame,
+): () => void {
+  // Guard: a non-positive frame count would settle instantly and defeat the
+  // gate's purpose. Clamp to the minimum that still clears the freeze window.
+  const required = Math.max(quietFrames, DEFAULT_SETTLE_QUIET_FRAMES);
+  let lastTop = container.scrollTop;
+  let stillFrames = 0;
+  let rafId: number | null = null;
+  let cancelled = false;
+
+  const tick = () => {
+    if (cancelled) return;
+    const top = container.scrollTop;
+    if (top === lastTop) {
+      stillFrames += 1;
+    } else {
+      stillFrames = 0;
+      lastTop = top;
+    }
+    if (stillFrames >= required) {
+      rafId = null;
+      onSettle();
+      return;
+    }
+    rafId = scheduleFrame(tick);
+  };
+
+  rafId = scheduleFrame(tick);
+
+  return () => {
+    cancelled = true;
+    if (rafId !== null) {
+      cancelFrame(rafId);
+      rafId = null;
+    }
+  };
 }
 
 /**
@@ -150,6 +253,7 @@ export function useAnchoredScroll({
 
   targetMessageId = null,
   onTargetReached,
+  settleGate,
 }: UseAnchoredScrollOptions): UseAnchoredScrollResult {
   // Anchor lives in a ref because it must survive renders and is updated
   // both on scroll (commit-time read) and in the layout effect (post-render
@@ -181,6 +285,17 @@ export function useAnchoredScroll({
   // ignores transient gaps and keeps chasing the floor. A `ref`, not state — the
   // guard runs on a native scroll event, outside React's render cycle.
   const settlingRef = React.useRef(false);
+  // Cancel handle for an in-flight settle observation armed by the prepend
+  // re-anchor while a fling is in progress (settle gate only). Held so a newer
+  // prepend, a channel switch, or unmount can supersede the pending correction
+  // before its `onSettle` fires — otherwise a stale re-anchor could snap the
+  // view after the user has already flung somewhere else.
+  const settleObserverCancelRef = React.useRef<(() => void) | null>(null);
+  // Keep the latest settle-gate config in a ref so the layout effect can read
+  // it without adding it to the dependency array (it must not re-run the
+  // restoration logic just because the caller passed a new options object).
+  const settleGateRef = React.useRef(settleGate);
+  settleGateRef.current = settleGate;
 
   // Reset everything when the channel changes — the layout effect that runs
   // immediately after this reset is responsible for either jumping to bottom
@@ -206,6 +321,10 @@ export function useAnchoredScroll({
     if (mountPinRafIdRef.current !== null) {
       cancelAnimationFrame(mountPinRafIdRef.current);
       mountPinRafIdRef.current = null;
+    }
+    if (settleObserverCancelRef.current !== null) {
+      settleObserverCancelRef.current();
+      settleObserverCancelRef.current = null;
     }
   }, [channelId]);
 
@@ -420,17 +539,53 @@ export function useAnchoredScroll({
       // observer's promise callback) because the prepended rows commit on a
       // deferred snapshot a few frames later, so the row's true position is only
       // known here.
-      const row = container.querySelector<HTMLElement>(
-        `[data-message-id="${CSS.escape(anchor.messageId)}"]`,
-      );
-      if (row) {
+      //
+      // Re-pin measured fresh at call time: find the anchored row, read its
+      // current top offset, and `scrollBy` the drift back to its saved offset.
+      // Deferred settle callers re-run this so they compensate the row's
+      // *settle-time* position, not a stale mid-fling measurement.
+      const applyReanchor = () => {
+        const currentRow = container.querySelector<HTMLElement>(
+          `[data-message-id="${CSS.escape(anchor.messageId)}"]`,
+        );
+        if (!currentRow) return;
         const currentTopOffset =
-          row.getBoundingClientRect().top -
+          currentRow.getBoundingClientRect().top -
           container.getBoundingClientRect().top;
         const drift = currentTopOffset - anchor.topOffset;
         if (Math.abs(drift) > 0.5) {
           container.scrollBy(0, drift);
         }
+      };
+
+      const gate = settleGateRef.current;
+      if (gate?.enabled) {
+        // Settle gate on: the prepend re-anchor is the one mid-fling scroll
+        // writer, and firing it against live user momentum is what produces the
+        // walk-blind jump. Defer it behind the polled quiet-window — apply the
+        // correction only once the scroll has been still for k consecutive
+        // frames (k clears WebKit's coalesced-freeze window; see
+        // `observeScrollSettle`). Supersede any correction still pending from a
+        // prior prepend so only the newest anchor is ever re-pinned.
+        //
+        // A3 trade (stated in the PR body): this removes the mid-fling jerk by
+        // *deferring* the re-anchor to settle, which means the reading row can
+        // drift during the fling and snap back once at rest. The artifact the
+        // user feels moves from "jump mid-scroll" to "small settle-time
+        // adjustment"; it is a trade, not a free correction.
+        if (settleObserverCancelRef.current !== null) {
+          settleObserverCancelRef.current();
+        }
+        settleObserverCancelRef.current = observeScrollSettle(
+          container,
+          gate.quietFrames ?? DEFAULT_SETTLE_QUIET_FRAMES,
+          () => {
+            settleObserverCancelRef.current = null;
+            applyReanchor();
+          },
+        );
+      } else {
+        applyReanchor();
       }
       if (!isPrepend) {
         setNewMessageCount((current) => current + messagesArrived);
@@ -522,6 +677,10 @@ export function useAnchoredScroll({
     return () => {
       if (highlightTimeoutRef.current !== null) {
         window.clearTimeout(highlightTimeoutRef.current);
+      }
+      if (settleObserverCancelRef.current !== null) {
+        settleObserverCancelRef.current();
+        settleObserverCancelRef.current = null;
       }
     };
   }, []);
