@@ -1,6 +1,7 @@
 import * as React from "react";
 import { FileDiff, Maximize2 } from "lucide-react";
 
+import { getDiffTitleBadge } from "@/features/messages/lib/parseDiff";
 import { isSafeUrl } from "@/shared/lib/url";
 import { Button } from "@/shared/ui/button";
 import { useSmoothCorners } from "@/shared/ui/smoothCorners";
@@ -39,6 +40,11 @@ export default function DiffMessage({
 
   const safeRepoUrl = isSafeUrl(repoUrl) ? repoUrl : undefined;
 
+  const titleBadge = React.useMemo(
+    () => getDiffTitleBadge(content, filePath),
+    [content, filePath],
+  );
+
   const commitUrl =
     safeRepoUrl && commitSha ? `${safeRepoUrl}/commit/${commitSha}` : undefined;
 
@@ -54,6 +60,11 @@ export default function DiffMessage({
         <span className="flex-1 truncate font-mono text-xs text-foreground/80">
           {filePath ?? "diff"}
         </span>
+        {titleBadge && (
+          <span className="shrink-0 rounded-md border border-border/60 px-1.5 py-0.5 text-2xs uppercase tracking-[0.14em] text-muted-foreground">
+            {titleBadge}
+          </span>
+        )}
         {shortSha && (
           <span className="text-xs text-muted-foreground font-mono">
             {commitUrl ? (

@@ -1,6 +1,7 @@
 import { Rows3, SplitSquareVertical } from "lucide-react";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 
+import { getDiffTitleBadge } from "@/features/messages/lib/parseDiff";
 import { DiffViewer } from "@/features/messages/ui/DiffViewer";
 import { Button } from "@/shared/ui/button";
 import {
@@ -23,6 +24,11 @@ export default function DiffMessageExpanded({
 }: DiffMessageExpandedProps) {
   const [viewType, setViewType] = useState<"split" | "unified">("unified");
 
+  const titleBadge = useMemo(
+    () => getDiffTitleBadge(content, filePath),
+    [content, filePath],
+  );
+
   return (
     <Dialog
       onOpenChange={(open) => {
@@ -36,6 +42,11 @@ export default function DiffMessageExpanded({
             <DialogTitle className="min-w-0 flex-1 truncate font-mono text-sm font-medium">
               {filePath ?? "Diff Viewer"}
             </DialogTitle>
+            {titleBadge && (
+              <span className="shrink-0 rounded-md border border-border/60 px-1.5 py-0.5 text-2xs uppercase tracking-[0.14em] text-muted-foreground">
+                {titleBadge}
+              </span>
+            )}
             <div className="flex items-center gap-1 rounded-lg border border-border/60 bg-muted/30 p-1">
               <Button
                 className="h-7 px-2"
