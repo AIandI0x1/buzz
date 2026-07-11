@@ -721,6 +721,20 @@ impl Db {
         event::get_latest_global_replaceable(&self.pool, community_id, kind, pubkey_bytes).await
     }
 
+    /// Fetch the `channel_id` of the current NIP-33 head for a kind:31234 draft address.
+    ///
+    /// Returns `Ok(Some(Some(uuid)))` if a live head exists with a channel_id,
+    /// `Ok(Some(None))` if a live head exists without a channel_id (defensive),
+    /// `Ok(None)` if no live head exists, `Err` on database failure.
+    pub async fn get_draft_head_channel_id(
+        &self,
+        community_id: CommunityId,
+        pubkey_bytes: &[u8],
+        d_tag: &str,
+    ) -> Result<Option<Option<uuid::Uuid>>> {
+        event::get_draft_head_channel_id(&self.pool, community_id, pubkey_bytes, d_tag).await
+    }
+
     /// Fetches a single non-deleted event by its raw ID bytes.
     ///
     /// Returns `None` if the event does not exist or has been soft-deleted.

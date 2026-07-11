@@ -404,11 +404,6 @@ pub(crate) fn is_global_only_kind(kind: u32) -> bool {
             // NIP-AM: agent turn metrics are owner-scoped global events.
             // Channel identity is encrypted inside the payload — no `h` tag.
             | KIND_AGENT_TURN_METRIC
-            // NIP-37: draft wraps are author-private global events.
-            // Compose context (channel, DM, reply target) is encrypted inside
-            // the payload — no outer `h` tag. A stray `h` tag is rejected at
-            // validation time (see `validate_draft_wrap_envelope`).
-            | KIND_DRAFT
     )
 }
 
@@ -441,6 +436,12 @@ pub(crate) fn requires_h_channel_scope(kind: u32) -> bool {
             | KIND_HUDDLE_PARTICIPANT_LEFT
             | KIND_HUDDLE_ENDED
             | KIND_HUDDLE_GUIDELINES
+            // NIP-37: draft wraps are channel-bound author-private events.
+            // Each draft is scoped to a specific channel or DM; the `h` tag
+            // carries the channel UUID. The relay resolves and validates the
+            // channel, enforces membership, and persists the draft with
+            // channel_id set.
+            | KIND_DRAFT
     )
 }
 
@@ -1209,8 +1210,11 @@ fn validate_not_before(tag_value: &str) -> Result<u64, &'static str> {
 ///    (NIP-37 does not prescribe it); the relay accepts any non-empty opaque identifier.
 /// 2. Exactly one `k` tag with a canonical ASCII-decimal inner kind value in the
 ///    unsigned 16-bit range (0..=65535) with no leading zeros (except bare "0").
-/// 3. No outer `h` tag — compose context is encrypted inside the payload.
+/// 3. Exactly one `h` tag with a canonical UUID value — the channel or DM this
+///    draft is bound to. The relay resolves and validates the channel separately;
+///    this check only validates the tag's syntactic shape.
 /// 4. No outer `p` tag — prevents this event from entering the mention/feed index.
+///    Recipient/reply/edit details remain encrypted inside the payload.
 /// 5. Non-empty content must be a syntactically plausible NIP-44 v2 ciphertext
 ///    (reuses `validate_engram_nip44_content`). Empty content is the NIP-37
 ///    deletion tombstone and is explicitly valid.
@@ -1225,6 +1229,8 @@ fn validate_draft_wrap_envelope(event: &Event) -> Result<(), String> {
     let mut d_value: Option<&str> = None;
     let mut k_count = 0usize;
     let mut k_value: Option<&str> = None;
+    let mut h_count = 0usize;
+    let mut h_value: Option<&str> = None;
     let mut expiration_count = 0usize;
     let mut expiration_value: Option<&str> = None;
 
@@ -1243,9 +1249,8 @@ fn validate_draft_wrap_envelope(event: &Event) -> Result<(), String> {
                 k_value = Some(&parts[1]);
             }
             "h" => {
-                return Err(
-                    "draft-wrap event must not have an `h` tag (compose context belongs inside the encrypted payload)".to_string(),
-                );
+                h_count += 1;
+                h_value = Some(&parts[1]);
             }
             "p" => {
                 return Err(
@@ -1295,6 +1300,20 @@ fn validate_draft_wrap_envelope(event: &Event) -> Result<(), String> {
     let _inner_kind: u16 = k.parse().map_err(|_| {
         "draft-wrap `k` tag value out of range (must fit unsigned 16-bit kind)".to_string()
     })?;
+
+    // Validate `h` tag — required, exactly one, must be a well-formed UUID.
+    if h_count != 1 {
+        return Err(format!(
+            "draft-wrap event must have exactly one `h` tag (got {h_count}); \
+             draft wraps are channel-bound"
+        ));
+    }
+    let h = h_value.unwrap();
+    if uuid::Uuid::parse_str(h).is_err() {
+        return Err(format!(
+            "draft-wrap `h` tag must be a canonical UUID (channel or DM id), got: {h:?}"
+        ));
+    }
 
     // Validate `expiration` tag (optional, at most one).
     if expiration_count > 1 {
@@ -2362,6 +2381,46 @@ async fn ingest_event_inner(
                 buzz_db::event::D_TAG_MAX_LEN,
             )));
         }
+
+        // Immutable channel binding for kind:31234 (NIP-37 draft wraps).
+        //
+        // The NIP-33 address (community, author, 31234, d_tag) is unique, but
+        // channel_id is NOT part of the NIP-33 key. This means a replacement
+        // with a different h-tag would silently re-bind the draft to a new
+        // channel while still winning the NIP-01 replacement. To prevent that,
+        // we reject any incoming kind:31234 update whose channel_id differs
+        // from the stored head's channel_id.
+        //
+        // A tombstone (empty content) carries the same h-tag as the draft it
+        // closes — this check enforces that invariant too.
+        if kind_u32 == KIND_DRAFT {
+            let pubkey_bytes = auth.pubkey().to_bytes().to_vec();
+            match state
+                .db
+                .get_draft_head_channel_id(tenant.community(), &pubkey_bytes, &d_tag)
+                .await
+            {
+                Ok(Some(head_ch)) => {
+                    // A live head exists. Its channel_id must match the incoming event's.
+                    if head_ch != channel_id {
+                        return Err(IngestError::Rejected(
+                            "invalid: draft-wrap channel binding is immutable — \
+                             `h` tag must match the existing head's channel"
+                                .into(),
+                        ));
+                    }
+                }
+                Ok(None) => {
+                    // No live head — this is the first write for this address.
+                }
+                Err(e) => {
+                    return Err(IngestError::Internal(format!(
+                        "error: checking draft channel binding: {e}"
+                    )));
+                }
+            }
+        }
+
         state
             .db
             .replace_parameterized_event(tenant.community(), &event, &d_tag, channel_id)
@@ -3553,7 +3612,8 @@ mod tests {
     #[test]
     fn draft_wrap_accepts_ciphertext_content() {
         let d = uuid::Uuid::new_v4().to_string();
-        let ev = make_draft(&[&["d", &d], &["k", "9"]], &fake_nip44_v2());
+        let ch = uuid::Uuid::new_v4().to_string();
+        let ev = make_draft(&[&["d", &d], &["k", "9"], &["h", &ch]], &fake_nip44_v2());
         assert!(
             validate_draft_wrap_envelope(&ev).is_ok(),
             "canonical draft with ciphertext content must be accepted"
@@ -3563,7 +3623,8 @@ mod tests {
     #[test]
     fn draft_wrap_accepts_blank_tombstone() {
         let d = uuid::Uuid::new_v4().to_string();
-        let ev = make_draft(&[&["d", &d], &["k", "9"]], "");
+        let ch = uuid::Uuid::new_v4().to_string();
+        let ev = make_draft(&[&["d", &d], &["k", "9"], &["h", &ch]], "");
         assert!(
             validate_draft_wrap_envelope(&ev).is_ok(),
             "tombstone (empty content) must be accepted"
@@ -3574,7 +3635,8 @@ mod tests {
     fn draft_wrap_accepts_various_valid_k_values() {
         for k in ["0", "1", "9", "1000", "30023", "65535"] {
             let d = uuid::Uuid::new_v4().to_string();
-            let ev = make_draft(&[&["d", &d], &["k", k]], "");
+            let ch = uuid::Uuid::new_v4().to_string();
+            let ev = make_draft(&[&["d", &d], &["k", k], &["h", &ch]], "");
             assert!(
                 validate_draft_wrap_envelope(&ev).is_ok(),
                 "k={k} must be accepted"
@@ -3586,14 +3648,16 @@ mod tests {
 
     #[test]
     fn draft_wrap_rejects_missing_d_tag() {
-        let ev = make_draft(&[&["k", "9"]], &fake_nip44_v2());
+        let ch = uuid::Uuid::new_v4().to_string();
+        let ev = make_draft(&[&["k", "9"], &["h", &ch]], &fake_nip44_v2());
         let err = validate_draft_wrap_envelope(&ev).unwrap_err();
         assert!(err.contains("`d` tag"), "got: {err}");
     }
 
     #[test]
     fn draft_wrap_rejects_empty_d_tag() {
-        let ev = make_draft(&[&["d", ""], &["k", "9"]], &fake_nip44_v2());
+        let ch = uuid::Uuid::new_v4().to_string();
+        let ev = make_draft(&[&["d", ""], &["k", "9"], &["h", &ch]], &fake_nip44_v2());
         let err = validate_draft_wrap_envelope(&ev).unwrap_err();
         assert!(err.contains("`d` tag"), "got: {err}");
     }
@@ -3601,7 +3665,11 @@ mod tests {
     #[test]
     fn draft_wrap_rejects_duplicate_d_tag() {
         let d = uuid::Uuid::new_v4().to_string();
-        let ev = make_draft(&[&["d", &d], &["d", &d], &["k", "9"]], &fake_nip44_v2());
+        let ch = uuid::Uuid::new_v4().to_string();
+        let ev = make_draft(
+            &[&["d", &d], &["d", &d], &["k", "9"], &["h", &ch]],
+            &fake_nip44_v2(),
+        );
         let err = validate_draft_wrap_envelope(&ev).unwrap_err();
         assert!(err.contains("`d` tag"), "got: {err}");
     }
@@ -3611,7 +3679,8 @@ mod tests {
     #[test]
     fn draft_wrap_rejects_missing_k_tag() {
         let d = uuid::Uuid::new_v4().to_string();
-        let ev = make_draft(&[&["d", &d]], &fake_nip44_v2());
+        let ch = uuid::Uuid::new_v4().to_string();
+        let ev = make_draft(&[&["d", &d], &["h", &ch]], &fake_nip44_v2());
         let err = validate_draft_wrap_envelope(&ev).unwrap_err();
         assert!(err.contains("`k` tag"), "got: {err}");
     }
@@ -3619,7 +3688,11 @@ mod tests {
     #[test]
     fn draft_wrap_rejects_duplicate_k_tag() {
         let d = uuid::Uuid::new_v4().to_string();
-        let ev = make_draft(&[&["d", &d], &["k", "9"], &["k", "9"]], &fake_nip44_v2());
+        let ch = uuid::Uuid::new_v4().to_string();
+        let ev = make_draft(
+            &[&["d", &d], &["k", "9"], &["k", "9"], &["h", &ch]],
+            &fake_nip44_v2(),
+        );
         let err = validate_draft_wrap_envelope(&ev).unwrap_err();
         assert!(err.contains("`k` tag"), "got: {err}");
     }
@@ -3627,7 +3700,8 @@ mod tests {
     #[test]
     fn draft_wrap_rejects_k_tag_non_decimal() {
         let d = uuid::Uuid::new_v4().to_string();
-        let ev = make_draft(&[&["d", &d], &["k", "0x9"]], &fake_nip44_v2());
+        let ch = uuid::Uuid::new_v4().to_string();
+        let ev = make_draft(&[&["d", &d], &["k", "0x9"], &["h", &ch]], &fake_nip44_v2());
         let err = validate_draft_wrap_envelope(&ev).unwrap_err();
         assert!(err.contains("canonical decimal"), "got: {err}");
     }
@@ -3635,7 +3709,8 @@ mod tests {
     #[test]
     fn draft_wrap_rejects_k_tag_leading_zero() {
         let d = uuid::Uuid::new_v4().to_string();
-        let ev = make_draft(&[&["d", &d], &["k", "09"]], &fake_nip44_v2());
+        let ch = uuid::Uuid::new_v4().to_string();
+        let ev = make_draft(&[&["d", &d], &["k", "09"], &["h", &ch]], &fake_nip44_v2());
         let err = validate_draft_wrap_envelope(&ev).unwrap_err();
         assert!(err.contains("leading zero"), "got: {err}");
     }
@@ -3643,35 +3718,31 @@ mod tests {
     #[test]
     fn draft_wrap_rejects_k_tag_out_of_u16_range() {
         let d = uuid::Uuid::new_v4().to_string();
+        let ch = uuid::Uuid::new_v4().to_string();
         // 65536 = u16::MAX + 1
-        let ev = make_draft(&[&["d", &d], &["k", "65536"]], &fake_nip44_v2());
+        let ev = make_draft(
+            &[&["d", &d], &["k", "65536"], &["h", &ch]],
+            &fake_nip44_v2(),
+        );
         let err = validate_draft_wrap_envelope(&ev).unwrap_err();
         assert!(err.contains("range"), "got: {err}");
     }
 
-    // ── h / p outer-tag exclusion ─────────────────────────────────────────────
-
-    #[test]
-    fn draft_wrap_rejects_h_tag() {
-        let d = uuid::Uuid::new_v4().to_string();
-        let ev = make_draft(
-            &[
-                &["d", &d],
-                &["k", "9"],
-                &["h", &uuid::Uuid::new_v4().to_string()],
-            ],
-            &fake_nip44_v2(),
-        );
-        let err = validate_draft_wrap_envelope(&ev).unwrap_err();
-        assert!(err.contains("`h` tag"), "got: {err}");
-    }
+    // ── p outer-tag exclusion ─────────────────────────────────────────────────
+    // Note: `h` is now *required* (not forbidden); see h-tag validation section.
 
     #[test]
     fn draft_wrap_rejects_p_tag() {
         let d = uuid::Uuid::new_v4().to_string();
+        let ch = uuid::Uuid::new_v4().to_string();
         let keys = nostr::Keys::generate();
         let ev = make_draft(
-            &[&["d", &d], &["k", "9"], &["p", &keys.public_key().to_hex()]],
+            &[
+                &["d", &d],
+                &["k", "9"],
+                &["h", &ch],
+                &["p", &keys.public_key().to_hex()],
+            ],
             &fake_nip44_v2(),
         );
         let err = validate_draft_wrap_envelope(&ev).unwrap_err();
@@ -3683,7 +3754,8 @@ mod tests {
     #[test]
     fn draft_wrap_rejects_non_base64_content() {
         let d = uuid::Uuid::new_v4().to_string();
-        let ev = make_draft(&[&["d", &d], &["k", "9"]], "not-a-ciphertext");
+        let ch = uuid::Uuid::new_v4().to_string();
+        let ev = make_draft(&[&["d", &d], &["k", "9"], &["h", &ch]], "not-a-ciphertext");
         let err = validate_draft_wrap_envelope(&ev).unwrap_err();
         assert!(
             err.contains("base64") || err.contains("NIP-44"),
@@ -3694,9 +3766,10 @@ mod tests {
     #[test]
     fn draft_wrap_rejects_wrong_nip44_version_byte() {
         let d = uuid::Uuid::new_v4().to_string();
+        let ch = uuid::Uuid::new_v4().to_string();
         // 132 chars of valid base64 but version byte decodes to 0x00, not 0x02.
         let bad = "A".repeat(132);
-        let ev = make_draft(&[&["d", &d], &["k", "9"]], &bad);
+        let ev = make_draft(&[&["d", &d], &["k", "9"], &["h", &ch]], &bad);
         let err = validate_draft_wrap_envelope(&ev).unwrap_err();
         assert!(
             err.contains("NIP-44 v2") || err.contains("0x02"),
@@ -3708,7 +3781,8 @@ mod tests {
     fn draft_wrap_rejects_short_ciphertext() {
         // 1-byte decoded (version prefix only, no payload) — too short.
         let d = uuid::Uuid::new_v4().to_string();
-        let ev = make_draft(&[&["d", &d], &["k", "9"]], "Ag==");
+        let ch = uuid::Uuid::new_v4().to_string();
+        let ev = make_draft(&[&["d", &d], &["k", "9"], &["h", &ch]], "Ag==");
         let err = validate_draft_wrap_envelope(&ev).unwrap_err();
         assert!(err.contains("too short"), "got: {err}");
     }
@@ -3718,9 +3792,15 @@ mod tests {
     #[test]
     fn draft_wrap_accepts_valid_future_expiration() {
         let d = uuid::Uuid::new_v4().to_string();
+        let ch = uuid::Uuid::new_v4().to_string();
         // A timestamp far in the future (year 2100).
         let ev = make_draft(
-            &[&["d", &d], &["k", "9"], &["expiration", "4102444800"]],
+            &[
+                &["d", &d],
+                &["k", "9"],
+                &["h", &ch],
+                &["expiration", "4102444800"],
+            ],
             "",
         );
         assert!(
@@ -3732,10 +3812,12 @@ mod tests {
     #[test]
     fn draft_wrap_rejects_duplicate_expiration_tag() {
         let d = uuid::Uuid::new_v4().to_string();
+        let ch = uuid::Uuid::new_v4().to_string();
         let ev = make_draft(
             &[
                 &["d", &d],
                 &["k", "9"],
+                &["h", &ch],
                 &["expiration", "4102444800"],
                 &["expiration", "4102444800"],
             ],
@@ -3748,8 +3830,14 @@ mod tests {
     #[test]
     fn draft_wrap_rejects_expiration_in_past() {
         let d = uuid::Uuid::new_v4().to_string();
+        let ch = uuid::Uuid::new_v4().to_string();
         let ev = make_draft(
-            &[&["d", &d], &["k", "9"], &["expiration", "1000000000"]],
+            &[
+                &["d", &d],
+                &["k", "9"],
+                &["h", &ch],
+                &["expiration", "1000000000"],
+            ],
             "",
         );
         let err = validate_draft_wrap_envelope(&ev).unwrap_err();
@@ -3759,8 +3847,14 @@ mod tests {
     #[test]
     fn draft_wrap_rejects_non_decimal_expiration() {
         let d = uuid::Uuid::new_v4().to_string();
+        let ch = uuid::Uuid::new_v4().to_string();
         let ev = make_draft(
-            &[&["d", &d], &["k", "9"], &["expiration", "not-a-number"]],
+            &[
+                &["d", &d],
+                &["k", "9"],
+                &["h", &ch],
+                &["expiration", "not-a-number"],
+            ],
             "",
         );
         let err = validate_draft_wrap_envelope(&ev).unwrap_err();
@@ -3770,12 +3864,20 @@ mod tests {
     // ── routing invariants ────────────────────────────────────────────────────
 
     #[test]
-    fn draft_wrap_is_global_only() {
-        // Draft wraps must never be channel-scoped; compose context lives in
-        // the encrypted payload only.
+    fn draft_wrap_requires_h_channel_scope() {
+        // Draft wraps are channel-bound; compose context exposed via `h` tag.
         assert!(
-            is_global_only_kind(KIND_DRAFT),
-            "KIND_DRAFT must be global-only (no h-tag channel scope)"
+            requires_h_channel_scope(KIND_DRAFT),
+            "KIND_DRAFT must require an `h` tag (channel-bound)"
+        );
+    }
+
+    #[test]
+    fn draft_wrap_is_not_global_only() {
+        // Draft wraps have a required `h` tag — they are channel-scoped, not global.
+        assert!(
+            !is_global_only_kind(KIND_DRAFT),
+            "KIND_DRAFT must not be global-only (it requires an h tag)"
         );
     }
 
@@ -3789,11 +3891,56 @@ mod tests {
         );
     }
 
+    // ── h-tag validation ──────────────────────────────────────────────────────
+
     #[test]
-    fn draft_wrap_does_not_require_h_tag() {
+    fn draft_wrap_accepts_valid_h_tag_uuid() {
+        let d = uuid::Uuid::new_v4().to_string();
+        let ch = uuid::Uuid::new_v4().to_string();
+        let ev = make_draft(&[&["d", &d], &["k", "9"], &["h", &ch]], &fake_nip44_v2());
         assert!(
-            !requires_h_channel_scope(KIND_DRAFT),
-            "KIND_DRAFT must not require an h tag"
+            validate_draft_wrap_envelope(&ev).is_ok(),
+            "draft with valid UUID h tag must be accepted"
+        );
+    }
+
+    #[test]
+    fn draft_wrap_rejects_missing_h_tag() {
+        let d = uuid::Uuid::new_v4().to_string();
+        let ev = make_draft(&[&["d", &d], &["k", "9"]], &fake_nip44_v2());
+        let err = validate_draft_wrap_envelope(&ev).unwrap_err();
+        assert!(
+            err.contains("`h` tag") || err.contains("channel-bound"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn draft_wrap_rejects_duplicate_h_tag() {
+        let d = uuid::Uuid::new_v4().to_string();
+        let ch = uuid::Uuid::new_v4().to_string();
+        let ev = make_draft(
+            &[&["d", &d], &["k", "9"], &["h", &ch], &["h", &ch]],
+            &fake_nip44_v2(),
+        );
+        let err = validate_draft_wrap_envelope(&ev).unwrap_err();
+        assert!(
+            err.contains("`h` tag") || err.contains("channel-bound"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn draft_wrap_rejects_non_uuid_h_tag() {
+        let d = uuid::Uuid::new_v4().to_string();
+        let ev = make_draft(
+            &[&["d", &d], &["k", "9"], &["h", "not-a-uuid"]],
+            &fake_nip44_v2(),
+        );
+        let err = validate_draft_wrap_envelope(&ev).unwrap_err();
+        assert!(
+            err.contains("`h` tag") || err.contains("UUID"),
+            "got: {err}"
         );
     }
 }

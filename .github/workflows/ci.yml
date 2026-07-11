@@ -611,11 +611,12 @@ jobs:
         env:
           RELAY_URL: ws://localhost:3000
       - name: NIP-37 draft wrap e2e
-        # Feature e2e for NIP-37 draft wraps (kind:31234): write-path
-        # validation, NIP-01 replacement/tombstone ordering, author-only privacy
-        # across all read paths (WS REQ, WS COUNT, HTTP /query, /count, live
-        # fan-out), known-d privacy tripwires, FTS/NIP-50 exclusion, and NIP-11
-        # advertisement.
+        # Feature e2e for NIP-37 draft wraps (kind:31234), channel-bound
+        # contract: h-tag validation, channel existence + membership gates,
+        # immutable channel binding, author-only privacy (WS REQ, WS COUNT,
+        # HTTP /query, /count, live fan-out), known-d privacy tripwires,
+        # FTS/NIP-50 exclusion, workflow exclusion, tenant confinement, and
+        # NIP-11 advertisement.
         run: cargo test --profile ci -p buzz-test-client --test e2e_nip37_draft -- --ignored
         env:
           RELAY_URL: ws://localhost:3000

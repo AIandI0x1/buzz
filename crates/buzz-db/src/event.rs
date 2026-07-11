@@ -915,6 +915,38 @@ pub async fn get_latest_global_replaceable(
     }
 }
 
+/// Fetch the `channel_id` of the current NIP-33 head for a kind:31234 draft address.
+///
+/// Used by the relay ingest handler to enforce immutable channel binding: if a
+/// head already exists for `(community, author, 31234, d_tag)`, its `channel_id`
+/// must match the incoming event's `channel_id`. A draft cannot be re-bound to a
+/// different channel.
+///
+/// Returns `Ok(Some(Some(uuid)))` if a live head exists with a channel_id,
+/// `Ok(Some(None))` if a head exists but has NULL channel_id (should not happen
+/// in practice but handled defensively), `Ok(None)` if no live head exists,
+/// `Err` on database failure.
+pub async fn get_draft_head_channel_id(
+    pool: &PgPool,
+    community_id: CommunityId,
+    pubkey_bytes: &[u8],
+    d_tag: &str,
+) -> Result<Option<Option<Uuid>>> {
+    let row: Option<(Option<uuid::Uuid>,)> = sqlx::query_as(
+        "SELECT channel_id FROM events \
+         WHERE community_id = $1 AND kind = 31234 AND pubkey = $2 AND d_tag = $3 \
+         AND deleted_at IS NULL \
+         ORDER BY created_at DESC, id ASC LIMIT 1",
+    )
+    .bind(community_id.as_uuid())
+    .bind(pubkey_bytes)
+    .bind(d_tag)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|(ch,)| ch))
+}
+
 /// Fetches a single event by its raw 32-byte ID, **including soft-deleted rows**.
 ///
 /// Most callers should use [`get_event_by_id`] instead. This variant is needed
