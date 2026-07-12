@@ -2798,7 +2798,10 @@ impl Db {
     /// kind:31234 draft wrap, the function checks — **inside the advisory lock,
     /// before the stale-ordering step** — that the current head's `channel_id`
     /// equals the incoming `channel_id`.  If it differs the transaction is rolled
-    /// back and an `Err(DbError::DraftChannelMismatch)` is returned.
+    /// back and an `Err(DbError::DraftChannelMismatch)` is returned.  An incoming
+    /// `channel_id` of `None` is also rejected with `Err(DbError::DraftChannelRequired)`
+    /// — every draft wrap must be bound to a channel via `h` tag, and a `None`
+    /// here means the caller bypassed the ingest validator.
     ///
     /// The check is inferred from `event.kind` so no caller can supply a separate
     /// "expected" value that differs from the "stored" value — the API is
@@ -2903,6 +2906,13 @@ impl Db {
         // lock so the read-then-reject is atomic: no concurrent writer can slip a
         // different-channel head between the SELECT and our rollback.
         if buzz_core::kind::event_kind_u32(event) == buzz_core::kind::KIND_DRAFT {
+            // channel_id is required for all draft wraps. A None here means the
+            // caller bypassed the ingest validator (which enforces the `h` tag).
+            // Reject at the DB layer to keep the structural invariant self-contained.
+            if channel_id.is_none() {
+                tx.rollback().await?;
+                return Err(DbError::DraftChannelRequired);
+            }
             if let Some((_, _, head_channel_id)) = &existing {
                 if *head_channel_id != channel_id {
                     tx.rollback().await?;
@@ -4482,6 +4492,55 @@ mod tests {
             heads[0].channel_id,
             Some(winning_ch),
             "live head must be bound to the winning channel"
+        );
+    }
+
+    /// Direct `replace_parameterized_event(channel_id = None)` for a kind:31234
+    /// draft must be rejected with `DraftChannelRequired`, regardless of whether
+    /// a head already exists.  The DB-layer invariant must hold even when the
+    /// ingest pre-storage gate is bypassed.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn draft_without_channel_id_is_rejected_at_db_layer() {
+        let db = setup_db().await;
+        let community = CommunityId::from_uuid(make_community(&db.pool).await);
+        let keys = nostr::Keys::generate();
+        let d_tag = Uuid::new_v4().to_string();
+        let ch = Uuid::new_v4();
+        let now = nostr::Timestamp::now().as_secs();
+
+        // First call: no existing head, channel_id = None.
+        let draft = build_test_draft_at(&keys, &d_tag, &ch, now);
+        let result = db
+            .replace_parameterized_event(community, &draft, &d_tag, None)
+            .await;
+        assert!(
+            matches!(result, Err(DbError::DraftChannelRequired)),
+            "first write with channel_id=None must return DraftChannelRequired; got: {result:?}"
+        );
+
+        // Verify no head was persisted.
+        let heads = query_draft_head(&db, community, &keys, &d_tag).await;
+        assert!(
+            heads.is_empty(),
+            "no head must be stored after DraftChannelRequired rejection"
+        );
+
+        // Second call: establish a real head first, then try channel_id = None
+        // update to confirm the None-reject fires before the mismatch check.
+        let (_, inserted) = db
+            .replace_parameterized_event(community, &draft, &d_tag, Some(ch))
+            .await
+            .expect("first write with channel_id = Some must succeed");
+        assert!(inserted, "first write must be a new insertion");
+
+        let update = build_test_draft_at(&keys, &d_tag, &ch, now + 1);
+        let result2 = db
+            .replace_parameterized_event(community, &update, &d_tag, None)
+            .await;
+        assert!(
+            matches!(result2, Err(DbError::DraftChannelRequired)),
+            "update with channel_id=None must return DraftChannelRequired even when head exists; got: {result2:?}"
         );
     }
 }

@@ -629,6 +629,14 @@ jobs:
         run: cargo test --profile ci -p buzz-db -- draft --ignored
         env:
           DATABASE_URL: postgres://buzz:buzz_dev@localhost:5432/buzz
+      - name: buzz-search FTS integration tests
+        # Storage-layer FTS guarantee tests, including the NIP-37 draft exclusion:
+        # kind:31234 rows must have NULL search_tsv so they never surface in
+        # NIP-50 results regardless of content.  These tests are #[ignore]
+        # because they require a live Postgres; the CI job already provisions one.
+        run: cargo test --profile ci -p buzz-search --tests -- --include-ignored
+        env:
+          BUZZ_TEST_DATABASE_URL: postgres://buzz:buzz_dev@localhost:5432/buzz
       - name: Upload relay log
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

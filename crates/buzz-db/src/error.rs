@@ -57,6 +57,16 @@ pub enum DbError {
         "draft-wrap channel binding is immutable — `h` tag must match the existing head's channel"
     )]
     DraftChannelMismatch,
+
+    /// A kind:31234 draft-wrap was submitted without a channel binding.
+    ///
+    /// Every draft wrap requires a `channel_id` (resolved from the `h` tag
+    /// by ingest).  A `None` channel_id at the DB layer means the caller
+    /// bypassed the ingest validator and must be rejected.
+    #[error(
+        "draft-wrap channel_id is required — draft wraps must be bound to a channel via `h` tag"
+    )]
+    DraftChannelRequired,
 }
 
 /// Convenience alias for `Result<T, DbError>`.

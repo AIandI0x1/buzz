@@ -756,6 +756,35 @@ async fn test_draft_rejected_p_tag() {
 
 #[tokio::test]
 #[ignore]
+async fn test_draft_rejected_outer_e_tag() {
+    // Smoke test: outer `e` tag on a kind:31234 event must be rejected.
+    // Thread-reference context (reply-to, root) belongs inside the NIP-44
+    // encrypted payload — plain outer `e` tags would expose the fact that
+    // this draft is a reply/edit of a specific event to any relay reader.
+    let client = http_client();
+    let owner = Keys::generate();
+    let ch_id = create_open_channel(&owner).await;
+    let d = uuid::Uuid::new_v4().to_string();
+    let target_id = "0".repeat(64); // 64-char hex string representing a nonexistent event id
+    let event = nostr::EventBuilder::new(nostr::Kind::Custom(KIND_DRAFT), fake_nip44_v2())
+        .tags([
+            nostr::Tag::parse(["d", &d]).unwrap(),
+            nostr::Tag::parse(["k", "9"]).unwrap(),
+            nostr::Tag::parse(["h", &ch_id]).unwrap(),
+            nostr::Tag::parse(["e", &target_id]).unwrap(),
+        ])
+        .sign_with_keys(&owner)
+        .unwrap();
+    let (accepted, msg) = submit_event_http(&client, &owner, &event).await;
+    assert!(!accepted, "outer `e` tag on draft should be rejected");
+    assert!(
+        msg.contains("e` tag") || msg.contains("e tag"),
+        "unexpected rejection message: {msg}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
 async fn test_draft_rejected_malformed_ciphertext() {
     let client = http_client();
     let owner = Keys::generate();
@@ -1521,6 +1550,66 @@ async fn test_draft_author_can_count_own_drafts_http() {
     assert!(count >= 1, "author must count at least 1 own draft");
 }
 
+#[tokio::test]
+#[ignore]
+async fn test_draft_attacker_mixed_kinds_count_excludes_drafts() {
+    // A mixed-kinds COUNT filter (e.g. kinds=[9,31234]) from a non-author must
+    // count only the public events — the kind:31234 draft must not be included.
+    // This exercises the per-event fallback path in handle_count where the
+    // reader_can_receive_event gate runs for each row in a mixed-kinds result.
+    let client = http_client();
+    let victim = Keys::generate();
+    let attacker = Keys::generate();
+    let ch_id = create_open_channel(&victim).await;
+    let d = uuid::Uuid::new_v4().to_string();
+
+    // Victim submits one kind:9 channel message and one kind:31234 draft.
+    let msg = EventBuilder::new(Kind::Custom(9), "hello")
+        .tags([Tag::parse(["h", &ch_id]).unwrap()])
+        .sign_with_keys(&victim)
+        .unwrap();
+    let (ok_m, err_m) = submit_event_http(&client, &victim, &msg).await;
+    assert!(ok_m, "kind:9 message must be accepted: {err_m}");
+
+    let draft = build_draft(&victim, &d, "9", &ch_id, &fake_nip44_v2());
+    let (ok_d, err_d) = submit_event_http(&client, &victim, &draft).await;
+    assert!(ok_d, "draft must be accepted: {err_d}");
+
+    // Attacker COUNTs with a mixed kinds=[9,31234] filter via HTTP /count.
+    // Should be allowed (kindless-mixed filter is not exclusively author-only)
+    // but the kind:31234 must be excluded from the count.
+    let url = relay_url();
+    let filter = serde_json::json!({
+        "kinds": [9, KIND_DRAFT],
+        "authors": [victim.public_key().to_hex()],
+    });
+    let resp = client
+        .post(format!(
+            "{}/count",
+            url.replace("ws://", "http://")
+                .replace("wss://", "https://")
+        ))
+        .header("X-Pubkey", &attacker.public_key().to_hex())
+        .header("Content-Type", "application/json")
+        .json(&vec![filter])
+        .send()
+        .await
+        .expect("count request");
+    assert!(
+        resp.status().is_success(),
+        "mixed-kinds /count must succeed for attacker, got: {}",
+        resp.status()
+    );
+    let body: Value = resp.json().await.expect("parse count response");
+    let count = body["count"].as_u64().unwrap_or(0);
+    // The attacker sees at most 1 (the kind:9 message). The kind:31234 draft
+    // must NOT be included.
+    assert!(
+        count <= 1,
+        "mixed-kinds count for non-author must not include kind:31234 drafts; got count={count}"
+    );
+}
+
 // ─── HTTP /query exclusive-author privacy ────────────────────────────────────
 
 #[tokio::test]
@@ -1627,6 +1716,53 @@ async fn test_draft_live_fanout_only_reaches_author() {
     ac.disconnect().await.expect("disconnect");
 }
 
+#[tokio::test]
+#[ignore]
+async fn test_draft_live_fanout_reaches_author_own_subscription() {
+    // Positive-control companion to test_draft_live_fanout_only_reaches_author:
+    // the AUTHOR themselves MUST receive their own draft via live fan-out when
+    // they have an active subscription for it.  This proves the author-only
+    // gate is a filter (not a kill-switch) and doesn't silently break delivery
+    // to the author.
+    let url = relay_url();
+    let client = http_client();
+    let author = Keys::generate();
+    let ch_id = create_open_channel(&author).await;
+    let d = uuid::Uuid::new_v4().to_string();
+
+    // Author opens a subscription with limit:0 (skip historical, live only).
+    let mut ac = BuzzTestClient::connect(&url, &author)
+        .await
+        .expect("connect author");
+    let sid = sub_id("fanout-author-self");
+    let filter = Filter::new()
+        .kind(Kind::Custom(KIND_DRAFT))
+        .author(author.public_key())
+        .limit(0);
+    ac.subscribe(&sid, vec![filter])
+        .await
+        .expect("subscribe author draft filter");
+    let _ = ac.collect_until_eose(&sid, Duration::from_secs(3)).await;
+
+    // Author submits their own draft.
+    let draft = build_draft(&author, &d, "9", &ch_id, &fake_nip44_v2());
+    let draft_id = draft.id;
+    let (ok, msg) = submit_event_http(&client, &author, &draft).await;
+    assert!(ok, "author's draft must be accepted: {msg}");
+
+    // Author's own subscription must deliver the draft via fan-out.
+    let received = ac
+        .recv_event(Duration::from_secs(5))
+        .await
+        .expect("author must receive their own draft via fan-out");
+    let got_draft = matches!(&received, RelayMessage::Event { event, .. } if event.id == draft_id);
+    assert!(
+        got_draft,
+        "author's own subscription must receive their draft via live fan-out; got: {received:?}"
+    );
+    ac.disconnect().await.expect("disconnect");
+}
+
 // ─── Nonexistent / alien channel rejection ────────────────────────────────────
 
 // NOTE: test_draft_rejected_nonexistent_channel_h_tag (at the top of this file)
@@ -1697,14 +1833,76 @@ async fn test_draft_not_returned_in_kindless_channel_query_by_attacker() {
 
 #[tokio::test]
 #[ignore]
-async fn test_draft_not_indexed_in_fts_search() {
-    // A kind:31234 has NULL search_tsv at the storage layer, so NIP-50 search
-    // must never surface it — even when the requester is the author.
+async fn test_draft_not_returned_in_kindless_channel_http_query() {
+    // HTTP bridge catchall /query mirror of the WS kindless h-tag test above.
+    // Exercises bridge.rs catchall path (distinct from req.rs), proving the
+    // reader_can_receive_event gate is live there.
     //
-    // The test explicitly uses kinds=[1,31234] in the search filter so the query
-    // cannot be satisfied by the read-gate alone: if kind:31234 had a non-NULL
-    // tsvector matching the token, the relay would return it to the authorized
-    // author.  NULL tsvector is the only thing that hides it.
+    // Non-author queries the channel with a kindless h-tag filter via HTTP
+    // /query.  Kind:9 message must appear (positive control); kind:31234 draft
+    // must be absent.
+    let client = http_client();
+    let owner = Keys::generate();
+    let attacker = Keys::generate();
+    let ch_id = create_open_channel(&owner).await;
+    let d = uuid::Uuid::new_v4().to_string();
+
+    let draft = build_draft(&owner, &d, "9", &ch_id, &fake_nip44_v2());
+    let draft_id = draft.id;
+    let (ok, msg) = submit_event_http(&client, &owner, &draft).await;
+    assert!(ok, "draft must be accepted: {msg}");
+
+    // Publish a public channel message for use as a positive control.
+    let msg_event = EventBuilder::new(Kind::Custom(9), "hello http channel")
+        .tags([Tag::parse(["h", &ch_id]).unwrap()])
+        .sign_with_keys(&owner)
+        .unwrap();
+    let msg_id = msg_event.id;
+    let (ok_m, msg_m) = submit_event_http(&client, &owner, &msg_event).await;
+    assert!(ok_m, "channel message must be accepted: {msg_m}");
+
+    // Kindless h-tag filter over HTTP /query as non-author.
+    let kindless_filter = Filter::new().custom_tag(
+        nostr::SingleLetterTag::lowercase(nostr::Alphabet::H),
+        ch_id.as_str(),
+    );
+    let results = query_events_http(
+        &client,
+        &attacker.public_key().to_hex(),
+        vec![kindless_filter],
+    )
+    .await;
+
+    // Kind:9 message must appear — proves the subscription is live.
+    assert!(
+        results
+            .iter()
+            .any(|e| e["id"].as_str() == Some(&msg_id.to_hex())),
+        "kind:9 channel message must appear in HTTP kindless query (positive control)"
+    );
+    // Draft must be absent — bridge.rs catchall author-only gate must suppress it.
+    assert!(
+        !results
+            .iter()
+            .any(|e| e["id"].as_str() == Some(&draft_id.to_hex())),
+        "kind:31234 draft must not appear in non-author HTTP kindless channel query"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_draft_not_indexed_in_fts_search() {
+    // Proves the search surface returns no drafts: the HTTP /query search path
+    // is exercised with a mixed kinds=[1,31234] filter, and the kind:31234 is
+    // absent from results.
+    //
+    // This test CANNOT prove the NULL-tsvector storage guarantee by itself:
+    // draft content is a NIP-44 ciphertext, so the search token could never
+    // appear in stored content regardless of the tsvector column.  The
+    // storage-layer guarantee (search_tsv = NULL for all kind:31234 rows) is
+    // owned by `crates/buzz-search/tests/fts_integration.rs`.  This e2e test
+    // only proves the search read-path returns no draft rows — a necessary
+    // complement that exercises the HTTP bridge search branch end-to-end.
     let client = http_client();
     let victim = Keys::generate();
     let attacker = Keys::generate();
@@ -1723,16 +1921,17 @@ async fn test_draft_not_indexed_in_fts_search() {
     let (ok_note, msg_note) = submit_event_http(&client, &victim, &note).await;
     assert!(ok_note, "control note must be accepted: {msg_note}");
 
-    // Kind:31234 draft — NIP-44 v2 content (relay validates).  Storage migration
-    // sets search_tsv = NULL for all kind:31234 rows, so even a theoretically
-    // searchable payload must not surface in FTS results.
+    // Kind:31234 draft — NIP-44 v2 content (relay validates). The draft
+    // content is a ciphertext and cannot contain the plaintext token; the
+    // search_tsv is also NULL at the storage layer (fts_integration.rs owns
+    // that guarantee).  Either property would prevent this draft from surfacing.
     let draft = build_draft(&victim, &d, "9", &ch_id, &fake_nip44_v2());
     let draft_id = draft.id;
     let (ok_d, msg_d) = submit_event_http(&client, &victim, &draft).await;
     assert!(ok_d, "draft must be accepted: {msg_d}");
 
-    // Search as the author with explicit kinds=[1,31234].  The kind:31234 draft
-    // is excluded by NULL search_tsv; the kind:1 note IS found.
+    // Search as the author with explicit kinds=[1,31234].  The kind:1 note IS
+    // found (positive control); the kind:31234 draft is absent.
     let search_filter = Filter::new()
         .kinds(vec![Kind::TextNote, Kind::Custom(KIND_DRAFT)])
         .search(&token)
@@ -2259,6 +2458,101 @@ async fn test_draft_accepted_and_replaced_in_dm_channel() {
     );
 }
 
+#[tokio::test]
+#[ignore]
+async fn test_dm_draft_not_readable_by_dm_recipient() {
+    // Regression guard (Q13): Alice opens a DM with Bob and writes a draft to
+    // that DM channel.  Bob (the DM recipient and channel member) must NOT be
+    // able to read Alice's draft — drafts are author-only regardless of
+    // channel membership.  The test queries from Bob's perspective to prove
+    // the author-only guard fires on the recipient-side, not just on arbitrary
+    // third parties.
+    let client = http_client();
+    let alice = Keys::generate();
+    let bob = Keys::generate();
+
+    // Alice opens a DM with Bob — relay creates the DM channel UUID.
+    let dm_event = EventBuilder::new(Kind::Custom(41010), "")
+        .tags([Tag::parse(["p", &bob.public_key().to_hex()]).unwrap()])
+        .sign_with_keys(&alice)
+        .unwrap();
+    let resp = client
+        .post(format!("{}/events", relay_http_url()))
+        .header("X-Pubkey", &alice.public_key().to_hex())
+        .header("Content-Type", "application/json")
+        .body(serde_json::to_string(&dm_event).unwrap())
+        .send()
+        .await
+        .expect("open DM");
+    let body: Value = resp.json().await.expect("parse DM response");
+    assert!(
+        body["accepted"].as_bool().unwrap_or(false),
+        "DM open must be accepted: {body}"
+    );
+    let msg = body["message"].as_str().unwrap_or("");
+    let dm_channel_id = if let Some(stripped) = msg.strip_prefix("response:") {
+        let parsed: Value = serde_json::from_str(stripped).expect("response JSON");
+        parsed["channel_id"]
+            .as_str()
+            .expect("channel_id in DM response")
+            .to_string()
+    } else {
+        panic!("DM open response must contain channel_id; got: {msg:?}");
+    };
+
+    // Alice writes a draft to the DM channel.
+    let d = uuid::Uuid::new_v4().to_string();
+    let draft = build_draft(&alice, &d, "9", &dm_channel_id, &fake_nip44_v2());
+    let draft_id = draft.id;
+    let (ok, err) = submit_event_http(&client, &alice, &draft).await;
+    assert!(ok, "Alice's draft must be accepted: {err}");
+
+    // Bob queries the DM channel as a member (recipient-side query).
+    // He should NOT see Alice's draft — drafts are author-only.
+    let filter = Filter::new()
+        .kind(Kind::Custom(KIND_DRAFT))
+        .author(alice.public_key())
+        .custom_tag(
+            nostr::SingleLetterTag::lowercase(nostr::Alphabet::D),
+            d.as_str(),
+        );
+    let resp2 = client
+        .post(format!("{}/query", relay_http_url()))
+        .header("X-Pubkey", &bob.public_key().to_hex())
+        .header("Content-Type", "application/json")
+        .json(&vec![filter])
+        .send()
+        .await
+        .expect("Bob query");
+    assert_eq!(
+        resp2.status().as_u16(),
+        403,
+        "Bob (DM recipient) must get 403 querying Alice's draft; got: {}",
+        resp2.status()
+    );
+
+    // Verify Alice herself can still read it (positive control).
+    let filter2 = Filter::new()
+        .kind(Kind::Custom(KIND_DRAFT))
+        .author(alice.public_key())
+        .custom_tag(
+            nostr::SingleLetterTag::lowercase(nostr::Alphabet::D),
+            d.as_str(),
+        );
+    let alice_results =
+        query_events_http(&client, &alice.public_key().to_hex(), vec![filter2]).await;
+    assert_eq!(
+        alice_results.len(),
+        1,
+        "Alice must be able to read her own DM draft (positive control)"
+    );
+    assert_eq!(
+        alice_results[0]["id"].as_str().unwrap(),
+        draft_id.to_hex(),
+        "Alice's query must return her draft"
+    );
+}
+
 // ─── Removed-member read denial ──────────────────────────────────────────────
 
 #[tokio::test]
@@ -2578,4 +2872,184 @@ async fn test_channel_window_draft_visible_to_author() {
         bounds_count, 1,
         "exactly one 39006 bounds overlay required: {events:?}"
     );
+}
+
+/// Q16: channel-window cursor-boundary variant.
+///
+/// Posts more messages than the `limit` so the window response includes a
+/// `next_cursor`, then verifies:
+/// 1. `next_cursor` ids never contain a draft id (draft-excluded row set).
+/// 2. Paginating with the cursor returns only public messages and remains gapless.
+/// 3. Drafts are excluded from both pages and from every id in the overlay.
+///
+/// This is the exact mutate-bite scenario the whole review run hunted:
+/// a future regression that moves the author-only filter after pagination
+/// would either leak a draft id in `next_cursor` or create a gap on page 2.
+#[tokio::test]
+#[ignore]
+async fn test_channel_window_cursor_boundary_excludes_draft() {
+    let client = http_client();
+    let author = Keys::generate();
+    let attacker = Keys::generate();
+    let ch_id = create_open_channel(&author).await;
+    add_member_http(&client, &author, &ch_id, &attacker).await;
+
+    // Post 3 public kind:9 messages with strictly increasing timestamps.
+    // Then post a draft between message 1 and 2 (same second as msg-1 so it
+    // sits in the middle of the window) to make it straddle the cursor
+    // boundary when limit=2.
+    let base_ts = nostr::Timestamp::now().as_secs() - 10;
+    let mut msg_ids = Vec::new();
+    for i in 0..3u64 {
+        let ts = nostr::Timestamp::from(base_ts + i * 2); // spread 0, 2, 4 seconds
+        let msg = nostr::EventBuilder::new(nostr::Kind::Custom(9), format!("msg-{i}"))
+            .tags([nostr::Tag::parse(["h", &ch_id]).unwrap()])
+            .custom_created_at(ts)
+            .sign_with_keys(&author)
+            .unwrap();
+        msg_ids.push(msg.id.to_hex());
+        let (ok, err) = submit_event_http(&client, &author, &msg).await;
+        assert!(ok, "kind:9 message {i} must be accepted: {err}");
+    }
+
+    // Post a draft with a timestamp between msg-0 and msg-1 so it lands in
+    // the middle of the window (created_at = base_ts + 1).
+    let d = uuid::Uuid::new_v4().to_string();
+    let draft_ts = nostr::Timestamp::from(base_ts + 1);
+    let draft = nostr::EventBuilder::new(nostr::Kind::Custom(KIND_DRAFT), fake_nip44_v2())
+        .tags([
+            nostr::Tag::parse(["d", &d]).unwrap(),
+            nostr::Tag::parse(["k", "9"]).unwrap(),
+            nostr::Tag::parse(["h", &ch_id]).unwrap(),
+        ])
+        .custom_created_at(draft_ts)
+        .sign_with_keys(&author)
+        .unwrap();
+    let draft_id = draft.id.to_hex();
+    let (ok_d, err_d) = submit_event_http(&client, &author, &draft).await;
+    assert!(ok_d, "draft must be accepted: {err_d}");
+
+    // Page 1: limit=2 as the attacker.  Response must have has_more=true and a
+    // next_cursor.  No draft id must appear anywhere (rows, overlay, aux).
+    let page1_filter = serde_json::json!({
+        "kinds": [9, KIND_DRAFT],
+        "#h": [ch_id],
+        "top_level": true,
+        "limit": 2,
+        "include_aux": true,
+        "include_summaries": false,
+    });
+    let resp1 = client
+        .post(format!("{}/query", relay_http_url()))
+        .header("X-Pubkey", &attacker.public_key().to_hex())
+        .header("Content-Type", "application/json")
+        .body(serde_json::to_string(&serde_json::json!([page1_filter])).unwrap())
+        .send()
+        .await
+        .expect("page 1 window query");
+    assert!(resp1.status().is_success(), "page 1 must succeed");
+    let page1_events: Vec<Value> = resp1.json().await.expect("page 1 parse");
+
+    // Collect all ids present in page 1 (rows + overlays + aux).
+    let page1_ids: Vec<String> = page1_events
+        .iter()
+        .flat_map(|e| {
+            let mut ids = vec![];
+            if let Some(id) = e["id"].as_str() {
+                ids.push(id.to_string());
+            }
+            // 39006 overlay content may embed next_cursor.id — check content too.
+            if e["kind"].as_u64() == Some(39006) {
+                if let Some(content_str) = e["content"].as_str() {
+                    if let Ok(content) = serde_json::from_str::<Value>(content_str) {
+                        if let Some(cursor_id) = content
+                            .get("next_cursor")
+                            .and_then(|c| c.get("id"))
+                            .and_then(|v| v.as_str())
+                        {
+                            ids.push(cursor_id.to_string());
+                        }
+                    }
+                }
+            }
+            ids
+        })
+        .collect();
+
+    assert!(
+        !page1_ids.iter().any(|id| id == &draft_id),
+        "draft id must not appear anywhere in page 1: draft_id={draft_id}, page1={page1_events:?}"
+    );
+
+    // Extract next_cursor from the 39006 overlay.
+    let overlay1 = page1_events
+        .iter()
+        .find(|e| e["kind"].as_u64() == Some(39006));
+    let cursor = overlay1.and_then(|o| {
+        let content: Value = serde_json::from_str(o["content"].as_str()?).ok()?;
+        let has_more = content["has_more"].as_bool().unwrap_or(false);
+        if !has_more {
+            return None;
+        }
+        let cursor_ts = content["next_cursor"]["created_at"].as_i64()?;
+        let cursor_id = content["next_cursor"]["id"].as_str()?.to_string();
+        Some((cursor_ts, cursor_id))
+    });
+
+    // If the relay returned has_more=true and a cursor, paginate to page 2
+    // and verify the second page also contains no draft id.
+    if let Some((cursor_ts, cursor_id)) = cursor {
+        // The cursor must not be the draft id.
+        assert_ne!(
+            cursor_id, draft_id,
+            "next_cursor.id must not be the draft id — cursor must be computed on the \
+             draft-excluded row set"
+        );
+
+        let page2_filter = serde_json::json!({
+            "kinds": [9, KIND_DRAFT],
+            "#h": [ch_id],
+            "top_level": true,
+            "limit": 2,
+            "until": cursor_ts,
+            "before_id": cursor_id,
+            "include_aux": true,
+            "include_summaries": false,
+        });
+        let resp2 = client
+            .post(format!("{}/query", relay_http_url()))
+            .header("X-Pubkey", &attacker.public_key().to_hex())
+            .header("Content-Type", "application/json")
+            .body(serde_json::to_string(&serde_json::json!([page2_filter])).unwrap())
+            .send()
+            .await
+            .expect("page 2 window query");
+        assert!(resp2.status().is_success(), "page 2 must succeed");
+        let page2_events: Vec<Value> = resp2.json().await.expect("page 2 parse");
+
+        let page2_ids: Vec<String> = page2_events
+            .iter()
+            .filter_map(|e| e["id"].as_str().map(|s| s.to_string()))
+            .collect();
+        assert!(
+            !page2_ids.iter().any(|id| id == &draft_id),
+            "draft id must not appear in page 2: draft_id={draft_id}, page2={page2_events:?}"
+        );
+
+        // Gapless invariant: the two pages together cover all 3 public messages.
+        let all_msg_ids: std::collections::HashSet<String> = page1_ids
+            .iter()
+            .chain(page2_ids.iter())
+            .filter(|id| msg_ids.contains(id))
+            .cloned()
+            .collect();
+        assert_eq!(
+            all_msg_ids.len(),
+            3,
+            "all 3 public messages must appear across both pages with no gaps; \
+             got: page1={page1_ids:?}, page2={page2_ids:?}"
+        );
+    }
+    // If has_more=false, all 3 messages fit in one page — cursor test skipped,
+    // but the no-draft assertion above already passed.
 }

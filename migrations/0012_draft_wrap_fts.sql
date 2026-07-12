@@ -10,6 +10,12 @@
 -- We must DROP the generated column and re-ADD it with the extended exclusion
 -- list; ALTER COLUMN cannot change a GENERATED expression in Postgres.
 --
+-- DEPLOY NOTE: the DROP + re-ADD below acquires ACCESS EXCLUSIVE on `events`
+-- for the duration of the migration, blocking all reads and writes to the
+-- table. The GIN index rebuild that follows is a full table scan. On large
+-- deployments this migration should run during a scheduled maintenance window.
+-- This is the same shape as migration 0005 and was accepted as precedent.
+--
 -- Final kind exclusion list after this migration:
 --   1059   = KIND_GIFT_WRAP                  (NIP-17 ciphertext)
 --   30300  = KIND_EVENT_REMINDER             (AUTHOR_ONLY_KINDS — defense in depth)

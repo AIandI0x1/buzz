@@ -32,6 +32,36 @@ pub fn reader_authorized_for_event(event: &nostr::Event, reader_pubkey_hex: &str
         .any(|t| t.content() == Some(reader_pubkey_hex))
 }
 
+/// Returns `true` if the event is an author-only kind and the requester is NOT
+/// the author. Used as a per-event filter during historical delivery and fan-out
+/// to silently omit unauthorized events from mixed-kind result sets.
+pub fn is_author_only_event(event: &nostr::Event, requester_pubkey_bytes: &[u8]) -> bool {
+    let kind_u32 = crate::kind::event_kind_u32(event);
+    crate::kind::AUTHOR_ONLY_KINDS.contains(&kind_u32)
+        && event.pubkey.to_bytes() != requester_pubkey_bytes
+}
+
+/// Canonical per-event read-authorization gate: combines `reader_authorized_for_event`
+/// (p-gated/result-gated kinds) and `is_author_only_event` (author-private kinds)
+/// into a single predicate.
+///
+/// Every delivery surface — WS historical pull, WS fan-out, HTTP bridge (all
+/// branches: feed, thread, search, catchall, channel-window), and COUNT fallback
+/// — must pass each event through this function before serializing it to the wire.
+/// Using one canonical gate instead of composing the two predicates at each call
+/// site prevents future read surfaces from accidentally omitting half the privacy
+/// model.
+///
+/// Returns `true` if `reader` MAY receive the event.
+pub fn reader_can_receive_event(
+    event: &nostr::Event,
+    reader_pubkey_hex: &str,
+    reader_pubkey_bytes: &[u8],
+) -> bool {
+    reader_authorized_for_event(event, reader_pubkey_hex)
+        && !is_author_only_event(event, reader_pubkey_bytes)
+}
+
 fn filter_match_one(f: &Filter, ev: &StoredEvent) -> bool {
     if let Some(kinds) = &f.kinds {
         if !kinds.contains(&ev.event.kind) {

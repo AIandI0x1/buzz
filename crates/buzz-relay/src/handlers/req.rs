@@ -368,16 +368,14 @@ pub async fn handle_req(
                 }
             }
 
-            // Result-level read auth: a viewer-private snapshot (kind:30622) is
-            // delivered only to its owner, even if reached via a kindless
-            // `ids:[…]` subscription that skips the filter-level `#p` gate.
-            if !buzz_core::filter::reader_authorized_for_event(&stored.event, &viewer_hex) {
-                continue;
-            }
-
-            // Author-only kinds: only the event author may see these events.
-            // Mixed-kind filters still serve other kinds normally.
-            if is_author_only_event(&stored.event, &pubkey_bytes) {
+            // Canonical per-event read gate: covers result-gated (p-owned) kinds
+            // and author-only kinds in a single call so no delivery surface can
+            // accidentally omit half the privacy model.
+            if !buzz_core::filter::reader_can_receive_event(
+                &stored.event,
+                &viewer_hex,
+                &pubkey_bytes,
+            ) {
                 continue;
             }
 
@@ -693,13 +691,11 @@ async fn handle_search_req(
                             continue;
                         }
                     }
-                    if !buzz_core::filter::reader_authorized_for_event(
+                    if !buzz_core::filter::reader_can_receive_event(
                         &stored.event,
                         reader_pubkey_hex,
+                        reader_pubkey_bytes,
                     ) {
-                        continue;
-                    }
-                    if is_author_only_event(&stored.event, reader_pubkey_bytes) {
                         continue;
                     }
                     // Dedup AFTER acceptance — an event that fails filter A's constraints
@@ -1132,7 +1128,7 @@ pub(crate) fn filter_can_match_result_gated_kinds(filter: &Filter) -> bool {
 /// `{kinds:[44200], #p:[self]}`.
 ///
 /// When this returns `false`, the COUNT handler MUST use the per-event fallback
-/// and apply `reader_authorized_for_event` on each row.
+/// and apply `reader_can_receive_event` on each row.
 pub(crate) fn result_gated_count_safe_for_pushdown(
     filter: &Filter,
     authed_pubkey_hex: &str,
@@ -1142,14 +1138,6 @@ pub(crate) fn result_gated_count_safe_for_pushdown(
         .generic_tags
         .get(&p_tag)
         .is_some_and(|values| !values.is_empty() && values.iter().all(|v| v == authed_pubkey_hex))
-}
-
-/// Returns `true` if the event is an author-only kind and the requester is NOT
-/// the author. Used as a per-event filter during historical delivery and fan-out
-/// to silently omit unauthorized events from mixed-kind result sets.
-pub(crate) fn is_author_only_event(event: &nostr::Event, requester_pubkey_bytes: &[u8]) -> bool {
-    let kind_u32 = event.kind.as_u16() as u32;
-    AUTHOR_ONLY_KINDS.contains(&kind_u32) && event.pubkey.to_bytes() != requester_pubkey_bytes
 }
 
 /// Pre-filter authorization for filters that exclusively target author-only kinds.
@@ -1438,7 +1426,7 @@ mod tests {
         // Case 2: kindless {ids:[...]} — the existing ids exemption applies
         // at this filter-authorization gate (consistent with other p-gated kinds).
         // The kindless path is closed at the result level by
-        // `reader_authorized_for_event` (buzz-core/src/filter.rs), which gates
+        // `reader_can_receive_event` (buzz-core/src/filter.rs), which gates
         // kind:44200 delivery to the #p owner across all pull paths (WS historical,
         // HTTP bridge) and live fan-out. Pass-through here is correct; the
         // result-level gate is the enforcement point for this path.

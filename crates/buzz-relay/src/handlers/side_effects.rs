@@ -216,6 +216,36 @@ pub async fn validate_standard_deletion_event(
             .await?
             .ok_or_else(|| anyhow::anyhow!("target event not found"))?;
 
+        // Author-only kinds (drafts, reminders): mask existence for non-authors.
+        // The authz check below produces "must be event author" for a real event
+        // vs "target event not found" for a random id — that differential IS an
+        // oracle.  Placing the author-only check before authz ensures that a
+        // non-author/non-agent-owner receives "target event not found" regardless,
+        // collapsing the oracle.  The author falls through to the informative
+        // tombstone-guidance error below.
+        if buzz_core::kind::AUTHOR_ONLY_KINDS
+            .contains(&buzz_core::kind::event_kind_u32(&target_event.event))
+        {
+            let draft_author =
+                effective_message_author(&target_event.event, &state.relay_keypair.public_key());
+            let is_owner = state
+                .db
+                .is_agent_owner(tenant.community(), &draft_author, &actor_bytes)
+                .await
+                .unwrap_or(false);
+            if draft_author != actor_bytes && !is_owner {
+                // Non-author: respond byte-identical to the missing-target branch.
+                return Err(anyhow::anyhow!("target event not found"));
+            }
+            // Author or agent-owner: informative tombstone-guidance error.
+            return Err(anyhow::anyhow!(
+                "NIP-09 e-tag deletion of kind:{} events is not supported; \
+                 use an empty-content tombstone (kind:{} with empty content) instead",
+                buzz_core::kind::event_kind_u32(&target_event.event),
+                buzz_core::kind::event_kind_u32(&target_event.event),
+            ));
+        }
+
         let target_author =
             effective_message_author(&target_event.event, &state.relay_keypair.public_key());
         if target_author != actor_bytes
@@ -225,20 +255,6 @@ pub async fn validate_standard_deletion_event(
                 .await?
         {
             return Err(anyhow::anyhow!("must be event author"));
-        }
-
-        // NIP-37: kind:5 e-tag deletion of kind:31234 draft wraps is not
-        // supported.  Accepting it would erase the live head row, enabling a
-        // subsequent write to rebind the immutable (community, author, kind, d)
-        // address to a different channel.  The correct deletion mechanism is an
-        // empty-content tombstone (kind:31234 with "" content).
-        // Check is placed after authz so the relay does not reveal draft
-        // existence to callers who do not own the target event.
-        if event_kind_u32(&target_event.event) == KIND_DRAFT {
-            return Err(anyhow::anyhow!(
-                "NIP-09 e-tag deletion of kind:31234 draft wraps is not supported; \
-                 use an empty-content tombstone (kind:31234 with empty content) instead"
-            ));
         }
     }
 
@@ -2030,12 +2046,21 @@ async fn handle_a_tag_deletion(
     let actor_bytes = effective_message_author(event, &state.relay_keypair.public_key());
 
     match kind_num {
-        // NIP-37 draft wraps use an empty-content tombstone (kind:31234 with ""
-        // content) for deletion — they do NOT use NIP-09 a-tag soft-deletion.
-        // Accepting a NIP-09 a-tag soft-delete would erase the head row, after
-        // which a different-channel write would see no existing head and bypass
-        // the immutable-binding invariant.  Reject with an error so the
-        // caller can surface it as a validation failure.
+        // Defensive guard: draft wraps (kind:31234) do NOT use NIP-09 a-tag
+        // soft-deletion — they use an empty-content tombstone (a replacement
+        // write with empty content) instead.  Accepting an a-tag soft-delete
+        // would erase the head row and allow a different-channel write to
+        // rebind the (author, d_tag) address, breaking the immutable-binding
+        // invariant.
+        //
+        // This branch is unreachable via normal ingest: the pre-storage gate at
+        // `ingest.rs` rejects any NIP-09 kind:5 event whose a-tag targets
+        // kind:31234 before it is ever stored.  This guard is a second-line
+        // defensive check in case side_effects is called from a future path
+        // that bypasses the pre-storage gate.  It does NOT surface as a
+        // client-facing validation error — errors returned by side-effect
+        // handlers after storage are logged only (callers do not propagate
+        // them to the client).
         buzz_core::kind::KIND_DRAFT => {
             return Err(anyhow::anyhow!(
                 "NIP-09 a-tag deletion of kind:31234 draft wraps is not supported; \

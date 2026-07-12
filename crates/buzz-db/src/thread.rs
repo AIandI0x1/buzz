@@ -563,11 +563,11 @@ pub async fn get_thread_summary(
 /// and never reaches the wire; callers must not re-derive exhaustion from row
 /// counts (`rows < limit` proves nothing on an exact-multiple final page).
 ///
-/// `author_pubkey`: when `Some`, author-only kinds (kind:31234 drafts,
-/// kind:30300 reminders) are excluded for rows whose `pubkey` does not match.
-/// Pass the authenticated requester's pubkey bytes on all bridge read paths.
-/// `None` skips the filter (internal/test callers that don't need author-only
-/// visibility control).
+/// `author_pubkey`: when `Some`, author-only kinds (as listed in
+/// `buzz_core::kind::AUTHOR_ONLY_KINDS`) are excluded for rows whose `pubkey`
+/// does not match the requester. Pass the authenticated requester's pubkey bytes
+/// on all bridge read paths. `None` skips the filter (internal/test callers
+/// that don't need author-only visibility control).
 pub async fn get_channel_window(
     pool: &PgPool,
     community_id: CommunityId,
@@ -638,10 +638,16 @@ pub async fn get_channel_window(
     // leave those values pointing at or counting draft rows for non-authors.
     if author_pubkey.is_some() {
         let pk_idx = param_idx;
-        // KIND_AUTHOR_ONLY list kept in sync with buzz_core::kind::AUTHOR_ONLY_KINDS
-        // (30300 = KIND_EVENT_REMINDER, 31234 = KIND_DRAFT).
+        // Derive the exclusion list from AUTHOR_ONLY_KINDS (buzz_core) so that
+        // adding a new author-only kind in one place automatically extends this
+        // filter without a separate hardcoded list here.
+        let ao_list = buzz_core::kind::AUTHOR_ONLY_KINDS
+            .iter()
+            .map(|k| k.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         sql.push_str(&format!(
-            " AND (e.kind NOT IN (30300, 31234) OR e.pubkey = ${pk_idx})"
+            " AND (e.kind NOT IN ({ao_list}) OR e.pubkey = ${pk_idx})"
         ));
         param_idx += 1;
     }
