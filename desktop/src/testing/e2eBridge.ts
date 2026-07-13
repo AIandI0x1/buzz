@@ -1318,37 +1318,12 @@ function buildMockConfigSurface(pubkey: string): {
     },
     advanced: [
       {
-        key: "extensions.developer",
-        label: "Extension: developer",
-        value: "enabled",
+        key: "active_provider",
+        label: "active_provider",
+        value: "openai",
         origin: "configFile",
-        schemaType: { type: "enum", options: ["enabled", "disabled"] },
-        writeVia: {
-          type: "gooseNativeConfigWrite",
-          configKey: "goose.extensions.developer",
-        },
-      },
-      {
-        key: "extensions.web_search",
-        label: "Extension: web_search",
-        value: "enabled",
-        origin: "configFile",
-        schemaType: { type: "enum", options: ["enabled", "disabled"] },
-        writeVia: {
-          type: "gooseNativeConfigWrite",
-          configKey: "goose.extensions.web_search",
-        },
-      },
-      {
-        key: "extensions.memory",
-        label: "Extension: memory",
-        value: "disabled",
-        origin: "configFile",
-        schemaType: { type: "enum", options: ["enabled", "disabled"] },
-        writeVia: {
-          type: "gooseNativeConfigWrite",
-          configKey: "goose.extensions.memory",
-        },
+        schemaType: { type: "string" },
+        writeVia: { type: "readOnly" },
       },
     ],
     extensions: [
@@ -1685,10 +1660,25 @@ function buildMockConfigSurface(pubkey: string): {
     },
   };
 
-  // Map well-known test pubkeys to specific fixtures
-  // Synthetic agent for the multi-origin provenance showcase (not a TEST_IDENTITY).
+  const buzzAgentSurface = {
+    ...gooseSurface,
+    runtimeId: "buzz-agent",
+    runtimeLabel: "Buzz Agent",
+    advanced: [],
+    extensions: [],
+    sources: {
+      ...gooseSurface.sources,
+      configFilePath: null,
+      mcpConfigFilePath: null,
+    },
+  };
+
+  // Map well-known test pubkeys to specific fixtures.
+  // Synthetic agents are intentionally not TEST_IDENTITIES.
   const PUBKEY_MULTI_ORIGIN =
     "abc1230000000000000000000000000000000000000000000000000000000def";
+  const PUBKEY_BUZZ_AGENT =
+    "b0220000000000000000000000000000000000000000000000000000000000a9";
 
   switch (pubkey) {
     case ALICE_PUBKEY:
@@ -1701,6 +1691,8 @@ function buildMockConfigSurface(pubkey: string): {
       return runtimeOverrideSurface;
     case PUBKEY_MULTI_ORIGIN:
       return multiOriginSurface;
+    case PUBKEY_BUZZ_AGENT:
+      return buzzAgentSurface;
     default:
       return gooseSurface;
   }

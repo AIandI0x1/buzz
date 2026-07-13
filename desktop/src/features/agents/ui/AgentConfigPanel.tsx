@@ -369,7 +369,6 @@ export function AgentConfigPanel({
   const { normalized, advanced, extensions, runtimeId, sources, isPreSpawn } =
     data;
   const configFilePath = sources.configFilePath;
-  const mcpConfigFilePath = sources.mcpConfigFilePath;
 
   const normalizedEntries = (
     Object.entries(normalized) as [
@@ -420,7 +419,6 @@ export function AgentConfigPanel({
       </div>
 
       <McpServersSection
-        configFilePath={mcpConfigFilePath}
         extensions={extensions}
         runtimeId={runtimeId}
         variant={advancedMode === "flat" ? "profile" : "compact"}
