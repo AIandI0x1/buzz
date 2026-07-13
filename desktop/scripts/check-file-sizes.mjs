@@ -202,9 +202,10 @@ const overrides = new Map([
   // RawInstallRuntimeResult + fromRawInstallRuntimeResult mapper (+2).
   // Git Bash Doctor discovery adds the raw Tauri response and its camelCase
   // mapper. This is the existing API boundary; split remains queued.
-  // team-instructions-first-class: createManagedAgent Tauri bridge threads the
-  // new teamId input through to the backend (+1 line).
-  ["src/shared/api/tauri.ts", 1305],
+  // `team-instructions-first-class` added the create `teamId` wire field; MCP
+  // configuration adds the raw/read/create `mcpServers` plumbing. The gate
+  // counts trailing newlines, so 1,308 physical lines are 1,309 counted lines.
+  ["src/shared/api/tauri.ts", 1309],
   // doctor-npm-eacces-preflight: hint field added to InstallStepResult (+1 line).
   // codex-acp-package-swap: "adapter_outdated" variant added to AcpAvailabilityStatus (+1 line).
   // doctor-install-reliability: AuthStatus tagged union + nodeRequired/authStatus/
@@ -214,12 +215,11 @@ const overrides = new Map([
   // mcp-readonly-view rebase: PR2 MCP config surface FE-type fields force +1 over the grandfathered ceiling.
   // Git Bash prerequisite payload adds four fields to the shared Tauri API
   // contract. This is the canonical type location; split remains queued.
-  // signout-wipe: resetFailed field added to Identity type (+6 lines).
-  // team-instructions-first-class: CreateManagedAgentInput.teamId (+2, incl.
-  // doc comment) and AgentTeam/CreateTeamInput/UpdateTeamInput.instructions
-  // (+3) — the new team-id spawn link and the runtime-layered instructions
-  // field.
-  ["src/shared/api/types.ts", 1047],
+  // `signout-wipe` added `Identity.resetFailed`; `team-instructions-first-class`
+  // added team/instructions fields; MCP config adds the shared server types,
+  // layer fields, IPC input fields, and effective-surface field. The gate
+  // counts trailing newlines, so 1,076 physical lines are 1,077 counted lines.
+  ["src/shared/api/types.ts", 1077],
   // readiness-gate: PersonaDialog.tsx threads computeLocalModeGate +
   // requiredCredentialEnvKeys + RequiredFieldLabel so the "New agent" dialog
   // shows required markers and credential amber rows (parity with

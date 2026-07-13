@@ -37,6 +37,7 @@ import { SettingsOptionGroup } from "@/features/settings/ui/SettingsOptionGroup"
 /** Sentinel value for an unconfigured global agent config. */
 export const EMPTY_GLOBAL_CONFIG: GlobalAgentConfig = {
   env_vars: {},
+  mcp_servers: [],
   provider: null,
   model: null,
 };
