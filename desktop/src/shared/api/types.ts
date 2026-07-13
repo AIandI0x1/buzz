@@ -575,6 +575,8 @@ export type AcpRuntimeCatalogEntry = {
   availability: AcpAvailabilityStatus;
   command: string | null;
   binaryPath: string | null;
+  /** True when `binaryPath` is the bridge bundled with the Buzz app rather than a user install. */
+  adapterBundled: boolean;
   defaultArgs: string[];
   mcpCommand: string | null;
   installHint: string;

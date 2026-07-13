@@ -225,6 +225,8 @@ export type RawAcpRuntimeCatalogEntry = {
   availability: AcpAvailabilityStatus;
   command: string | null;
   binary_path: string | null;
+  /** Always sent by the backend; optional so e2e fixtures can omit it. */
+  adapter_bundled?: boolean;
   default_args: string[];
   mcp_command: string | null;
   install_hint: string;
@@ -919,6 +921,7 @@ function fromRawAcpRuntimeCatalogEntry(
     availability: entry.availability,
     command: entry.command,
     binaryPath: entry.binary_path,
+    adapterBundled: entry.adapter_bundled ?? false,
     defaultArgs: entry.default_args,
     mcpCommand: entry.mcp_command,
     installHint: entry.install_hint,

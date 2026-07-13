@@ -446,4 +446,40 @@ test.describe("Doctor panel state screenshots", () => {
     });
     await expect(page.getByTestId("doctor-node-runtime")).toHaveCount(0);
   });
+
+  /**
+   * 09 — available runtime whose adapter is the bridge bundled with the app:
+   * the row says "ACP bridge bundled with Buzz" instead of rendering the
+   * resource-dir path; the user's CLI path still renders.
+   */
+  test("09-bundled-adapter", async ({ page }) => {
+    const bundledPath =
+      "/Applications/Buzz.app/Contents/Resources/resources/acp/bin/claude-agent-acp";
+    await installMockBridge(page, {
+      acpRuntimesCatalog: [
+        GOOSE_AVAILABLE,
+        {
+          ...CLAUDE_AVAILABLE_LOGGED_IN,
+          binary_path: bundledPath,
+          adapter_bundled: true,
+        },
+        CODEX_NOT_INSTALLED,
+        BUZZ_AGENT_AVAILABLE,
+      ],
+    });
+
+    await page.goto("/", { waitUntil: "domcontentloaded" });
+    await openSettings(page, "doctor");
+
+    const row = page.getByTestId("doctor-runtime-claude");
+    await expect(row).toBeVisible({ timeout: 10_000 });
+    await expect(row).toContainText("ACP bridge bundled with Buzz.");
+    await expect(row).toContainText("/usr/local/bin/claude");
+    await expect(row).not.toContainText(bundledPath);
+    await expect(row).not.toContainText("installed on PATH");
+
+    await row.scrollIntoViewIfNeeded();
+    await waitForAnimations(page);
+    await row.screenshot({ path: `${SHOTS}/09-bundled-adapter.png` });
+  });
 });

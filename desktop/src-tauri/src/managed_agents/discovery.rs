@@ -1116,6 +1116,9 @@ pub fn discover_acp_runtimes() -> Vec<AcpRuntimeCatalogEntry> {
                 .underlying_cli
                 .map(|cli| find_command(cli).is_some())
                 .unwrap_or(false);
+            let adapter_bundled = adapter_result
+                .as_ref()
+                .is_some_and(|(_, path)| super::acp_tools::path_is_in_bundled_dir(path));
             let (availability, command, binary_path) =
                 classify_runtime(adapter_result, runtime.underlying_cli, underlying_cli_found);
 
@@ -1173,6 +1176,7 @@ pub fn discover_acp_runtimes() -> Vec<AcpRuntimeCatalogEntry> {
                     availability,
                     command,
                     binary_path,
+                    adapter_bundled,
                     default_args,
                     mcp_command: runtime.mcp_command.map(str::to_string),
                     install_hint,

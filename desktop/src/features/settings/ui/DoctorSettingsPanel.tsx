@@ -206,8 +206,9 @@ function RuntimeRow({
         runtime.binaryPath ? (
           <>
             <p className="mt-1 text-sm font-normal text-muted-foreground">
-              Available via{" "}
-              {describeResolvedCommand(runtime.command, runtime.binaryPath)}.
+              {runtime.adapterBundled
+                ? "ACP bridge bundled with Buzz."
+                : `Available via ${describeResolvedCommand(runtime.command, runtime.binaryPath)}.`}
             </p>
             {runtime.defaultArgs.length > 0 ? (
               <p className="mt-2 text-xs text-muted-foreground">
@@ -224,12 +225,16 @@ function RuntimeRow({
                   <span className="text-muted-foreground">CLI:</span>{" "}
                   {runtime.underlyingCliPath}
                 </p>
-                <p className="break-all font-mono text-2xs text-muted-foreground/80">
-                  <span className="text-muted-foreground">ACP adapter:</span>{" "}
-                  {runtime.binaryPath}
-                </p>
+                {/* The bundled bridge's resource-dir path is noise — the
+                    "ACP bridge bundled with Buzz." line above covers it. */}
+                {runtime.adapterBundled ? null : (
+                  <p className="break-all font-mono text-2xs text-muted-foreground/80">
+                    <span className="text-muted-foreground">ACP adapter:</span>{" "}
+                    {runtime.binaryPath}
+                  </p>
+                )}
               </div>
-            ) : (
+            ) : runtime.adapterBundled ? null : (
               <>
                 <p className="mt-1 break-all font-mono text-2xs text-muted-foreground/80">
                   {runtime.binaryPath}
@@ -283,11 +288,20 @@ function RuntimeRow({
         ) : runtime.availability === "cli_missing" ? (
           <>
             <p className="mt-1 text-sm font-normal text-muted-foreground">
-              ACP adapter found at{" "}
-              <code className="rounded bg-muted px-1 py-0.5 text-2xs">
-                {runtime.binaryPath ?? "unknown path"}
-              </code>{" "}
-              but the {runtime.label} CLI is not installed.
+              {runtime.adapterBundled ? (
+                <>
+                  ACP bridge bundled with Buzz, but the {runtime.label} CLI is
+                  not installed.
+                </>
+              ) : (
+                <>
+                  ACP adapter found at{" "}
+                  <code className="rounded bg-muted px-1 py-0.5 text-2xs">
+                    {runtime.binaryPath ?? "unknown path"}
+                  </code>{" "}
+                  but the {runtime.label} CLI is not installed.
+                </>
+              )}
             </p>
             <p className="mt-1 text-sm font-normal text-muted-foreground">
               {runtime.installHint}

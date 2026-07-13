@@ -568,6 +568,10 @@ pub struct AcpRuntimeCatalogEntry {
     pub availability: AcpAvailabilityStatus,
     pub command: Option<String>,
     pub binary_path: Option<String>,
+    /// true when `binary_path` is the pinned bridge bundled with the app
+    /// rather than a user install. The Doctor UI says "ACP bridge bundled
+    /// with Buzz" instead of rendering the resource-dir path.
+    pub adapter_bundled: bool,
     pub default_args: Vec<String>,
     pub mcp_command: Option<String>,
     pub install_hint: String,

@@ -58,6 +58,17 @@ pub(in crate::managed_agents) fn command_in_bundled_dir(command: &str) -> Option
     command_in_dir(&bundled_acp_tools_dir()?, command)
 }
 
+/// Whether `path` points inside the bundled tools dir — i.e. the resolved
+/// adapter is the pinned bridge Buzz ships rather than a user install. False
+/// until [`register_bundled_acp_tools_dir`] runs or when no tools are bundled.
+pub(in crate::managed_agents) fn path_is_in_bundled_dir(path: &Path) -> bool {
+    path_is_in_dir(bundled_acp_tools_dir().as_deref(), path)
+}
+
+fn path_is_in_dir(dir: Option<&Path>, path: &Path) -> bool {
+    dir.is_some_and(|dir| path.starts_with(dir))
+}
+
 /// Path of the Node runtime manifest staged by
 /// `desktop/scripts/prepare-acp-tools-resource.sh`: it lives next to the
 /// tools bin dir (`acp/node-runtime.json` beside `acp/bin`), so it resolves
@@ -90,9 +101,31 @@ fn bundled_acp_tools_dir_from_parts(
 
 #[cfg(test)]
 mod tests {
-    use super::{bundled_acp_tools_dir_from_parts, command_in_dir};
+    use super::{bundled_acp_tools_dir_from_parts, command_in_dir, path_is_in_dir};
     use std::ffi::OsStr;
     use std::path::Path;
+
+    #[test]
+    fn path_is_in_dir_matches_whole_components_of_the_bundled_dir() {
+        let dir = Some(Path::new("/bundle/resources/acp/bin"));
+        assert!(path_is_in_dir(
+            dir,
+            Path::new("/bundle/resources/acp/bin/claude-agent-acp"),
+        ));
+        assert!(!path_is_in_dir(
+            dir,
+            Path::new("/usr/local/bin/claude-agent-acp"),
+        ));
+        // Component-wise prefix, not a string prefix.
+        assert!(!path_is_in_dir(
+            dir,
+            Path::new("/bundle/resources/acp/bin-old/claude-agent-acp"),
+        ));
+        assert!(!path_is_in_dir(
+            None,
+            Path::new("/bundle/resources/acp/bin/codex-acp")
+        ));
+    }
 
     #[test]
     fn env_override_wins_over_resource_dir() {
