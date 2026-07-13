@@ -132,6 +132,7 @@ fn definition_from_snapshot(
         source_team: None,
         source_team_persona_slug: None,
         env_vars: Default::default(),
+        mcp_servers: Default::default(),
         respond_to,
         respond_to_allowlist: behavior.respond_to_allowlist,
         parallelism: behavior.parallelism,
