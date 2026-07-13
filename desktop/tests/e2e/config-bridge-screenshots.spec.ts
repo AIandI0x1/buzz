@@ -247,10 +247,10 @@ test.describe("config bridge screenshots", () => {
 
     // Advanced runtime fields render directly in the profile panel's flat list.
     await expect(panel.getByText("active_provider")).toBeVisible();
-    // MCP servers render once each, without the removed summary row.
+    // MCP servers render once each under their group label.
     await expect(panel.getByText("developer", { exact: true })).toHaveCount(1);
     await expect(panel.getByText("MCP Servers", { exact: true })).toHaveCount(
-      0,
+      1,
     );
     await settleAnimations(panel);
 
@@ -275,7 +275,7 @@ test.describe("config bridge screenshots", () => {
       panel.getByText("No custom servers configured", { exact: true }),
     ).toBeVisible();
     await expect(panel.getByText("MCP Servers", { exact: true })).toHaveCount(
-      0,
+      1,
     );
   });
 

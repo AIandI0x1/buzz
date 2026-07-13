@@ -29,6 +29,15 @@ export function McpServersSection({
         variant === "compact" ? "mt-3 pt-2" : "divide-y divide-border/50",
       )}
     >
+      <p
+        className={cn(
+          "text-xs font-medium text-foreground",
+          variant === "compact" ? "py-2" : "px-4 py-3",
+        )}
+      >
+        MCP Servers
+      </p>
+
       {isBuzzAgent && buzzAgentSlot ? buzzAgentSlot : null}
 
       {extensions.length > 0 ? (
