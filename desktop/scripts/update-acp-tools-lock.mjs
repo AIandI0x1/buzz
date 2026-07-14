@@ -91,6 +91,13 @@ const NPM_TARGET_CONFIG = {
   },
 };
 
+// Tarball URLs in the lock are informational — ensure-acp-tools.sh installs
+// via the ambient npm registry and validates the registry-agnostic sha512
+// integrity. Normalize them to the public registry so regenerating against an
+// internal mirror (e.g. Artifactory) neither leaks internal hosts into the
+// committed lock nor churns every URL in the diff.
+const PUBLIC_NPM_REGISTRY = "https://registry.npmjs.org";
+
 const npmViewCache = new Map();
 const execFileAsync = promisify(execFile);
 
@@ -105,6 +112,10 @@ older version.
 A --target run regenerates only the selected targets; the existing lock's
 entries for every other target are preserved verbatim, so a partial bump
 never drops another target's pins.
+
+Tarball URLs are normalized to ${PUBLIC_NPM_REGISTRY} regardless of the
+registry that resolved the metadata, so regeneration is deterministic across
+environments and internal mirror hosts never land in the committed lock.
 
 Supported targets:
   ${SUPPORTED_TARGETS.join("\n  ")}
@@ -178,10 +189,27 @@ function requireString(value, label) {
   return value;
 }
 
+// Rebuild the tarball URL on PUBLIC_NPM_REGISTRY, keeping the registry's
+// `<package>/-/<basename>.tgz` path (the basename is not always derivable
+// from name@version — @openai/codex native tarballs carry a platform suffix).
+function normalizeTarballUrl(tarball, packageName, label) {
+  const separator = "/-/";
+  const separatorIndex = tarball.lastIndexOf(separator);
+  if (separatorIndex === -1) {
+    throw new Error(`Cannot normalize ${label} tarball URL: ${tarball}`);
+  }
+  const basename = tarball.slice(separatorIndex + separator.length);
+  return `${PUBLIC_NPM_REGISTRY}/${packageName}/-/${basename}`;
+}
+
 function packageDist(metadata, label) {
   const dist = metadata?.dist;
   return {
-    tarball: requireString(dist?.tarball, `${label} dist.tarball`),
+    tarball: normalizeTarballUrl(
+      requireString(dist?.tarball, `${label} dist.tarball`),
+      requireString(metadata?.name, `${label} name`),
+      label,
+    ),
     integrity: requireString(dist?.integrity, `${label} dist.integrity`),
   };
 }
