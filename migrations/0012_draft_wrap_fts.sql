@@ -11,15 +11,15 @@
 -- omission. Populated databases still on the legacy negative blocklist need
 -- the column rewritten to add 31234 to the exclusion list. This migration
 -- inspects the live column expression and acts accordingly:
---   - Allowlist form (contains '45001') → no-op, 31234 already unsearchable.
---   - Legacy blocklist form → DROP + re-ADD with 31234 added to exclusion.
+--   - Allowlist form (ELSE NULL shape) → no-op, 31234 already unsearchable.
+--   - Legacy blocklist form (ELSE to_tsvector shape) → DROP + re-ADD with 31234.
 --
 -- DEPLOY NOTE: the DROP + re-ADD path acquires ACCESS EXCLUSIVE on `events`
 -- for the duration of the migration, blocking all reads and writes to the
 -- table. The GIN index rebuild that follows is a full table scan. On large
 -- deployments this migration should run during a scheduled maintenance window.
 -- This is the same shape as migration 0005 and was accepted as precedent.
--- The no-op path (fresh installs) acquires no exclusive lock.
+-- The no-op path (fresh installs) does not escalate to ACCESS EXCLUSIVE.
 --
 -- Final kind exclusion list after this migration (legacy path):
 --   1059   = KIND_GIFT_WRAP                  (NIP-17 ciphertext)
@@ -50,9 +50,12 @@ BEGIN
                    WHERE attrelid = 'events'::regclass
                      AND attname = 'search_tsv');
 
-    -- The positive allowlist form (0008) contains '45001' in its kind list.
-    -- If present, 31234 is already excluded by omission — nothing to do.
-    IF expr IS NOT NULL AND expr LIKE '%45001%' THEN
+    -- The positive allowlist form (0008) falls through to ELSE NULL::tsvector
+    -- for unlisted kinds, while the legacy blocklist uses THEN NULL::tsvector
+    -- for excluded kinds and ELSE to_tsvector(...) for everything else.
+    -- Detecting the allowlist shape (ELSE NULL) is robust against future kind
+    -- list changes in either form.
+    IF expr IS NOT NULL AND expr LIKE '%ELSE NULL%' THEN
         RAISE NOTICE '0012_draft_wrap_fts: allowlist expression detected, 31234 already excluded — no-op';
         RETURN;
     END IF;
