@@ -317,6 +317,7 @@ class RelaySessionNotifier extends Notifier<SessionState> {
   /// Force a reconnect (e.g., returning from background).
   Future<void> reconnect() async {
     _reconnectTimer?.cancel();
+    ++_connectionGeneration;
     await _socket?.disconnect();
     _resetReconnectBudget();
     final config = ref.read(relayConfigProvider);

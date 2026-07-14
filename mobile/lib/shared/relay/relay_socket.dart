@@ -102,14 +102,18 @@ class RelaySocket {
     _subscription = _channel!.stream.listen(
       _handleRawMessage,
       onError: (Object error) {
+        final awaitingAuth =
+            _authCompleter != null && !_authCompleter!.isCompleted;
         _failAuth(error);
         _resetConnection();
-        _onDisconnected(error);
+        if (!awaitingAuth) _onDisconnected(error);
       },
       onDone: () {
+        final awaitingAuth =
+            _authCompleter != null && !_authCompleter!.isCompleted;
         _failAuth(null);
         _resetConnection();
-        _onDisconnected(null);
+        if (!awaitingAuth) _onDisconnected(null);
       },
     );
 
