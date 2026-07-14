@@ -11,6 +11,7 @@ import {
 
 const GENERAL_CHANNEL_ID = "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50";
 const AGENTS_CHANNEL_ID = "94a444a4-c0a3-5966-ab05-530c6ddc2301";
+const RANDOM_CHANNEL_ID = "9dae0116-799b-5071-a0a8-fdd30a91a35d";
 const MOCK_IDENTITY_PUBKEY = "deadbeef".repeat(8);
 // Relay-only agent owned by the mock viewer (see e2eBridge.ts
 // OWNED_RELAY_AGENT_PUBKEY). Classified as a bot via mockRelayAgents and
@@ -2365,6 +2366,23 @@ test("channel context menu hides management actions from members and DMs", async
 }) => {
   await page.goto("/");
 
+  await page.getByTestId("channel-random").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("random");
+  await page.getByTestId("channel-management-trigger").click();
+  await expect(page.getByTestId("channel-management-sheet")).toBeVisible();
+  await expect
+    .poll(async () => {
+      const commandLog = await readCommandPayloadLog(page);
+      return commandLog.some(
+        ({ command, payload }) =>
+          command === "get_channel_members" &&
+          (payload as { channelId?: string }).channelId === RANDOM_CHANNEL_ID,
+      );
+    })
+    .toBe(true);
+  await expect(page.getByTestId("channel-management-edit")).toHaveCount(0);
+  await page.getByTestId("auxiliary-panel-close").click();
+
   await page.getByTestId("channel-random").click({ button: "right" });
   await expect(
     page.getByRole("menuitem", { name: "Edit channel" }),
@@ -2395,7 +2413,7 @@ test("channel context menu archives a stream", async ({ page }) => {
   await expect(archiveItem).toBeVisible();
   await archiveItem.click();
 
-  await expect(page.getByTestId("stream-list")).not.toContainText("general");
+  await expect(page.getByTestId("channel-general")).toHaveCount(0);
   await openChannelBrowser(page);
   await expect(page.getByTestId("browse-channel-general")).toContainText(
     "archived",

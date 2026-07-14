@@ -1,3 +1,5 @@
+import * as React from "react";
+
 import {
   Archive,
   Bell,
@@ -32,12 +34,39 @@ import { StatusEmoji } from "@/features/user-status/ui/StatusEmoji";
 import type { Channel } from "@/shared/api/types";
 import { copyTextToClipboard } from "@/shared/lib/clipboard";
 import {
+  ContextMenu,
+  ContextMenuContent,
   ContextMenuItem,
   ContextMenuSeparator,
+  ContextMenuTrigger,
   ContextMenuSub,
   ContextMenuSubContent,
   ContextMenuSubTrigger,
 } from "@/shared/ui/context-menu";
+
+export function ChannelContextMenu({
+  children,
+  contentProps,
+  modal,
+}: {
+  children: React.ReactNode;
+  contentProps: Omit<
+    React.ComponentProps<typeof ChannelContextMenuItems>,
+    "menuOpen"
+  >;
+  modal?: boolean;
+}) {
+  const [open, setOpen] = React.useState(false);
+
+  return (
+    <ContextMenu modal={modal} onOpenChange={setOpen}>
+      <ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
+      <ContextMenuContent forceMount className={open ? undefined : "hidden"}>
+        <ChannelContextMenuItems {...contentProps} menuOpen={open} />
+      </ContextMenuContent>
+    </ContextMenu>
+  );
+}
 
 function MoveToSectionSubmenu({
   channelId,
@@ -143,6 +172,7 @@ function CopyChannelSubmenu({ channel }: { channel: Channel }) {
 export function ChannelContextMenuItems({
   channel,
   hasUnread,
+  menuOpen = false,
   isMuted,
   isStarred,
   sections,
@@ -160,6 +190,7 @@ export function ChannelContextMenuItems({
 }: {
   channel: Channel;
   hasUnread: boolean;
+  menuOpen?: boolean;
   isMuted?: boolean;
   isStarred?: boolean;
   sections?: ChannelSection[];
@@ -203,12 +234,26 @@ export function ChannelContextMenuItems({
       currentPubkey,
     ),
   );
-  const showManagementActions =
-    channel.channelType !== "dm" &&
-    channel.archivedAt === null &&
-    (selfMember?.role === "owner" ||
-      selfMember?.role === "admin" ||
-      canManageOwnedAgentChannel);
+  const canManageChannel =
+    selfMember?.role === "owner" ||
+    selfMember?.role === "admin" ||
+    canManageOwnedAgentChannel;
+  // Snapshot capabilities for each open session. Permission responses that
+  // arrive after the menu opens apply on the next open instead of inserting
+  // immediate actions beneath the user's pointer.
+  const [showManagementActions, setShowManagementActions] =
+    React.useState(false);
+  const menuWasOpenRef = React.useRef(false);
+  React.useLayoutEffect(() => {
+    if (menuOpen && !menuWasOpenRef.current) {
+      setShowManagementActions(
+        channel.channelType !== "dm" &&
+          channel.archivedAt === null &&
+          canManageChannel,
+      );
+    }
+    menuWasOpenRef.current = menuOpen;
+  }, [canManageChannel, channel.archivedAt, channel.channelType, menuOpen]);
   const showStar = Boolean(onStarChannel && onUnstarChannel);
   const showReadToggle = hasUnread
     ? Boolean(onMarkChannelRead)
