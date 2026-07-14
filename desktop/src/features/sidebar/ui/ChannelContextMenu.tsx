@@ -50,19 +50,14 @@ export function ChannelContextMenu({
   modal,
 }: {
   children: React.ReactNode;
-  contentProps: Omit<
-    React.ComponentProps<typeof ChannelContextMenuItems>,
-    "menuOpen"
-  >;
+  contentProps: React.ComponentProps<typeof ChannelContextMenuItems>;
   modal?: boolean;
 }) {
-  const [open, setOpen] = React.useState(false);
-
   return (
-    <ContextMenu modal={modal} onOpenChange={setOpen}>
+    <ContextMenu modal={modal}>
       <ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
       <ContextMenuContent>
-        <ChannelContextMenuItems {...contentProps} menuOpen={open} />
+        <ChannelContextMenuItems {...contentProps} />
       </ContextMenuContent>
     </ContextMenu>
   );
@@ -172,7 +167,6 @@ function CopyChannelSubmenu({ channel }: { channel: Channel }) {
 export function ChannelContextMenuItems({
   channel,
   hasUnread,
-  menuOpen = false,
   isMuted,
   isStarred,
   sections,
@@ -190,7 +184,6 @@ export function ChannelContextMenuItems({
 }: {
   channel: Channel;
   hasUnread: boolean;
-  menuOpen?: boolean;
   isMuted?: boolean;
   isStarred?: boolean;
   sections?: ChannelSection[];
@@ -238,18 +231,15 @@ export function ChannelContextMenuItems({
     selfMember?.role === "owner" ||
     selfMember?.role === "admin" ||
     canManageOwnedAgentChannel;
-  const managementActionsAreResolved =
-    menuOpen &&
-    membersQuery.data !== undefined &&
-    (ownerPubkeys.length === 0 || ownerProfilesQuery.data !== undefined);
-  const managementActionsAreEligible =
-    channel.channelType !== "dm" && channel.archivedAt === null;
-  // Reserve the final two action rows while permissions load. If the viewer can
-  // manage this channel, the rows become actionable without changing the menu
-  // geometry; otherwise they disappear without ever exposing Archive.
-  const showManagementActions =
-    managementActionsAreEligible &&
-    (!managementActionsAreResolved || canManageChannel);
+  // Context-menu content mounts once per open session, so this capability is a
+  // stable snapshot. Late query/refetch results cannot insert an immediate
+  // Archive action or move another item beneath the user's pointer.
+  const [showManagementActions] = React.useState(
+    () =>
+      channel.channelType !== "dm" &&
+      channel.archivedAt === null &&
+      canManageChannel,
+  );
   const showStar = Boolean(onStarChannel && onUnstarChannel);
   const showReadToggle = hasUnread
     ? Boolean(onMarkChannelRead)
@@ -280,7 +270,6 @@ export function ChannelContextMenuItems({
         <>
           <ContextMenuSeparator />
           <ContextMenuItem
-            disabled={!managementActionsAreResolved}
             onSelect={() =>
               deferMenuAction(() =>
                 openChannelManagement(channel.id, { edit: true }),
@@ -294,7 +283,6 @@ export function ChannelContextMenuItems({
           </ContextMenuItem>
           <ContextMenuItem
             className="text-destructive focus:text-destructive"
-            disabled={!managementActionsAreResolved}
             onSelect={() =>
               deferMenuAction(() => {
                 void archiveChannelMutation.mutateAsync().catch((error) => {
