@@ -10,6 +10,7 @@ import 'package:buzz/shared/community/community_storage.dart';
 /// in-memory logic.
 class FakeSecureStorage extends Fake implements FlutterSecureStorage {
   final Map<String, String> _data = {};
+  bool dropDeviceBoundCommunityWrites = false;
 
   @override
   Future<String?> read({
@@ -33,6 +34,10 @@ class FakeSecureStorage extends Fake implements FlutterSecureStorage {
     AppleOptions? mOptions,
     WindowsOptions? wOptions,
   }) async {
+    if (dropDeviceBoundCommunityWrites &&
+        key == 'buzz_communities_device_bound_v1') {
+      return;
+    }
     if (value != null) {
       _data[key] = value;
     } else {
@@ -97,6 +102,16 @@ void main() {
   });
 
   group('CommunityStorage', () {
+    test('default iOS storage is device-bound and not synchronizable', () {
+      final defaultStorage = CommunityStorage();
+
+      expect(
+        defaultStorage.iosOptionsForTesting.accessibility,
+        KeychainAccessibility.unlocked_this_device,
+      );
+      expect(defaultStorage.iosOptionsForTesting.synchronizable, isFalse);
+    });
+
     test('loadAll returns empty list when no data', () async {
       final result = await storage.loadAll();
       expect(result, isEmpty);
@@ -178,10 +193,50 @@ void main() {
 
         expect(loaded.single.id, legacy.id);
         expect(await storage.loadActiveId(), legacy.id);
-        expect(fakeSecure['buzz_communities'], isNotNull);
+        expect(fakeSecure['buzz_communities_device_bound_v1'], isNotNull);
         expect(fakeSecure['buzz_workspaces'], isNull);
         expect(fakeSecure['buzz_active_workspace_id'], isNull);
       });
+
+      test(
+        'moves an existing community blob to the device-bound key',
+        () async {
+          final legacy = Community.create(
+            name: 'Migratable',
+            relayUrl: 'https://legacy.example.com',
+            nsec: 'nsec1devicebound',
+          );
+          fakeSecure['buzz_communities'] = jsonEncode([legacy.toJson()]);
+          fakeSecure['buzz_active_community_id'] = legacy.id;
+
+          final loaded = await storage.loadAll();
+          final activeId = await storage.loadActiveId();
+
+          expect(loaded.single.nsec, 'nsec1devicebound');
+          expect(activeId, legacy.id);
+          expect(fakeSecure['buzz_communities_device_bound_v1'], isNotNull);
+          expect(fakeSecure['buzz_communities'], isNull);
+          expect(fakeSecure['buzz_active_community_id'], legacy.id);
+        },
+      );
+
+      test(
+        'keeps the migratable copy when protected write verification fails',
+        () async {
+          final legacy = Community.create(
+            name: 'Migratable',
+            relayUrl: 'https://legacy.example.com',
+            nsec: 'nsec1stillavailable',
+          );
+          fakeSecure['buzz_communities'] = jsonEncode([legacy.toJson()]);
+          fakeSecure.dropDeviceBoundCommunityWrites = true;
+
+          await expectLater(storage.loadAll(), throwsStateError);
+
+          expect(fakeSecure['buzz_communities'], isNotNull);
+          expect(fakeSecure['buzz_communities_device_bound_v1'], isNull);
+        },
+      );
 
       test('migrates legacy keys to community on first load', () async {
         fakeSecure['buzz_relay_url'] = 'https://legacy.example.com';
