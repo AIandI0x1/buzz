@@ -93,6 +93,7 @@ pub async fn process_streaming_ingest(
     // whether this is a long-running video upload or a short-lived token class.
     verify_source_auth(mode, auth_event, &source_hash, ctx.host(), 3_600).await?;
 
+    enforce_sniffed_source_size(&sniff, source_size, config)?;
     let source_probe = crate::sanitize::probe_media(&source_path, &sniff, config).await?;
     let is_media = source_probe.is_some();
     enforce_route_policy(mode, source_probe.as_ref())?;
@@ -353,9 +354,8 @@ async fn stream_source(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_util::io::StreamReader;
 
-    let mapped = futures_util::StreamExt::map(body_stream, |result| {
-        result.map_err(|error| std::io::Error::other(error.to_string()))
-    });
+    let mapped =
+        futures_util::StreamExt::map(body_stream, |result| result.map_err(body_stream_io_error));
     let mut reader = StreamReader::new(Box::pin(mapped));
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
@@ -368,10 +368,16 @@ async fn stream_source(
     let mut sniff = Vec::with_capacity(4096);
     let mut buffer = vec![0_u8; 64 * 1024];
     loop {
-        let read = reader
-            .read(&mut buffer)
-            .await
-            .map_err(|error| MediaError::Io(error.to_string()))?;
+        let read = match reader.read(&mut buffer).await {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::WriteZero => {
+                return Err(MediaError::FileTooLarge {
+                    size: total.saturating_add(1),
+                    max: max_bytes,
+                });
+            }
+            Err(error) => return Err(MediaError::Io(error.to_string())),
+        };
         if read == 0 {
             break;
         }
@@ -393,6 +399,21 @@ async fn stream_source(
         .await
         .map_err(|error| MediaError::Io(error.to_string()))?;
     Ok((hex::encode(hasher.finalize()), total, sniff))
+}
+
+fn body_stream_io_error(error: axum::Error) -> std::io::Error {
+    let message = error.to_string();
+    if is_body_limit_error(&message) {
+        std::io::Error::new(std::io::ErrorKind::WriteZero, message)
+    } else {
+        std::io::Error::other(error)
+    }
+}
+
+fn is_body_limit_error(message: &str) -> bool {
+    message.contains("length limit")
+        || message.contains("body limit")
+        || message.contains("LengthLimitError")
 }
 
 async fn hash_file(path: &std::path::Path) -> Result<(String, u64), MediaError> {
@@ -433,6 +454,33 @@ fn enforce_source_size(
         Some(crate::sanitize::MediaClass::Video) => config.max_video_bytes,
         Some(crate::sanitize::MediaClass::Audio) => config.max_audio_bytes,
         None => config.max_file_bytes,
+    };
+    if size > max {
+        Err(MediaError::FileTooLarge { size, max })
+    } else {
+        Ok(())
+    }
+}
+
+fn enforce_sniffed_source_size(
+    sniff: &[u8],
+    size: u64,
+    config: &MediaConfig,
+) -> Result<(), MediaError> {
+    let Some(kind) = infer::get(sniff) else {
+        return Ok(());
+    };
+    let mime = kind.mime_type();
+    let max = if mime == "image/gif" {
+        config.max_gif_bytes
+    } else if mime.starts_with("image/") {
+        config.max_image_bytes
+    } else if mime.starts_with("video/") {
+        config.max_video_bytes
+    } else if mime.starts_with("audio/") {
+        config.max_audio_bytes
+    } else {
+        config.max_file_bytes
     };
     if size > max {
         Err(MediaError::FileTooLarge { size, max })
@@ -757,18 +805,8 @@ pub async fn process_video_upload(
         // We check multiple Display strings so that if axum changes the wording,
         // at least one pattern still matches. test_body_limit_error_detection
         // will catch a regression if ALL patterns break.
-        let mapped = futures_util::StreamExt::map(body_stream, |r| {
-            r.map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("length limit")
-                    || msg.contains("body limit")
-                    || msg.contains("LengthLimitError")
-                {
-                    std::io::Error::new(std::io::ErrorKind::WriteZero, msg)
-                } else {
-                    std::io::Error::other(e)
-                }
-            })
+        let mapped = futures_util::StreamExt::map(body_stream, |result| {
+            result.map_err(body_stream_io_error)
         });
         let mut reader = StreamReader::new(Box::pin(mapped));
 
@@ -1152,27 +1190,10 @@ mod tests {
         // Verify that body-limit errors are mapped to WriteZero (which
         // process_video_upload converts to FileTooLarge / 413).
         // Must match the detection logic in process_video_upload exactly.
-        let detect = |msg: &str| -> std::io::ErrorKind {
-            if msg.contains("length limit")
-                || msg.contains("body limit")
-                || msg.contains("LengthLimitError")
-            {
-                std::io::ErrorKind::WriteZero
-            } else {
-                std::io::ErrorKind::Other
-            }
-        };
-
-        // All known patterns should trigger WriteZero.
-        assert_eq!(
-            detect("length limit exceeded"),
-            std::io::ErrorKind::WriteZero
-        );
-        assert_eq!(detect("body limit exceeded"), std::io::ErrorKind::WriteZero);
-        assert_eq!(detect("LengthLimitError"), std::io::ErrorKind::WriteZero);
-
-        // Non-limit errors should remain as Other.
-        assert_eq!(detect("connection reset"), std::io::ErrorKind::Other);
+        assert!(is_body_limit_error("length limit exceeded"));
+        assert!(is_body_limit_error("body limit exceeded"));
+        assert!(is_body_limit_error("LengthLimitError"));
+        assert!(!is_body_limit_error("connection reset"));
     }
 
     #[test]
@@ -1209,6 +1230,17 @@ mod tests {
         assert_eq!(auth_max_age_secs(Some(&audio)), 600);
         assert_eq!(auth_max_age_secs(None), 600);
         assert_eq!(auth_max_age_secs(Some(&video)), 3_600);
+    }
+
+    #[test]
+    fn sniffed_image_size_is_rejected_before_parsing() {
+        let mut config = test_config();
+        config.max_image_bytes = 1;
+        let jpeg_header = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\0\0\x01\0\x01\0\0";
+        assert!(matches!(
+            enforce_sniffed_source_size(jpeg_header, jpeg_header.len() as u64, &config),
+            Err(MediaError::FileTooLarge { max: 1, .. })
+        ));
     }
 
     #[test]
