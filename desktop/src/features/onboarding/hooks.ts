@@ -1,5 +1,6 @@
 import * as React from "react";
 import { useQueryClient, type QueryStatus } from "@tanstack/react-query";
+import { toast } from "sonner";
 
 import {
   managedAgentsQueryKey,
@@ -18,7 +19,7 @@ import {
   getWelcomeGuideAgentPubkeys,
 } from "@/features/onboarding/welcomeGuide";
 import { useProfileQuery } from "@/features/profile/hooks";
-import { useWorkspaces } from "@/features/workspaces/useWorkspaces";
+import { useCommunities } from "@/features/communities/useCommunities";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import {
   createChannel,
@@ -30,9 +31,11 @@ import {
 
 const DEFAULT_AUTO_JOIN_CHANNEL_NAME = "general";
 
+export type ChannelInitResult = { ok: true } | { ok: false; reason: string };
+
 async function autoJoinDefaultChannel(
   queryClient: ReturnType<typeof useQueryClient>,
-) {
+): Promise<ChannelInitResult> {
   try {
     const channels = await getChannels();
     const target = channels.find(
@@ -40,13 +43,19 @@ async function autoJoinDefaultChannel(
         channel.name === DEFAULT_AUTO_JOIN_CHANNEL_NAME && !channel.isMember,
     );
     if (!target) {
-      return;
+      return { ok: true };
     }
     await joinChannel(target.id);
     await queryClient.invalidateQueries({ queryKey: channelsQueryKey });
-  } catch {
-    // Silent: auto-join is best-effort. The Welcome channel is created
-    // separately, and users can still join channels manually from the browser.
+    return { ok: true };
+  } catch (error) {
+    return {
+      ok: false,
+      reason:
+        error instanceof Error
+          ? error.message
+          : "Failed to join the general channel",
+    };
   }
 }
 
@@ -55,16 +64,16 @@ async function initializeWelcomeChannel(
   {
     focus,
     pubkey,
-    workspaceScope,
+    communityScope,
   }: {
     focus: boolean;
     pubkey: string | null;
-    workspaceScope: string | null;
+    communityScope: string | null;
   },
-) {
+): Promise<ChannelInitResult> {
   try {
     const allowedMemberPubkeys = await getWelcomeGuideAgentPubkeys(
-      workspaceScope,
+      communityScope,
     ).catch(() => []);
     const welcomeChannel = await ensureWelcomeChannel(
       {
@@ -79,7 +88,7 @@ async function initializeWelcomeChannel(
     );
     let didInitializeWelcomeGuide = false;
     try {
-      await ensureWelcomeGuideIntro(welcomeChannel.id, workspaceScope);
+      await ensureWelcomeGuideIntro(welcomeChannel.id, communityScope);
       didInitializeWelcomeGuide = true;
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: managedAgentsQueryKey }),
@@ -89,7 +98,7 @@ async function initializeWelcomeChannel(
       console.warn("Failed to initialize Welcome guide.", error);
     }
     if (didInitializeWelcomeGuide) {
-      markWelcomeChannelEnsured(pubkey, workspaceScope);
+      markWelcomeChannelEnsured(pubkey, communityScope);
     }
     if (focus) {
       rememberPendingWelcomeChannel(welcomeChannel.id);
@@ -98,8 +107,16 @@ async function initializeWelcomeChannel(
     if (focus) {
       notifyWelcomeChannelReady(welcomeChannel.id);
     }
+    return { ok: true };
   } catch (error) {
     console.warn("Failed to initialize Welcome channel.", error);
+    return {
+      ok: false,
+      reason:
+        error instanceof Error
+          ? error.message
+          : "Failed to create the Welcome channel",
+    };
   }
 }
 
@@ -122,9 +139,10 @@ type OnboardingGateStage = "blocking" | "onboarding" | "ready";
 type UseFirstRunOnboardingGateOptions = {
   currentPubkey: string | null;
   identityIsFetching: boolean;
+  identityLost: boolean;
   identityStatus: QueryStatus;
   isSharedIdentity: boolean;
-  profileDisplayName: string | null | undefined;
+  profileHasEvent: boolean | undefined;
   profileIsFetching: boolean;
   profileStatus: QueryStatus;
 };
@@ -217,9 +235,10 @@ function resolveOnboardingGateStage({
 export function useFirstRunOnboardingGate({
   currentPubkey,
   identityIsFetching,
+  identityLost,
   identityStatus,
   isSharedIdentity,
-  profileDisplayName,
+  profileHasEvent,
   profileIsFetching,
   profileStatus,
 }: UseFirstRunOnboardingGateOptions) {
@@ -237,6 +256,23 @@ export function useFirstRunOnboardingGate({
         : createOnboardingGateState(currentPubkey),
     );
   }, [currentPubkey]);
+
+  // When the backend signals "identity lost" (keyring was cleared after a
+  // successful migration), force onboarding open immediately so the user can
+  // re-import their nsec. This runs once, after identity settles.
+  React.useEffect(() => {
+    if (!identityLost || !currentPubkey || identityStatus !== "success") {
+      return;
+    }
+    setGateState((current) =>
+      updateActiveGateState(current, currentPubkey, (activeGateState) => ({
+        ...activeGateState,
+        hasCompletedCurrentPubkey: false,
+        hasSettledCurrentPubkey: true,
+        isOpen: true,
+      })),
+    );
+  }, [currentPubkey, identityLost, identityStatus]);
 
   React.useEffect(() => {
     // Fast-path: shared identity worktrees have already onboarded in the
@@ -288,19 +324,32 @@ export function useFirstRunOnboardingGate({
       return;
     }
 
-    // If the relay already has a profile with a display name for this pubkey,
-    // the user has previously completed onboarding (possibly on another
-    // machine or app data directory). Skip the onboarding flow and mark as
-    // complete so they go straight to the app.
+    // If the relay has a real kind:0 metadata event for this pubkey, the user
+    // has previously completed onboarding (possibly on another machine or app
+    // data directory). Skip the onboarding flow and mark as complete so they
+    // go straight to the app.
+    //
+    // We gate on `hasProfileEvent` — a flag set by the Tauri backend when a
+    // real kind:0 event was found — rather than any field value. This correctly
+    // handles the case where a returning user's display_name is empty: the event
+    // still exists, so onboarding is skipped. A missing event (new user, or no
+    // kind:0 on the relay) always shows onboarding regardless of display_name.
     const hasExistingProfile =
-      profileStatus === "success" &&
-      typeof profileDisplayName === "string" &&
-      profileDisplayName.trim().length > 0;
+      profileStatus === "success" && profileHasEvent === true;
 
     setGateState((current) =>
       updateActiveGateState(current, currentPubkey, (activeGateState) => {
+        // Re-read localStorage here to handle the webkit2gtk WAL race: the
+        // synchronous useState initializer may have run before the WAL was
+        // merged into the main SQLite file, returning null for a flag that is
+        // actually present. By the time this effect fires (identity + profile
+        // settled), the WAL has had time to merge and the read is reliable.
+        const hasCompletedAfterRecheck =
+          readOnboardingCompletion(currentPubkey);
         const alreadyOnboarded =
-          activeGateState.hasCompletedCurrentPubkey || hasExistingProfile;
+          activeGateState.hasCompletedCurrentPubkey ||
+          hasCompletedAfterRecheck ||
+          hasExistingProfile;
         if (alreadyOnboarded && typeof window !== "undefined") {
           window.localStorage.setItem(
             onboardingCompletionStorageKey(currentPubkey),
@@ -321,7 +370,7 @@ export function useFirstRunOnboardingGate({
     hasSettledCurrentPubkey,
     identityStatus,
     isSharedIdentity,
-    profileDisplayName,
+    profileHasEvent,
     profileIsFetching,
     profileStatus,
   ]);
@@ -366,62 +415,112 @@ export function useFirstRunOnboardingGate({
 
 export function useAppOnboardingState(isSharedIdentity: boolean) {
   const queryClient = useQueryClient();
-  const { activeWorkspace } = useWorkspaces();
+  const { activeCommunity } = useCommunities();
   const identityQuery = useIdentityQuery();
   const identity = identityQuery.data;
   const currentPubkey = identity?.pubkey ?? null;
-  const welcomeChannelWorkspaceScope = activeWorkspace?.relayUrl ?? null;
+  const welcomeChannelCommunityScope = activeCommunity?.relayUrl ?? null;
   const welcomeChannelInitPromisesRef = React.useRef(
-    new Map<string, Promise<void>>(),
+    new Map<string, Promise<ChannelInitResult>>(),
   );
   const [isCompletingWelcomeSetup, setIsCompletingWelcomeSetup] =
     React.useState(false);
-  const profileQuery = useProfileQuery();
+  const identityLost = identity?.lost === true;
+  // Keyring unreachable at boot — the real key is still in the OS keyring but
+  // the session cannot access it. No in-app recovery is possible; the user
+  // must unlock the keyring externally and relaunch. Mutually exclusive with lost.
+  const identityLocked = identity?.locked === true;
+  // Boot-time Phase 2 reset failed — wipe was attempted but verification failed.
+  // The sentinel is preserved so the next relaunch retries automatically.
+  const identityResetFailed = identity?.resetFailed === true;
+
+  // Sticky boot fact: once identity was lost at boot, this remains true for the
+  // entire session. Per-component state in OnboardingFlow cannot carry this
+  // because the flow remounts when pubkey changes after recovery.
+  const [bootedLost, setBootedLost] = React.useState(false);
+  React.useEffect(() => {
+    if (identityLost) setBootedLost(true);
+  }, [identityLost]);
+
+  // Sticky boot fact: once identity was locked at boot, this remains true for
+  // the entire session. After import_identity clears the locked flag, the
+  // relaunchRequired derivation uses this to force the relaunch screen.
+  const [bootedLocked, setBootedLocked] = React.useState(false);
+  React.useEffect(() => {
+    if (identityLocked) setBootedLocked(true);
+  }, [identityLocked]);
+
+  const profileQuery = useProfileQuery(
+    !identityLost && !identityLocked && identityQuery.status === "success",
+  );
   const onboardingGate = useFirstRunOnboardingGate({
     currentPubkey,
     identityIsFetching: identityQuery.fetchStatus === "fetching",
+    identityLost,
     identityStatus: identityQuery.status,
     isSharedIdentity,
-    profileDisplayName: profileQuery.data?.displayName,
+    profileHasEvent: profileQuery.data?.hasProfileEvent,
     profileIsFetching: profileQuery.fetchStatus === "fetching",
     profileStatus: profileQuery.status,
   });
   const gateComplete = onboardingGate.complete;
+  const welcomeChannelFocusIntentRef = React.useRef(new Map<string, boolean>());
   const requestWelcomeChannel = React.useCallback(
-    (focus: boolean) => {
-      if (!currentPubkey || !welcomeChannelWorkspaceScope) {
-        return Promise.resolve();
+    (focus: boolean): Promise<ChannelInitResult> => {
+      if (!currentPubkey || !welcomeChannelCommunityScope) {
+        return Promise.resolve({ ok: true });
       }
 
-      const welcomeChannelInitKey = `${welcomeChannelWorkspaceScope}:${currentPubkey}`;
+      const welcomeChannelInitKey = `${welcomeChannelCommunityScope}:${currentPubkey}`;
       const currentPromise = welcomeChannelInitPromisesRef.current.get(
         welcomeChannelInitKey,
       );
       if (currentPromise) {
+        // A focus=true request must not be swallowed behind an in-flight
+        // focus=false promise. Upgrade the intent: when the background
+        // promise resolves, chain a focus-only follow-up.
+        if (
+          focus &&
+          !welcomeChannelFocusIntentRef.current.get(welcomeChannelInitKey)
+        ) {
+          welcomeChannelFocusIntentRef.current.set(welcomeChannelInitKey, true);
+          return currentPromise.then((result) => {
+            if (!result.ok) return result;
+            return initializeWelcomeChannel(queryClient, {
+              focus: true,
+              pubkey: currentPubkey,
+              communityScope: welcomeChannelCommunityScope,
+            });
+          });
+        }
         return currentPromise;
       }
 
+      if (focus) {
+        welcomeChannelFocusIntentRef.current.set(welcomeChannelInitKey, true);
+      }
       const promise = initializeWelcomeChannel(queryClient, {
         focus,
         pubkey: currentPubkey,
-        workspaceScope: welcomeChannelWorkspaceScope,
+        communityScope: welcomeChannelCommunityScope,
       });
       welcomeChannelInitPromisesRef.current.set(welcomeChannelInitKey, promise);
       void promise.finally(() => {
         welcomeChannelInitPromisesRef.current.delete(welcomeChannelInitKey);
+        welcomeChannelFocusIntentRef.current.delete(welcomeChannelInitKey);
       });
       return promise;
     },
-    [currentPubkey, queryClient, welcomeChannelWorkspaceScope],
+    [currentPubkey, queryClient, welcomeChannelCommunityScope],
   );
 
   React.useEffect(() => {
     if (
       onboardingGate.stage !== "ready" ||
       !currentPubkey ||
-      !welcomeChannelWorkspaceScope ||
+      !welcomeChannelCommunityScope ||
       !readOnboardingCompletion(currentPubkey) ||
-      hasEnsuredWelcomeChannel(currentPubkey, welcomeChannelWorkspaceScope)
+      hasEnsuredWelcomeChannel(currentPubkey, welcomeChannelCommunityScope)
     ) {
       return;
     }
@@ -431,8 +530,46 @@ export function useAppOnboardingState(isSharedIdentity: boolean) {
     currentPubkey,
     onboardingGate.stage,
     requestWelcomeChannel,
-    welcomeChannelWorkspaceScope,
+    welcomeChannelCommunityScope,
   ]);
+
+  const showWelcomeRetryToast = React.useCallback(
+    (reason: string) => {
+      toast.error("Couldn't set up the Welcome channel", {
+        action: {
+          label: "Retry",
+          onClick: () => {
+            void requestWelcomeChannel(true).then((result) => {
+              if (!result.ok) {
+                showWelcomeRetryToast(result.reason);
+              }
+            });
+          },
+        },
+        description: reason,
+      });
+    },
+    [requestWelcomeChannel],
+  );
+
+  const showGeneralRetryToast = React.useCallback(
+    (reason: string) => {
+      toast.error("Couldn't join #general", {
+        action: {
+          label: "Retry",
+          onClick: () => {
+            void autoJoinDefaultChannel(queryClient).then((result) => {
+              if (!result.ok) {
+                showGeneralRetryToast(result.reason);
+              }
+            });
+          },
+        },
+        description: reason,
+      });
+    },
+    [queryClient],
+  );
 
   const completeAndShowWelcome = React.useCallback(() => {
     setIsCompletingWelcomeSetup(true);
@@ -441,11 +578,25 @@ export function useAppOnboardingState(isSharedIdentity: boolean) {
       requestWelcomeChannel(true),
       autoJoinDefaultChannel(queryClient),
     ])
-      .then(() => refreshChannelsCache(queryClient))
+      .then(([welcomeResult, autoJoinResult]) => {
+        if (!welcomeResult.ok) {
+          showWelcomeRetryToast(welcomeResult.reason);
+        }
+        if (!autoJoinResult.ok) {
+          showGeneralRetryToast(autoJoinResult.reason);
+        }
+        return refreshChannelsCache(queryClient);
+      })
       .finally(() => {
         setIsCompletingWelcomeSetup(false);
       });
-  }, [gateComplete, queryClient, requestWelcomeChannel]);
+  }, [
+    gateComplete,
+    queryClient,
+    requestWelcomeChannel,
+    showGeneralRetryToast,
+    showWelcomeRetryToast,
+  ]);
   const flow = {
     actions: {
       complete: completeAndShowWelcome,
@@ -456,9 +607,30 @@ export function useAppOnboardingState(isSharedIdentity: boolean) {
     },
   };
 
+  // Recovery completed this boot: force a relaunch screen regardless of any
+  // other gate state. Backend startup routines (event sync, agent restore,
+  // pending-event flush) were skipped for the ephemeral key and cannot restart
+  // in-process, so nothing else can proceed until the app restarts.
+  const relaunchRequired =
+    ((bootedLost && !identityLost) || (bootedLocked && !identityLocked)) &&
+    identityQuery.status === "success";
+
   return {
     currentPubkey,
     flow,
-    stage: isCompletingWelcomeSetup ? "blocking" : onboardingGate.stage,
+    identityLost,
+    // reset-failed is the highest-precedence stage: a failed boot-time reset
+    // means identity resolution was skipped entirely. Nothing can proceed until
+    // the user relaunches and the wipe retries.
+    stage:
+      identityResetFailed && identityQuery.status === "success"
+        ? ("reset-failed" as const)
+        : identityLocked && identityQuery.status === "success"
+          ? ("keyring-locked" as const)
+          : relaunchRequired
+            ? ("relaunch-required" as const)
+            : isCompletingWelcomeSetup
+              ? ("blocking" as const)
+              : onboardingGate.stage,
   };
 }

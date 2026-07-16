@@ -27,8 +27,9 @@
     },
     {
       "id": "workspaceRail",
-      "name": "Workspace Rail",
-      "description": "Far-left rail for switching relays with cross-relay unread indicators",
+      "name": "Community Rail",
+      "defaultEnabled": true,
+      "description": "Far-left rail for switching communities with cross-community unread indicators",
       "platforms": [
         "desktop"
       ]

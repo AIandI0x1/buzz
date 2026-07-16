@@ -1,6 +1,12 @@
+// Deep async call chains (mesh ensure→download→start under Tauri command
+// futures) exceed the default query depth when computing layouts.
+#![recursion_limit = "256"]
+
 mod app_state;
+mod archive;
 mod commands;
 mod deep_link;
+mod event_sync;
 mod events;
 mod huddle;
 mod managed_agents;
@@ -11,10 +17,12 @@ mod migration;
 #[cfg(test)]
 mod model_tests;
 mod models;
+mod nostr_bind;
 pub mod nostr_convert;
 mod prevent_sleep;
 mod ptt_shortcut;
 mod relay;
+mod reset;
 mod secret_store;
 mod shutdown;
 mod templates;
@@ -31,22 +39,30 @@ use deep_link::handle_deep_link_url;
 use huddle::audio_output::{
     get_audio_output_device, list_audio_output_devices, set_audio_output_device,
 };
+use huddle::reconnect::reconnect_huddle_audio;
 use huddle::{
     add_agent_to_huddle, check_pipeline_hotstart, confirm_huddle_active, download_voice_models,
     end_huddle, get_huddle_agent_pubkeys, get_huddle_state, get_model_status, get_voice_input_mode,
     join_huddle, leave_huddle, push_audio_pcm, set_huddle_transcription_enabled, set_tts_enabled,
     set_voice_input_mode, speak_agent_message, start_huddle, start_stt_pipeline,
 };
-use managed_agents::{
-    backfill_persona_snapshots, ensure_nest, restore_managed_agents_on_launch, try_regenerate_nest,
-};
+use managed_agents::{backfill_persona_snapshots, ensure_nest, try_regenerate_nest};
+#[cfg(all(feature = "mesh-llm", target_os = "macos"))]
+use shutdown::hard_exit_after_mesh_shutdown;
 use shutdown::shutdown_managed_agents;
+#[cfg(feature = "mesh-llm")]
+use shutdown::shutdown_mesh_runtime;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+#[cfg(target_os = "macos")]
+use tauri::Listener;
 use tauri::{Emitter, Manager, RunEvent};
 use tauri_plugin_window_state::StateFlags;
+
+#[cfg(target_os = "macos")]
+const INITIAL_RENDER_READY_EVENT: &str = "initial-render-ready";
 
 #[tauri::command]
 fn perform_sidebar_default_haptic() {
@@ -64,8 +80,185 @@ fn perform_sidebar_default_haptic() {
     }
 }
 
+/// Performs the window action matching the macOS "double-click a window's
+/// title bar to" preference (`AppleActionOnDoubleClick`).
+///
+/// macOS values are `Minimize`, `Maximize` (default when unset), `Fill`, or
+/// `None`.
+/// The desktop app uses a web-based title-bar drag region, so the frontend
+/// forwards double-clicks here and suppresses Tauri's injected drag-region
+/// handler, whose default macOS path hardcodes maximize.
+///
+/// For `Fill`, resize to the current monitor work area instead of using
+/// Tauri's maximize path, which maps to macOS zoom for titled, resizable
+/// windows.
+///
+/// On non-macOS platforms this always toggles maximize (the historical
+/// behavior).
+#[tauri::command]
+fn title_bar_double_click(window: tauri::Window) {
+    #[cfg(target_os = "macos")]
+    {
+        let action = {
+            let output = std::process::Command::new("defaults")
+                .args(["read", "-g", "AppleActionOnDoubleClick"])
+                .output();
+            match output {
+                Ok(output) if output.status.success() => {
+                    String::from_utf8_lossy(&output.stdout).trim().to_string()
+                }
+                _ => "Maximize".to_string(),
+            }
+        };
+
+        match action.as_str() {
+            "None" => {}
+            "Minimize" => {
+                let _ = window.minimize();
+            }
+            "Fill" => {
+                fill_window(&window);
+            }
+            // "Maximize" or any unexpected value.
+            _ => {
+                toggle_maximize(&window);
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        toggle_maximize(&window);
+    }
+}
+
+/// Fills the current display work area, excluding system UI like the menu bar
+/// and Dock.
+#[cfg(target_os = "macos")]
+fn fill_window(window: &tauri::Window) {
+    match window.current_monitor() {
+        Ok(Some(monitor)) => {
+            if window.is_maximized().unwrap_or(false) {
+                let _ = window.unmaximize();
+            }
+
+            let work_area = monitor.work_area();
+            let _ = window.set_position(work_area.position);
+            let _ = window.set_size(work_area.size);
+        }
+        _ => {
+            let _ = window.maximize();
+        }
+    }
+}
+
+/// Toggles the window between maximized and its previous size, matching the
+/// historical double-click behavior.
+fn toggle_maximize(window: &tauri::Window) {
+    match window.is_maximized() {
+        Ok(true) => {
+            let _ = window.unmaximize();
+        }
+        _ => {
+            let _ = window.maximize();
+        }
+    }
+}
+
+fn reveal_initial_window<R: tauri::Runtime>(window: &tauri::Window<R>) {
+    if let Err(error) = window.show() {
+        eprintln!("buzz-desktop: failed to reveal main window: {error}");
+        return;
+    }
+    if let Err(error) = window.set_focus() {
+        eprintln!("buzz-desktop: failed to focus main window: {error}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn set_initial_window_backing<R: tauri::Runtime>(window: &tauri::Window<R>) {
+    // The window remains transparent at runtime for vibrancy. Use an opaque
+    // native backing only across the first visible frames so the previous app
+    // cannot show through before WebKit has submitted its first surface.
+    if let Err(error) = window.set_background_color(Some(tauri::window::Color(17, 21, 24, 255))) {
+        eprintln!("buzz-desktop: failed to set initial window backing: {error}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn clear_initial_window_backing<R: tauri::Runtime>(window: &tauri::Window<R>) {
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    if let Err(error) = window.set_background_color(None) {
+        eprintln!("buzz-desktop: failed to clear initial window backing: {error}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn wait_for_stable_initial_window_geometry<R: tauri::Runtime>(window: &tauri::Window<R>) {
+    const MAX_POLLS: usize = 120;
+    const REQUIRED_STABLE_POLLS: usize = 4;
+
+    let mut previous_bounds = None;
+    let mut stable_polls = 0;
+
+    for _ in 0..MAX_POLLS {
+        // Accept whatever geometry the window-state plugin restores — maximized
+        // or a normal saved size. macOS applies the restore asynchronously, so
+        // we only need consecutive identical outer bounds to know it settled.
+        // Gating on `is_maximized()` here would leave `bounds` permanently
+        // `None` for restored non-maximized windows and stall the reveal until
+        // the poll timeout.
+        let bounds = match (window.outer_position(), window.outer_size()) {
+            (Ok(position), Ok(size)) => Some((position.x, position.y, size.width, size.height)),
+            _ => None,
+        };
+
+        if bounds.is_some() && bounds == previous_bounds {
+            stable_polls += 1;
+            if stable_polls >= REQUIRED_STABLE_POLLS {
+                return;
+            }
+        } else {
+            stable_polls = 0;
+        }
+        previous_bounds = bounds;
+
+        tokio::time::sleep(std::time::Duration::from_millis(16)).await;
+    }
+
+    eprintln!("buzz-desktop: initial window geometry did not settle before reveal timeout");
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // mesh-llm's async chains (model download, node start/join) overflow
+    // tokio's default 2 MiB worker stacks — a stack-guard SIGABRT, not a
+    // panic. Upstream mesh-llm and mesh-console both run on 8 MiB worker
+    // stacks for this reason; give Tauri's command runtime the same headroom
+    // before anything else touches tauri::async_runtime.
+    #[cfg(feature = "mesh-llm")]
+    match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(crate::mesh_llm::MESH_WORKER_STACK_SIZE)
+        .build()
+    {
+        Ok(runtime) => {
+            tauri::async_runtime::set(runtime.handle().clone());
+            // Keep the runtime alive for the process lifetime; dropping it
+            // would shut down the workers Tauri now depends on.
+            std::mem::forget(runtime);
+            eprintln!(
+                "buzz-mesh: installed tokio runtime with {} MiB worker stacks",
+                crate::mesh_llm::MESH_WORKER_STACK_SIZE / (1024 * 1024)
+            );
+        }
+        Err(error) => {
+            // Fall back to Tauri's default runtime: the app still works,
+            // only deep mesh-llm futures are at risk of stack overflow.
+            eprintln!("buzz-mesh: failed to build big-stack tokio runtime, using default: {error}");
+        }
+    }
+
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             // Focus the existing window when a duplicate instance launches.
@@ -84,17 +277,59 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(
             tauri_plugin_window_state::Builder::default()
-                // The main window should always launch edge-to-edge in the
-                // available desktop area. Do not let stale saved geometry or
-                // fullscreen state override the maximized launch config.
-                .with_state_flags(
-                    StateFlags::all()
-                        & !(StateFlags::VISIBLE
-                            | StateFlags::POSITION
-                            | StateFlags::SIZE
-                            | StateFlags::MAXIMIZED
-                            | StateFlags::FULLSCREEN),
-                )
+                // Visibility is excluded: the native reveal plugin below
+                // shows the window after saved geometry has been restored.
+                .with_state_flags(StateFlags::all() & !StateFlags::VISIBLE)
+                .build(),
+        )
+        .plugin(
+            tauri::plugin::Builder::<_, ()>::new("initial-window-reveal")
+                .on_webview_ready(|webview| {
+                    if webview.label() != "main" {
+                        return;
+                    }
+
+                    // macOS applies the restored geometry asynchronously. Wait
+                    // for several identical outer bounds and for React to
+                    // commit the startup surface before revealing it.
+                    let window = webview.window();
+
+                    #[cfg(target_os = "macos")]
+                    {
+                        set_initial_window_backing(&window);
+
+                        let (initial_render_tx, initial_render_rx) = tokio::sync::oneshot::channel();
+                        window
+                            .app_handle()
+                            .once(INITIAL_RENDER_READY_EVENT, move |_| {
+                                let _ = initial_render_tx.send(());
+                            });
+
+                        tauri::async_runtime::spawn(async move {
+                            wait_for_stable_initial_window_geometry(&window).await;
+
+                            if tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                initial_render_rx,
+                            )
+                            .await
+                            .is_err()
+                            {
+                                eprintln!(
+                                    "buzz-desktop: initial render did not commit before reveal timeout"
+                                );
+                            }
+
+                            reveal_initial_window(&window);
+                            clear_initial_window_backing(&window).await;
+                        });
+                    }
+
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        reveal_initial_window(&window);
+                    }
+                })
                 .build(),
         )
         .plugin(tauri_plugin_websocket::init())
@@ -205,8 +440,6 @@ pub fn run() {
     #[cfg(not(buzz_updater_enabled))]
     let builder = builder;
 
-    let shutdown_started = Arc::new(AtomicBool::new(false));
-    let restore_shutdown_started = Arc::clone(&shutdown_started);
     let app = builder
         .register_asynchronous_uri_scheme_protocol("buzz-media", |ctx, request, responder| {
             let app = ctx.app_handle().clone();
@@ -219,27 +452,75 @@ pub fn run() {
         .manage(commands::pairing::PairingHandle::new())
         .setup(move |app| {
             let app_handle = app.handle().clone();
-            let shutdown_started = Arc::clone(&restore_shutdown_started);
+
+            // ── Phase 2: boot-time sentinel wipe ──────────────────────────────
+            // Must run before migrations and identity resolution so the wipe
+            // completes atomically on crash recovery.
+            //
+            // init_nest_dir is called early here (normally it runs inside
+            // run_boot_migrations) so reset::run_boot_reset can call nest_dir().
+            let reset_outcome = if let Ok(data_dir) = app_handle.path().app_data_dir() {
+                let is_dev_for_reset = data_dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(crate::migration::is_dev_data_dir_name)
+                    .unwrap_or(false);
+                crate::managed_agents::init_nest_dir(is_dev_for_reset);
+                crate::reset::run_boot_reset(&data_dir)
+            } else {
+                crate::reset::ResetOutcome::default()
+            };
+
+            if reset_outcome.failed {
+                // Surface reset-failed state — skip identity resolution and
+                // all side-effecting setup. The webview still loads so the
+                // frontend can show the recovery screen via get_identity.
+                let state = app_handle.state::<AppState>();
+                state
+                    .reset_failed
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Ok(());
+            }
 
             // Run all pre-identity data migrations before state loads from disk.
-            migration::run_boot_migrations(&app_handle);
+            if reset_outcome.completed {
+                migration::run_boot_migrations_after_reset(&app_handle);
+            } else {
+                migration::run_boot_migrations(&app_handle);
+            }
 
             // Resolve persisted identity key (env var → file → generate+save).
             // This is fatal — the app should not start with an ephemeral identity
             // that will be lost on restart, as that silently breaks channel
             // memberships, DMs, and relay identity.
             let state = app_handle.state::<AppState>();
-            resolve_persisted_identity(&app_handle, &state)
-                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            if let Err(e) = resolve_persisted_identity(&app_handle, &state) {
+                eprintln!("buzz-desktop: fatal: identity resolution failed: {e}");
+                std::process::exit(1);
+            }
 
-            // Sync team-dir edits and reconcile persona/team events. Needs the
-            // resolved owner keys, so it runs after identity resolution.
-            let owner_keys = state
-                .keys
-                .lock()
-                .map(|k| k.clone())
-                .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
-            migration::run_event_sync(&app_handle, &owner_keys);
+            // When the identity is in recovery mode (lost = keyring empty after
+            // migration, or keyring-locked = keyring unreachable but marker
+            // present), all owner-keyed side effects (event sync, agent restore,
+            // relay publish) are skipped. The frontend shows a recovery screen;
+            // the user must relaunch after restoring the identity.
+            let identity_lost = state
+                .identity_lost
+                .load(std::sync::atomic::Ordering::Acquire);
+            let keyring_locked = state
+                .keyring_locked
+                .load(std::sync::atomic::Ordering::Acquire);
+            let recovery_mode = identity_lost || keyring_locked;
+
+            // Snapshot owner keys after identity resolution; the best-effort
+            // event reconcile itself runs off the synchronous setup path below.
+            let owner_keys = match state.keys.lock() {
+                Ok(k) => k.clone(),
+                Err(e) => {
+                    eprintln!("buzz-desktop: fatal: owner keys lock poisoned: {e}");
+                    std::process::exit(1);
+                }
+            };
 
             // Backfill the pinned persona snapshot for any pre-existing agent
             // that predates the record-authoritative-spawn cutover (persona_id
@@ -258,15 +539,18 @@ pub fn run() {
                 *guard = Some(app_handle.clone());
             }
 
-            // Bring up the runtime-owned relay-mesh call-me-now listener now,
-            // before any saved agent restore can request a connection. Its
-            // lifetime is tied to the runtime, not a UI mount — this is what
-            // closes the cold-launch hole-punch race.
+            // Bring up the runtime-owned shared-compute coordinator before
+            // saved agents are restored. Its lifetime is tied to the app, not
+            // a UI mount; it publishes discovery and reconciles membership for
+            // MeshLLM's native admission and transport.
             #[cfg(feature = "mesh-llm")]
             {
+                // Route mesh-llm's download progress (model weights, runtime)
+                // onto Tauri events so the UI can render real progress.
+                crate::mesh_llm::install_progress_sink(&app_handle);
                 let mesh_app = app_handle.clone();
                 tauri::async_runtime::spawn(async move {
-                    crate::mesh_llm::spawn_listener(mesh_app).await;
+                    crate::mesh_llm::start_coordinator(mesh_app).await;
                 });
             }
 
@@ -311,7 +595,9 @@ pub fn run() {
             // destination is present. Non-fatal.
             // On a real migration, emit a one-time hint so the user can delete
             // the now-inert ~/.sprout; the frontend dedupes the toast.
-            if migration::migrate_legacy_nest() {
+            // Suppressed when a reset completed this boot: the nest was wiped and
+            // a fresh ~/.sprout-less state is exactly what we want.
+            if !reset_outcome.completed && migration::migrate_legacy_nest() {
                 let _ = app_handle.emit("legacy-nest-migrated", ());
             }
 
@@ -319,10 +605,12 @@ pub fn run() {
             // from the shared ~/.buzz nest into the new dedicated ~/.buzz-dev
             // nest so no work is lost when the nest is first namespaced.
             // Runs only when nest_dir() resolved to ~/.buzz-dev (dev instance).
+            // Suppressed after a reset so re-importing ~/.buzz into ~/.buzz-dev
+            // doesn't re-populate what was just wiped.
             let is_dev_nest = managed_agents::nest_dir()
                 .and_then(|p| p.file_name().map(|n| n.to_os_string()))
                 .is_some_and(|n| n == ".buzz-dev");
-            if is_dev_nest {
+            if !reset_outcome.completed && is_dev_nest {
                 migration::migrate_dev_nest();
             }
 
@@ -330,13 +618,22 @@ pub fn run() {
             // bundled CLI binary. Non-fatal: agents find CLI via PATH.
             if let Ok(exe) = std::env::current_exe() {
                 if let Some(parent) = exe.parent() {
-                    if let Err(error) = managed_agents::ensure_cli_symlink(parent) {
+                    if let Err(error) = managed_agents::ensure_cli_symlink(parent, is_dev_nest) {
                         eprintln!("buzz-desktop: failed to create CLI symlink: {error}");
                     }
                 }
             }
 
             try_regenerate_nest(&app_handle);
+
+            // Sync team-dir edits and reconcile persona/team/agent events after
+            // setup can continue. It is best-effort retention backfill, unlike
+            // identity resolution above, so JSON/SQLite/signing work must not
+            // hold the boot path hostage. Skipped in recovery mode — the owner
+            // key is ephemeral.
+            if !recovery_mode {
+                event_sync::spawn_event_sync(app_handle.clone(), owner_keys);
+            }
 
             if let Some(mgr) = huddle::models::global_model_manager() {
                 mgr.start_stt_download(state.http_client.clone());
@@ -357,20 +654,16 @@ pub fn run() {
                 });
             }
 
-            // Keep launch-time agent restoration off the synchronous setup path
-            // so the frontend can mount and reveal the window promptly. Gated on
-            // the boot-time repos symlink result (see restore_agents above):
-            // skip when a configured repos_dir could not be resolved, so no
-            // agent clones into a REPOS that isn't the user's target.
-            if restore_agents {
-                tauri::async_runtime::spawn(async move {
-                    if let Err(error) =
-                        restore_managed_agents_on_launch(&app_handle, shutdown_started.as_ref())
-                            .await
-                    {
-                        eprintln!("buzz-desktop: failed to restore managed agents: {error}");
-                    }
-                });
+            // Defer launch-time agent restoration until `apply_workspace` has
+            // installed the active workspace relay and identity. Starting here
+            // would race React initialization and send agents whose saved record
+            // has no relay override to the localhost fallback. Preserve the
+            // boot-time repos and identity recovery safety gates by only marking
+            // restoration pending when both allow it.
+            if restore_agents && !recovery_mode {
+                state
+                    .managed_agent_restore_pending
+                    .store(true, Ordering::Release);
             }
 
             // Periodic sweep: reap orphaned agents from dead instances every 60s.
@@ -417,38 +710,46 @@ pub fn run() {
             // One loop is the sole publisher for persona, team, and managed-
             // agent writers; a relay-unreachable tick leaves rows pending for
             // the next sweep.
-            let flush_handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                use std::time::Duration;
-                use tauri::Manager;
-                let Ok(db_path) = managed_agents::managed_agents_base_dir(&flush_handle)
-                    .map(|d| d.join("retention.db"))
-                else {
-                    eprintln!("buzz-desktop: event-flush: cannot resolve retention db path");
-                    return;
-                };
-                loop {
-                    let state = flush_handle.state::<AppState>();
-                    if let Err(e) =
-                        managed_agents::persona_events::flush_pending_events(&db_path, &state).await
-                    {
-                        eprintln!("buzz-desktop: event-flush: {e}");
+            // Skipped in recovery mode — flushing under an ephemeral key would
+            // publish events attributed to an identity the user doesn't own.
+            if !recovery_mode {
+                let flush_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use std::time::Duration;
+                    use tauri::Manager;
+                    let Ok(db_path) = managed_agents::managed_agents_base_dir(&flush_handle)
+                        .map(|d| d.join("retention.db"))
+                    else {
+                        eprintln!("buzz-desktop: event-flush: cannot resolve retention db path");
+                        return;
+                    };
+                    loop {
+                        let state = flush_handle.state::<AppState>();
+                        if let Err(e) =
+                            managed_agents::persona_events::flush_pending_events(&db_path, &state)
+                                .await
+                        {
+                            eprintln!("buzz-desktop: event-flush: {e}");
+                        }
+                        tokio::time::sleep(Duration::from_secs(30)).await;
                     }
-                    tokio::time::sleep(Duration::from_secs(30)).await;
-                }
-            });
+                });
+            }
 
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            title_bar_double_click,
             get_identity,
             get_nsec,
             import_identity,
+            persist_current_identity,
             get_profile,
             update_profile,
             get_user_profile,
             get_users_batch,
             get_user_notes,
+            get_git_identity,
             get_project_repo_snapshot,
             get_project_repo_diff,
             get_project_local_repo_diff,
@@ -467,9 +768,12 @@ pub fn run() {
             get_media_proxy_port,
             fetch_link_preview_title,
             discover_acp_providers,
+            discover_git_bash_prerequisite,
             install_acp_runtime,
             discover_managed_agent_prereqs,
             sign_event,
+            sign_nostr_identity_binding,
+            sign_out,
             decrypt_observer_event,
             build_observer_control_event,
             create_auth_event,
@@ -511,9 +815,14 @@ pub fn run() {
             show_native_notification,
             upload_media,
             pick_and_upload_media,
+            pick_and_upload_image,
             upload_media_bytes,
             download_image,
             download_file,
+            fetch_media_bytes,
+            copy_image_to_clipboard,
+            copy_text_to_clipboard,
+            fetch_snapshot_bytes,
             list_relay_members,
             get_my_relay_membership,
             add_relay_member,
@@ -522,6 +831,7 @@ pub fn run() {
             archive_identity,
             unarchive_identity,
             list_archived_identities,
+            get_relay_self,
             resolve_oa_owner,
             list_relay_agents,
             list_managed_agents,
@@ -529,22 +839,23 @@ pub fn run() {
             start_managed_agent,
             stop_managed_agent,
             set_managed_agent_start_on_app_launch,
+            set_managed_agent_auto_restart,
             delete_managed_agent,
             get_managed_agent_log,
             get_agent_models,
             discover_agent_models,
             get_agent_config_surface,
+            get_runtime_file_config,
+            get_baked_build_env_keys,
+            get_baked_build_env,
             put_agent_session_config,
-            mesh_availability,
+            get_global_agent_config,
+            set_global_agent_config,
             mesh_start_node,
-            mesh_ensure_client_node,
-            mesh_prepare_relay_mesh_client,
-            mesh_dial_endpoint_addr,
-            mesh_status_report_payload,
             mesh_stop_node,
             mesh_node_status,
             mesh_installed_models,
-            mesh_agent_preset,
+            mesh_model_catalog,
             update_managed_agent,
             discover_backend_providers,
             probe_backend_provider,
@@ -563,14 +874,16 @@ pub fn run() {
             create_team,
             update_team,
             delete_team,
-            install_team_from_directory,
-            sync_team_directory,
-            pick_team_directory,
-            export_team_to_json,
-            parse_team_file,
-            parse_persona_files,
-            export_persona_to_json,
+            export_agent_snapshot,
+            preview_agent_snapshot_import,
+            confirm_agent_snapshot_import,
+            encode_agent_snapshot_for_send,
+            export_team_snapshot,
+            encode_team_snapshot_for_send,
+            preview_team_snapshot_import,
+            confirm_team_snapshot_import,
             get_channel_workflows,
+            get_channels_workflows,
             get_workflow,
             create_workflow,
             update_workflow,
@@ -594,6 +907,7 @@ pub fn run() {
             end_huddle,
             get_huddle_state,
             push_audio_pcm,
+            reconnect_huddle_audio,
             start_stt_pipeline,
             set_huddle_transcription_enabled,
             download_voice_models,
@@ -621,45 +935,52 @@ pub fn run() {
             get_agent_memory,
             relay_reconnect_hook,
             relay_reconnect_hook_configured,
+            observer_archive_default_enabled,
+            agent_metric_archive_default_enabled,
+            archive::archive_events,
+            archive::create_save_subscription,
+            archive::merge_save_subscription_kinds,
+            archive::remove_save_subscription_kind,
+            archive::list_save_subscriptions,
+            archive::delete_save_subscription,
+            archive::read_archived_events,
+            archive::read_archived_observer_events_for_channel,
+            archive::index_observer_channel_id,
+            archive::read_unindexed_observer_rows,
             is_auto_update_supported,
+            set_window_vibrancy,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
     let shutdown_done = Arc::new(AtomicBool::new(false));
 
-    // Agent cleanup on SIGINT (Ctrl+C), SIGTERM, and SIGHUP (terminal close).
-    // The ctrlc crate with the "termination" feature covers all three signals
-    // and runs the handler on a dedicated thread (safe for mutex operations).
-    // `shutdown_done` prevents double-execution with the RunEvent handler.
-    // `process::exit(0)` intentionally skips Drop impls to avoid re-entrant
-    // locking in destructors during signal teardown.
     #[cfg(unix)]
-    {
-        let signal_app = app.handle().clone();
-        let signal_shutdown_done = Arc::clone(&shutdown_done);
-        let signal_shutdown_started = Arc::clone(&shutdown_started);
-        if let Err(e) = ctrlc::set_handler(move || {
-            signal_shutdown_started.store(true, Ordering::SeqCst);
-            if !signal_shutdown_done.swap(true, Ordering::SeqCst) {
-                let _ = shutdown_managed_agents(&signal_app);
-            }
-            std::process::exit(0);
-        }) {
-            eprintln!("buzz-desktop: failed to register signal handler: {e}");
-        }
-    }
+    shutdown::install_signal_handler(app.handle().clone(), Arc::clone(&shutdown_done));
 
     let run_shutdown_done = Arc::clone(&shutdown_done);
     app.run(move |app_handle, event| match event {
         RunEvent::ExitRequested { .. } | RunEvent::Exit => {
-            shutdown_started.store(true, Ordering::SeqCst);
+            app_handle
+                .state::<AppState>()
+                .shutdown_started
+                .store(true, Ordering::SeqCst);
             if !run_shutdown_done.swap(true, Ordering::SeqCst) {
                 prevent_sleep::release(&app_handle.state::<AppState>().prevent_sleep);
                 if let Err(error) = shutdown_managed_agents(app_handle) {
                     eprintln!("buzz-desktop: failed to stop managed agents: {error}");
                 }
+                #[cfg(feature = "mesh-llm")]
+                shutdown_mesh_runtime(app_handle);
             }
+
+            // AppKit terminates through libc exit(), which runs C++ static
+            // destructors. The embedded ggml/Metal runtime currently aborts in
+            // that destructor phase even after its node has stopped cleanly.
+            // End the process only after Buzz and Mesh shutdown above, while
+            // deliberately skipping those native global destructors.
+            #[cfg(all(feature = "mesh-llm", target_os = "macos"))]
+            hard_exit_after_mesh_shutdown();
         }
         _ => {}
     });

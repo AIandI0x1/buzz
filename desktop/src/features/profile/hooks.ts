@@ -18,7 +18,7 @@ import {
   getUserProfile,
   getUsersBatch,
   updateProfile,
-} from "@/shared/api/tauri";
+} from "@/shared/api/tauriProfiles";
 import { getContactList, setContactList } from "@/shared/api/social";
 import type { ContactListResponse } from "@/shared/api/socialTypes";
 import type {
@@ -41,7 +41,7 @@ import {
   shouldFetchAvatar,
   resolveAvatarDataUrl,
 } from "@/features/profile/lib/selfProfileStorage";
-import { useWorkspaces } from "@/features/workspaces/useWorkspaces";
+import { useCommunities } from "@/features/communities/useCommunities";
 
 export const profileQueryKey = ["profile"] as const;
 export const contactListQueryKey = (pubkey: string) =>
@@ -75,14 +75,18 @@ async function persistSelfProfile(
     avatarUrl: profile.avatarUrl,
     avatarDataUrl,
     updatedAt: Date.now(),
+    // Only persist the presence bit when true — no-event fallbacks
+    // (hasProfileEvent: false) must not be cached as real profiles,
+    // which would cause the onboarding gate to skip on next restart.
+    ...(profile.hasProfileEvent && { hasProfileEvent: true }),
   });
 }
 
 export function useProfileQuery(enabled = true) {
-  const { activeWorkspace } = useWorkspaces();
+  const { activeCommunity } = useCommunities();
   const identityQuery = useIdentityQuery();
   const queryClient = useQueryClient();
-  const relayUrl = activeWorkspace?.relayUrl ?? "";
+  const relayUrl = activeCommunity?.relayUrl ?? "";
   const pubkey = identityQuery.data?.pubkey ?? "";
 
   // Parse localStorage once per relayUrl/pubkey pair — not on every render.
@@ -105,13 +109,17 @@ export function useProfileQuery(enabled = true) {
             about: null,
             nip05Handle: null,
             ownerPubkey: null,
+            // Only true when the cache entry was explicitly written with a
+            // real kind:0-backed profile. Older entries (absent field) and
+            // no-event fallbacks default to false — conservative is correct.
+            hasProfileEvent: cached.hasProfileEvent === true,
           } satisfies Profile)
         : undefined,
     [cached, pubkey],
   );
 
   // `initialData` is only honored at query construction, which happens before
-  // identity/workspace resolve on a fresh QueryClient — seed the cache
+  // identity/community resolve on a fresh QueryClient — seed the cache
   // imperatively once they arrive, without ever stomping a real fetch result.
   React.useEffect(() => {
     if (!initialData || !cached) return;
@@ -149,9 +157,9 @@ export function useProfileQuery(enabled = true) {
  * SELF_PROFILE_CACHE_EVENT after writes so this hook re-reads without polling.
  */
 export function useSelfProfileCache(): SelfProfileCache | null {
-  const { activeWorkspace } = useWorkspaces();
+  const { activeCommunity } = useCommunities();
   const identityQuery = useIdentityQuery();
-  const relayUrl = activeWorkspace?.relayUrl ?? "";
+  const relayUrl = activeCommunity?.relayUrl ?? "";
   const pubkey = identityQuery.data?.pubkey ?? "";
 
   const [cache, setCache] = React.useState<SelfProfileCache | null>(() =>
@@ -370,7 +378,15 @@ export function useUsersBatchQuery(
     for (const [pubkey, summary] of Object.entries(profiles)) {
       queryClient.setQueryData<Profile>(
         ["user-profile", pubkey],
-        (existing) => existing ?? { pubkey, about: null, ...summary },
+        (existing) =>
+          existing ?? {
+            pubkey,
+            about: null,
+            // Batch endpoint gives UserProfileSummary (no event-presence flag).
+            // These cached summaries are never used for the onboarding gate.
+            hasProfileEvent: false,
+            ...summary,
+          },
       );
     }
   }, [query.data, queryClient]);
@@ -469,14 +485,26 @@ export function useUserSearchFetchMoreOnScroll(
 
 export function useUpdateProfileMutation() {
   const queryClient = useQueryClient();
-  const { activeWorkspace } = useWorkspaces();
+  const { activeCommunity } = useCommunities();
   const identityQuery = useIdentityQuery();
 
   return useMutation({
     mutationFn: (input: UpdateProfileInput) => updateProfile(input),
-    onSuccess: (profile: Profile) => {
+    onMutate: async () => {
+      // Discard any in-flight profile fetch: a background refetch started
+      // before the update (e.g. by a route mount) can resolve AFTER
+      // onSuccess writes the fresh profile below and clobber it with the
+      // pre-update snapshot — the avatar/name then silently reverts until
+      // some later refetch. (Masked historically by users-batch refetch
+      // churn from per-keystroke app renders; exposed when those renders
+      // were removed.)
+      await queryClient.cancelQueries({ queryKey: profileQueryKey });
+    },
+    onSuccess: async (profile: Profile) => {
+      // Cancel again: a refetch may have started while mutationFn awaited.
+      await queryClient.cancelQueries({ queryKey: profileQueryKey });
       queryClient.setQueryData(profileQueryKey, profile);
-      const relayUrl = activeWorkspace?.relayUrl ?? "";
+      const relayUrl = activeCommunity?.relayUrl ?? "";
       const pubkey = identityQuery.data?.pubkey ?? profile.pubkey;
       if (relayUrl && pubkey) {
         void persistSelfProfile(relayUrl, pubkey, profile);

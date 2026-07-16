@@ -3,7 +3,7 @@ import { motion } from "motion/react";
 
 import { cn } from "@/shared/lib/cn";
 import { Input } from "@/shared/ui/input";
-import { PersonaDropdownField } from "./PersonaDropdownField";
+import { PersonaModelCombobox } from "./PersonaModelCombobox";
 import type { PersonaModelDiscoveryStatus } from "./personaModelDiscoveryStatus";
 import {
   type PersonaDropdownOption,
@@ -18,6 +18,7 @@ type PersonaModelFieldProps = {
   model: string;
   modelDiscoveryStatus: PersonaModelDiscoveryStatus | null;
   modelDropdownOptions: readonly PersonaDropdownOption[];
+  showSharedComputeAutoHint: boolean;
   modelSelectValue: string;
   onCustomModelChange: (value: string) => void;
   onModelValueChange: (value: string) => void;
@@ -32,6 +33,7 @@ export function PersonaModelField({
   modelDiscoveryStatus,
   modelDropdownOptions,
   modelSelectValue,
+  showSharedComputeAutoHint,
   onCustomModelChange,
   onModelValueChange,
   showCustomModelInput,
@@ -56,7 +58,7 @@ export function PersonaModelField({
             <span className={PERSONA_LABEL_OPTIONAL_CLASS}>Optional</span>
           ) : null}
         </label>
-        <PersonaDropdownField
+        <PersonaModelCombobox
           disabled={disabled}
           id="persona-model"
           onValueChange={onModelValueChange}
@@ -87,6 +89,11 @@ export function PersonaModelField({
               value={model}
             />
           </div>
+        ) : null}
+        {showSharedComputeAutoHint ? (
+          <p className="text-xs text-muted-foreground">
+            Buzz will choose an available shared model when the agent starts.
+          </p>
         ) : null}
         {modelDiscoveryStatus ? (
           <p

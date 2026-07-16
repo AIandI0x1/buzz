@@ -1,7 +1,12 @@
 import * as React from "react";
 import { Bot, Hash, LogIn, Plus, Sparkles, UserPlus } from "lucide-react";
+import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { useMediaUpload } from "@/features/messages/lib/useMediaUpload";
 import { MessageComposer } from "@/features/messages/ui/MessageComposer";
+import { ComposerTimeoutBanner } from "@/features/moderation/ui/ComposerTimeoutBanner";
+import { useTimeoutState } from "@/features/moderation/lib/timeoutStore";
+import { isModerationDm } from "@/features/moderation/lib/moderationDm";
+import { useRelaySelfQuery } from "@/features/moderation/hooks";
 import { DropZoneOverlay } from "@/features/messages/ui/ComposerAttachments";
 import {
   MessageThreadPanel,
@@ -27,6 +32,7 @@ import { ChannelFindBar } from "@/features/search/ui/ChannelFindBar";
 import { AgentSessionThreadPanel } from "@/features/channels/ui/AgentSessionThreadPanel";
 import { ChannelManagementAuxiliaryPanel } from "@/features/channels/ui/ChannelManagementAuxiliaryPanel";
 import { RightAuxiliaryPane } from "@/features/channels/ui/RightAuxiliaryPane";
+import { useChannelWorkingAgentPubkeys } from "@/features/agents/agentWorkingSignal";
 import { BotActivityComposerAction } from "@/features/channels/ui/BotActivityBar";
 import {
   containsWelcomePersonaMention,
@@ -45,6 +51,7 @@ import {
 } from "@/features/channels/ui/ChannelPane.helpers";
 import type { ChannelPaneProps } from "@/features/channels/ui/ChannelPane.types";
 import * as agentSessionSelection from "@/features/channels/ui/agentSessionSelection";
+import { usePrepareDmSendChannel } from "@/features/channels/ui/usePrepareDmSendChannel";
 import { Button } from "@/shared/ui/button";
 import { buildMainTimelineEntries } from "@/features/messages/lib/threadPanel";
 import { useRenderScopedReactionHydration } from "@/features/messages/lib/useRenderScopedReactionHydration";
@@ -60,6 +67,8 @@ export const ChannelPane = React.memo(function ChannelPane({
   agentPubkeysPending = false,
   agentSessionAgents,
   activityAgents = agentSessionAgents,
+  autoSendDraftKey = null,
+  onAutoSendComplete = null,
   botTypingEntries,
   channelFind,
   channelManagementOpen = false,
@@ -68,6 +77,7 @@ export const ChannelPane = React.memo(function ChannelPane({
   fetchOlder,
   header,
   hasOlderMessages,
+  historyExhausted,
   isFetchingOlder,
   followThreadById,
   isFollowingThread,
@@ -130,6 +140,7 @@ export const ChannelPane = React.memo(function ChannelPane({
   targetMessageId,
   threadHeadMessage,
   threadMessages,
+  threadMessagesPending = false,
   threadPanelWidthPx,
   threadScrollTargetId,
   threadTypingPubkeys,
@@ -147,6 +158,11 @@ export const ChannelPane = React.memo(function ChannelPane({
   const welcomeComposerHideTimerRef = React.useRef<number | null>(null);
   const [welcomeComposerBannerState, setWelcomeComposerBannerState] =
     React.useState<WelcomeComposerBannerState>("prompt");
+  const { goChannel } = useAppNavigation();
+  const prepareDmSendChannel = usePrepareDmSendChannel(
+    activeChannel,
+    currentPubkey,
+  );
   const mainComposerMedia = useMediaUpload();
   const isNonMemberView =
     activeChannel !== null &&
@@ -155,6 +171,29 @@ export const ChannelPane = React.memo(function ChannelPane({
     !activeChannel.archivedAt;
   const hasMainComposerOverlay = !isNonMemberView;
   const activeChannelId = activeChannel?.id ?? null;
+  const activeChannelIdRef = React.useRef(activeChannelId);
+  const channelPaneMountedRef = React.useRef(false);
+  activeChannelIdRef.current = activeChannelId;
+  React.useEffect(() => {
+    channelPaneMountedRef.current = true;
+    return () => {
+      channelPaneMountedRef.current = false;
+    };
+  }, []);
+  // Clear the ?autoSend search param once the auto-submit fires so
+  // back-navigation cannot re-trigger the send.
+  // When `onAutoSendComplete` is provided it does a surgical single-key clear
+  // that preserves `?thread` and all other panel search state (required for
+  // the thread-draft send path so the thread panel does not unmount before the
+  // deferred setTimeout(0) submit fires). The goChannel fallback is kept for
+  // callers that do not supply the prop (e.g. isolated tests / older wrappers).
+  const handleAutoSubmitComplete = React.useCallback(() => {
+    if (onAutoSendComplete) {
+      onAutoSendComplete();
+    } else if (activeChannelId) {
+      void goChannel(activeChannelId, { replace: true });
+    }
+  }, [activeChannelId, goChannel, onAutoSendComplete]);
   const huddleMemberPubkeys = React.useMemo(
     () => getDmHuddleMemberPubkeys(activeChannel, agentPubkeys, currentPubkey),
     [activeChannel, agentPubkeys, currentPubkey],
@@ -167,6 +206,7 @@ export const ChannelPane = React.memo(function ChannelPane({
     timelineScrollRef,
     composerWrapperRef,
     `${activeChannelId}:${isSinglePanelView}:${hasMainComposerOverlay}`,
+    "css-variable",
   );
   const clearWelcomeComposerDismissTimer = React.useCallback(() => {
     if (welcomeComposerDismissTimerRef.current !== null) {
@@ -250,10 +290,24 @@ export const ChannelPane = React.memo(function ChannelPane({
     return true;
   }, [findLastOwnEditable, onEdit, threadHeadMessage, threadMessages]);
 
+  const timeoutState = useTimeoutState();
+
+  // A moderation DM (1:1 with the relay identity) is read-only for the member;
+  // only DMs pay for the NIP-11 `self` lookup. Fails open: no `relaySelf` →
+  // ordinary DM, composer enabled.
+  const relaySelfQuery = useRelaySelfQuery(activeChannel?.channelType === "dm");
+  const isModerationDmChannel = isModerationDm(
+    activeChannel ?? null,
+    currentPubkey,
+    relaySelfQuery.data,
+  );
+
   const isComposerDisabled =
     !activeChannel?.isMember ||
     activeChannel.archivedAt !== null ||
     activeChannel.channelType === "forum" ||
+    timeoutState.active ||
+    isModerationDmChannel ||
     isSending;
   const knownAgentPubkeys = React.useMemo(() => {
     const pubkeys = new Set<string>();
@@ -310,12 +364,23 @@ export const ChannelPane = React.memo(function ChannelPane({
       messageTimelineRef.current?.scrollToBottomOnNextUpdate();
       await onSendMessage(content, mentionPubkeys, mediaTags, channelId);
 
+      if (
+        channelId &&
+        channelId !== activeChannelId &&
+        channelPaneMountedRef.current &&
+        activeChannelIdRef.current === activeChannelId
+      ) {
+        await goChannel(channelId, { replace: true });
+      }
+
       if (shouldCompleteWelcomeBanner) {
         completeWelcomeComposerBanner();
       }
     },
     [
+      activeChannelId,
       completeWelcomeComposerBanner,
+      goChannel,
       isActiveWelcomeChannel,
       knownAgentPubkeys,
       onSendMessage,
@@ -324,24 +389,14 @@ export const ChannelPane = React.memo(function ChannelPane({
   const canDropInMainColumn =
     hasMainComposerOverlay && !isComposerDisabled && !isSinglePanelView;
   const hasTypingActivity = typingPubkeys.length > 0;
-  const composerBotTypingPubkeys = React.useMemo(() => {
-    const pubkeys: string[] = [];
-    for (const entry of botTypingEntries) {
-      if (entry.threadHeadId !== null) {
-        continue;
-      }
-
-      if (
-        !pubkeys.some(
-          (pubkey) => pubkey.toLowerCase() === entry.pubkey.toLowerCase(),
-        )
-      ) {
-        pubkeys.push(entry.pubkey);
-      }
-    }
-    return pubkeys;
-  }, [botTypingEntries]);
-  const hasComposerBotActivity = composerBotTypingPubkeys.length > 0;
+  // Unified working set for the composer bar: observer-derived turns primary,
+  // bot typing fallback (both folded together by agentWorkingSignal). This is
+  // what makes the bar show for an agent whose observer stream is live but
+  // whose typing signal never arrives — and vice versa.
+  const composerWorkingBotPubkeys = useChannelWorkingAgentPubkeys(
+    activeChannel?.id ?? null,
+  );
+  const hasComposerBotActivity = composerWorkingBotPubkeys.length > 0;
   const threadComposerBotTypingPubkeys = React.useMemo(() => {
     if (!openThreadHeadId) {
       return [];
@@ -382,21 +437,25 @@ export const ChannelPane = React.memo(function ChannelPane({
 
     const actions = [];
     if (isWelcomeChannel(activeChannel)) {
+      if (onAddAgent) {
+        actions.push({
+          icon: <Bot aria-hidden className="h-6 w-6" />,
+          label: "Create an agent",
+          onClick: () =>
+            onAddAgent({
+              beforeSend: () =>
+                messageTimelineRef.current?.scrollToBottomOnNextUpdate(),
+            }),
+          testId: "welcome-intro-action-create-agent",
+        });
+      }
+
       if (onCreateChannel) {
         actions.push({
           icon: <Plus aria-hidden className="h-6 w-6" />,
           label: "Create a channel",
           onClick: onCreateChannel,
           testId: "welcome-intro-action-create-channel",
-        });
-      }
-
-      if (onAddAgent) {
-        actions.push({
-          icon: <Bot aria-hidden className="h-6 w-6" />,
-          label: "Create a custom agent",
-          onClick: onAddAgent,
-          testId: "welcome-intro-action-create-agent",
         });
       }
 
@@ -579,7 +638,6 @@ export const ChannelPane = React.memo(function ChannelPane({
           ) : null}
           <MessageTimeline
             ref={messageTimelineRef}
-            agentPubkeys={agentPubkeys}
             channelId={activeChannel?.id}
             channelIntro={channelIntro}
             directMessageIntro={directMessageIntro}
@@ -589,6 +647,7 @@ export const ChannelPane = React.memo(function ChannelPane({
             followThreadById={followThreadById}
             hasComposerOverlay={hasMainComposerOverlay}
             hasOlderMessages={hasOlderMessages}
+            historyExhausted={historyExhausted}
             huddleMemberPubkeys={huddleMemberPubkeys}
             huddleMemberPubkeysPending={huddleMemberPubkeysPending}
             isFetchingOlder={isFetchingOlder}
@@ -632,6 +691,9 @@ export const ChannelPane = React.memo(function ChannelPane({
             searchMatchingMessageIds={channelFind.matchingMessageIds}
             searchQuery={channelFind.query}
             targetMessageId={targetMessageId}
+            splitThreadPanelOpen={
+              useSplitAuxiliaryPane && Boolean(openThreadHeadId)
+            }
             threadUnreadCounts={threadUnreadCounts}
           />
           {isNonMemberView ? (
@@ -662,12 +724,16 @@ export const ChannelPane = React.memo(function ChannelPane({
             </div>
           ) : (
             <div
-              className="pointer-events-none absolute inset-x-0 bottom-0 z-40"
+              className="pointer-events-none absolute inset-x-0 bottom-0 z-40 bg-background/70 backdrop-blur-md supports-[backdrop-filter]:bg-background/55"
               data-testid="channel-composer-overlay"
               ref={composerWrapperRef}
             >
               <div className="pointer-events-auto">
-                {isActiveWelcomeChannel ? (
+                {timeoutState.active ? (
+                  <ComposerTimeoutBanner
+                    expiresAtMs={timeoutState.expiresAtMs}
+                  />
+                ) : isActiveWelcomeChannel ? (
                   <WelcomeComposerBanner state={welcomeComposerBannerState} />
                 ) : null}
                 <MessageComposer
@@ -677,28 +743,39 @@ export const ChannelPane = React.memo(function ChannelPane({
                   containerClassName="px-5"
                   disabled={isComposerDisabled}
                   editTarget={mainEditTarget}
+                  autoSubmitDraftKey={autoSendDraftKey}
+                  onAutoSubmitComplete={handleAutoSubmitComplete}
                   isSending={isSending}
                   mediaController={mainComposerMedia}
                   onCancelEdit={onCancelEdit}
                   onEditLastOwnMessage={handleEditLastOwnMainMessage}
                   onEditSave={onEditSave}
+                  onPrepareSendChannel={
+                    activeChannel?.channelType === "dm"
+                      ? prepareDmSendChannel
+                      : undefined
+                  }
                   onSend={handleSendMessage}
                   profiles={profiles}
                   placeholder={
-                    activeChannel?.archivedAt
-                      ? "Archived channels are read-only."
-                      : activeChannel?.channelType === "forum"
-                        ? "Forum posting is not wired in this pass."
-                        : activeChannel
-                          ? activeChannel.channelType === "dm" &&
-                            directMessageIntro
-                            ? `Message ${directMessageIntro.displayName}`
-                            : `Message #${activeChannel.name}`
-                          : "Select a channel"
+                    timeoutState.active
+                      ? "You're timed out by community moderators."
+                      : isModerationDmChannel
+                        ? "This channel is read-only."
+                        : activeChannel?.archivedAt
+                          ? "Archived channels are read-only."
+                          : activeChannel?.channelType === "forum"
+                            ? "Forum posting is not wired in this pass."
+                            : activeChannel
+                              ? activeChannel.channelType === "dm" &&
+                                directMessageIntro
+                                ? `Message ${directMessageIntro.displayName}`
+                                : `Message #${activeChannel.name}`
+                              : "Select a channel"
                   }
                   showTopBorder={false}
                 />
-                <div className="min-h-8 overflow-visible bg-background px-5 pb-1.5 pt-0">
+                <div className="min-h-8 overflow-visible bg-transparent px-5 pb-1.5 pt-0">
                   <div className="flex h-full w-full items-center gap-2 overflow-visible">
                     {hasComposerBotActivity ? (
                       <div className="flex min-w-0 flex-1 overflow-visible">
@@ -708,7 +785,7 @@ export const ChannelPane = React.memo(function ChannelPane({
                           onOpenAgentSession={onOpenAgentSession}
                           openAgentSessionPubkey={openAgentSessionPubkey}
                           profiles={profiles}
-                          typingBotPubkeys={composerBotTypingPubkeys}
+                          workingBotPubkeys={composerWorkingBotPubkeys}
                           variant="inline"
                         />
                       </div>
@@ -751,7 +828,6 @@ export const ChannelPane = React.memo(function ChannelPane({
         (() => {
           const panel = (
             <MessageThreadPanel
-              agentPubkeys={agentPubkeys}
               channel={activeChannel}
               channelId={activeChannel?.id ?? null}
               channelName={activeChannel?.name ?? "channel"}
@@ -769,6 +845,8 @@ export const ChannelPane = React.memo(function ChannelPane({
               }
               layout={useSplitAuxiliaryPane ? "split" : "standalone"}
               transparentChrome={useSplitAuxiliaryPane}
+              autoSendDraftKey={autoSendDraftKey}
+              onAutoSubmitComplete={handleAutoSubmitComplete}
               onCancelEdit={onCancelEdit}
               onCancelReply={onCancelThreadReply}
               onClose={onCloseThread}
@@ -792,6 +870,7 @@ export const ChannelPane = React.memo(function ChannelPane({
               threadHeadVideoReviewContext={threadHeadVideoReviewContext}
               widthPx={threadPanelWidthPx}
               threadReplies={threadMessages}
+              threadRepliesPending={threadMessagesPending}
               threadUnreadCount={threadUnreadCounts?.get(threadHeadMessage.id)}
               threadReplyUnreadCounts={threadReplyUnreadCounts}
               threadTypingPubkeys={threadTypingPubkeys}
@@ -803,7 +882,7 @@ export const ChannelPane = React.memo(function ChannelPane({
                     onOpenAgentSession={onOpenAgentSession}
                     openAgentSessionPubkey={openAgentSessionPubkey}
                     profiles={profiles}
-                    typingBotPubkeys={threadComposerBotTypingPubkeys}
+                    workingBotPubkeys={threadComposerBotTypingPubkeys}
                     variant="inline"
                   />
                 ) : null
@@ -829,13 +908,22 @@ export const ChannelPane = React.memo(function ChannelPane({
         })()
       ) : activeChannel && selectedAgent ? (
         (() => {
+          // When the panel was opened from a different channel than the
+          // currently active one, re-scope it to the active channel so
+          // that both the content/header AND channel-backed actions (e.g.
+          // Stop current turn) operate on the same channel object.
+          const effectiveAgentSessionChannelId =
+            openAgentSessionChannelId &&
+            activeChannel.id !== openAgentSessionChannelId
+              ? activeChannelId
+              : openAgentSessionChannelId;
           const panel = (
             <AgentSessionThreadPanel
               agent={selectedAgent}
               canInterruptTurn={selectedAgent.canInterruptTurn}
               channel={
-                openAgentSessionChannelId
-                  ? activeChannel?.id === openAgentSessionChannelId
+                effectiveAgentSessionChannelId
+                  ? effectiveAgentSessionChannelId === activeChannel.id
                     ? activeChannel
                     : null
                   : agentSessionSelection.isAgentInActivityList({
@@ -845,12 +933,7 @@ export const ChannelPane = React.memo(function ChannelPane({
                     ? activeChannel
                     : null
               }
-              channelId={openAgentSessionChannelId}
-              isWorking={botTypingEntries.some(
-                (entry) =>
-                  entry.pubkey.toLowerCase() ===
-                  selectedAgent.pubkey.toLowerCase(),
-              )}
+              channelId={effectiveAgentSessionChannelId}
               isSinglePanelView={
                 useSplitAuxiliaryPane ? false : isSinglePanelView
               }
@@ -869,6 +952,7 @@ export const ChannelPane = React.memo(function ChannelPane({
           const panel = (
             <UserProfilePanel
               currentPubkey={currentPubkey}
+              callerChannelId={activeChannelId}
               isSinglePanelView={
                 useSplitAuxiliaryPane ? false : isSinglePanelView
               }

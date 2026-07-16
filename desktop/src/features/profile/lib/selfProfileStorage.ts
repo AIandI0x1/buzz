@@ -8,7 +8,7 @@
  *
  * Profiles are keyed per relay + pubkey rather than pubkey alone because the
  * same key can have a different kind-0 on different relays. Scoping by relay
- * prevents one workspace's cached identity from bleeding into another.
+ * prevents one community's cached identity from bleeding into another.
  */
 
 const STORAGE_KEY_PREFIX = "buzz-self-profile.v1";
@@ -43,6 +43,15 @@ export type SelfProfileCache = {
   avatarDataUrl: string | null;
   /** ms timestamp of last successful profile fetch. 0 = never fetched. */
   updatedAt: number;
+  /**
+   * True only when the cached result was backed by a real kind:0 metadata
+   * event on the relay.  False (or absent in older v1 entries) means the
+   * backend returned the synthesized no-event fallback.
+   *
+   * Conservative default: absent = false.  Callers must not promote an absent
+   * or false entry to hasProfileEvent: true — that reopens the onboarding bug.
+   */
+  hasProfileEvent?: boolean;
 };
 
 const DEFAULT_CACHE: SelfProfileCache = Object.freeze({
@@ -87,8 +96,19 @@ export function parseSelfProfileCache(json: unknown): SelfProfileCache | null {
     typeof obj.updatedAt === "number" && Number.isFinite(obj.updatedAt)
       ? obj.updatedAt
       : 0;
+  // Conservative: absent field in older v1 entries defaults to false.
+  // Only a stored true value (written from a profile with has_profile_event)
+  // is promoted — absent/false must never become true.
+  const hasProfileEvent = obj.hasProfileEvent === true ? true : undefined;
 
-  return { version: 1, displayName, avatarUrl, avatarDataUrl, updatedAt };
+  return {
+    version: 1,
+    displayName,
+    avatarUrl,
+    avatarDataUrl,
+    updatedAt,
+    ...(hasProfileEvent !== undefined && { hasProfileEvent }),
+  };
 }
 
 /**
@@ -140,7 +160,7 @@ export function writeSelfProfileCache(
 
 /**
  * Removes all self-profile cache entries for every pubkey on the given relay.
- * Called when a workspace is removed to GC storage for that relay.
+ * Called when a community is removed to GC storage for that relay.
  */
 export function removeSelfProfileCachesForRelay(relayUrl: string): void {
   try {
@@ -203,7 +223,7 @@ export function resolveAvatarDataUrl(
  * is known to be reachable, so the fetch has the best chance of succeeding.
  *
  * The data URL is capped at 256 KB to keep localStorage usage bounded across
- * workspaces and accounts. Returns null on ANY failure: network error, non-OK
+ * communities and accounts. Returns null on ANY failure: network error, non-OK
  * response, wrong content-type, blob too large, or FileReader error.
  */
 export async function fetchAvatarDataUrl(

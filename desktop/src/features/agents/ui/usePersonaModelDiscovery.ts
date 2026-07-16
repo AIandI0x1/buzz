@@ -38,9 +38,12 @@ function getDiscoveredPersonaModelOptions(
     : [
         {
           id: "",
-          label: response.agentDefaultModel?.trim()
-            ? `Default model (${response.agentDefaultModel})`
-            : "Default model",
+          label:
+            provider === "relay-mesh"
+              ? "Default (auto)"
+              : response.agentDefaultModel?.trim()
+                ? `Default model (${response.agentDefaultModel})`
+                : "Default model",
         },
       ];
 
@@ -85,6 +88,11 @@ export function usePersonaModelDiscovery({
   const discoveryAgentCommand = selectedRuntime?.command?.trim()
     ? selectedRuntime.command
     : null;
+  // Narrow to the individual fields the effect consumes so a new object
+  // reference from a React Query refetch (same data, unstable ref) does not
+  // abandon and re-issue an in-flight discovery IPC call.
+  const selectedRuntimeAvailability = selectedRuntime?.availability;
+  const selectedRuntimeDefaultArgs = selectedRuntime?.defaultArgs;
   const canDiscoverModelOptions =
     open &&
     modelFieldVisible &&
@@ -121,7 +129,21 @@ export function usePersonaModelDiscovery({
     if (modelDiscoveryKey === null || discoveryAgentCommand === null) {
       modelDiscoveryRequestRef.current += 1;
       setModelDiscoveryData(null);
-      setModelDiscoveryStatus(null);
+      // When the runtime exists but is not available, surface a status message
+      // so the model dropdown explains why no live models can be loaded.
+      if (
+        selectedRuntimeAvailability != null &&
+        selectedRuntimeAvailability !== "available"
+      ) {
+        setModelDiscoveryStatus(
+          formatModelDiscoveryErrorStatus(
+            new Error(`Runtime not available: ${selectedRuntimeAvailability}`),
+            trimmedProvider,
+          ),
+        );
+      } else {
+        setModelDiscoveryStatus(null);
+      }
       setModelDiscoveryLoading(false);
       return;
     }
@@ -144,7 +166,7 @@ export function usePersonaModelDiscovery({
     function runModelDiscovery() {
       void discoverAgentModels({
         agentCommand: activeAgentCommand,
-        agentArgs: selectedRuntime?.defaultArgs ?? [],
+        agentArgs: selectedRuntimeDefaultArgs ?? [],
         provider: trimmedProvider || undefined,
         envVars,
       })
@@ -193,7 +215,8 @@ export function usePersonaModelDiscovery({
     discoveryAgentCommand,
     envVars,
     modelDiscoveryKey,
-    selectedRuntime?.defaultArgs,
+    selectedRuntimeAvailability,
+    selectedRuntimeDefaultArgs,
     shouldDebounceModelDiscovery,
     trimmedProvider,
   ]);

@@ -29,6 +29,7 @@ import {
   buildChannelMentionFilter,
   buildGlobalStreamFilter,
 } from "@/shared/api/relayChannelFilters";
+import { collectWithConcurrency } from "@/shared/api/concurrency";
 import { replayLiveSubscriptions } from "@/shared/api/relayReconnectReplay";
 import { RelayConnectionStateEmitter } from "@/shared/api/relayConnectionStateEmitter";
 import {
@@ -41,7 +42,8 @@ import { buildThreadReferenceTags } from "@/features/messages/lib/threading";
 
 const RECONNECT_BASE_DELAY_MS = 1_000,
   RECONNECT_MAX_DELAY_MS = 30_000,
-  EVENT_BATCH_MS = 16;
+  EVENT_BATCH_MS = 16,
+  AUX_BACKFILL_CONCURRENCY = 4;
 
 /**
  * Passive liveness check. The relay sends heartbeat pings every 30s; if no
@@ -79,8 +81,8 @@ export class RelayClient {
    * the reconnect-timer / retry-wrapper paths racing back to "reconnecting"
    * after we've already declared the session dead.
    *
-   * Cleared only on explicit user re-engagement: `disconnect()` (workspace
-   * switch — the singleton is being reused for a different workspace) and
+   * Cleared only on explicit user re-engagement: `disconnect()` (community
+   * switch — the singleton is being reused for a different community) and
    * `preconnect()` (caller is asking us to come back up).
    */
   private terminal = false;
@@ -97,11 +99,11 @@ export class RelayClient {
 
   /**
    * Cleanly tear down the connection without scheduling a reconnect.
-   * Used during workspace switches to reset the singleton before the
-   * new workspace applies.
+   * Used during community switches to reset the singleton before the
+   * new community applies.
    */
   disconnect() {
-    const error = new Error("Relay disconnected for workspace switch.");
+    const error = new Error("Relay disconnected for community switch.");
 
     if (this.reconnectTimeout) {
       window.clearTimeout(this.reconnectTimeout);
@@ -117,7 +119,7 @@ export class RelayClient {
     this.connectionStateEmitter.set("idle");
 
     if (this.wsId !== null) {
-      void closeWebSocket(this.wsId, "workspace switch");
+      void closeWebSocket(this.wsId, "community switch");
       this.wsId = null;
     }
 
@@ -217,10 +219,11 @@ export class RelayClient {
       chunks.push(eventIds.slice(i, i + AUX_BACKFILL_CHUNK_SIZE));
     }
 
-    const batches: RelayEvent[][] = [];
-    for (const ids of chunks) {
-      batches.push(await this.requestHistory(buildFilter(channelId, ids)));
-    }
+    const batches = await collectWithConcurrency(
+      chunks,
+      AUX_BACKFILL_CONCURRENCY,
+      (ids) => this.requestHistory(buildFilter(channelId, ids)),
+    );
 
     return batches.flat();
   }

@@ -36,7 +36,7 @@ export const KEYBOARD_SHORTCUTS: KeyboardShortcut[] = [
   {
     id: "browse-dms",
     label: "New direct message",
-    description: "Open the new DM dialog",
+    description: "Open the new message composer",
     keys: "⇧⌘K",
     keysWindows: "Shift+Ctrl+K",
     category: "Navigation",
@@ -218,7 +218,8 @@ export const KEYBOARD_SHORTCUTS: KeyboardShortcut[] = [
   {
     id: "format-link",
     label: "Insert link",
-    description: "Insert or edit a link in the composer",
+    description:
+      "Link the selected composer text, or edit the link under the caret",
     keys: "⌘K",
     keysWindows: "Ctrl+K",
     category: "Formatting",

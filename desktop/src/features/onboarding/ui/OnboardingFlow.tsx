@@ -7,7 +7,11 @@ import {
 } from "@/features/profile/hooks";
 import { relayClient } from "@/shared/api/relayClient";
 import { getMyRelayMembershipLookup } from "@/shared/api/relayMembers";
-import { getIdentity, importIdentity } from "@/shared/api/tauri";
+import {
+  getIdentity,
+  importIdentity,
+  persistCurrentIdentity,
+} from "@/shared/api/tauriIdentity";
 import {
   ACCENT_STORAGE_KEY,
   NEUTRAL_ACCENT,
@@ -16,11 +20,15 @@ import {
 } from "@/shared/theme/ThemeProvider";
 import { useSystemColorScheme } from "@/shared/theme/useSystemColorScheme";
 import { ONBOARDING_DEFAULT_THEME_NAME } from "@/shared/theme/theme-loader";
+import { Button } from "@/shared/ui/button";
 import { StartupWindowDragRegion } from "@/shared/ui/StartupWindowDragRegion";
 import { StepProgress } from "@/shared/ui/step-progress";
 import { AvatarStep } from "./AvatarStep";
+import { BackupStep } from "./BackupStep";
 import { MembershipDenied } from "./MembershipDenied";
 import { NostrKeyImportForm } from "./NostrKeyImportForm";
+import { useCommunities } from "@/features/communities/useCommunities";
+import { CommunityChangeOverlay } from "@/features/communities/ui/CommunityChangeOverlay";
 import {
   type OnboardingTransitionDirection,
   OnboardingSlideTransition,
@@ -36,14 +44,6 @@ import type {
   ProfileStepState,
 } from "./types";
 
-/**
- * Check whether the relay denies access due to membership gating.
- *
- * Uses the standard relay message path to read the NIP-43 membership snapshot.
- *
- * Returns `true` if denied, `false` if the user is a member (or if the
- * relay doesn't enforce membership / isn't reachable).
- */
 function isRelayMembershipDeniedError(error: unknown): boolean {
   if (!(error instanceof Error)) {
     return false;
@@ -57,24 +57,37 @@ function isRelayMembershipDeniedError(error: unknown): boolean {
   );
 }
 
-async function checkMembershipDenied(): Promise<boolean> {
+type MembershipCheckResult = "denied" | "ok" | "unreachable" | "error";
+
+async function checkMembershipStatus(): Promise<MembershipCheckResult> {
   try {
     const { membership, snapshotFound } = await getMyRelayMembershipLookup();
-    return snapshotFound && membership === null;
+    if (snapshotFound && membership === null) return "denied";
+    return "ok";
   } catch (error) {
-    if (isRelayMembershipDeniedError(error)) {
-      return true;
+    if (isRelayMembershipDeniedError(error)) return "denied";
+    if (error instanceof Error) {
+      const msg = error.message.toLowerCase();
+      if (
+        msg.includes("failed to fetch") ||
+        msg.includes("networkerror") ||
+        msg.includes("timeout") ||
+        msg.includes("econnrefused") ||
+        msg.includes("enotfound") ||
+        msg.includes("connection") ||
+        msg.includes("aborted")
+      ) {
+        return "unreachable";
+      }
     }
-    // Network errors, 401s, 500s — not membership denials.
-    return false;
+    return "error";
   }
 }
 
 type OnboardingFlowProps = {
   actions: OnboardingActions;
-  canBackToWorkspaceSetup: boolean;
+  identityLost?: boolean;
   initialProfile: OnboardingProfileSeed;
-  onBackToWorkspaceSetup: () => void;
 };
 
 function isFallbackDisplayName(value?: string | null) {
@@ -141,26 +154,42 @@ function resolveProfileSaveRecovery(
 
 export function OnboardingFlow({
   actions,
-  canBackToWorkspaceSetup,
+  identityLost = false,
   initialProfile,
-  onBackToWorkspaceSetup,
 }: OnboardingFlowProps) {
   const { complete, skipForNow } = actions;
+  const { activeCommunity, communities, updateCommunity, switchCommunity } =
+    useCommunities();
   const queryClient = useQueryClient();
   const savedProfile = resolveSavedProfile(initialProfile);
   const profileUpdateMutation = useUpdateProfileMutation();
   const { error: profileSaveError, isPending: isSavingProfile } =
     profileUpdateMutation;
-  const [currentPage, setCurrentPage] =
-    React.useState<OnboardingPage>("profile");
+  // When identity was lost (keyring cleared after migration), land the user
+  // directly on the import step with a recovery notice rather than profile setup.
+  const [currentPage, setCurrentPage] = React.useState<OnboardingPage>(
+    identityLost ? "key-import" : "profile",
+  );
   const [profileDraft, setProfileDraft] =
     React.useState<OnboardingProfileValues>(savedProfile);
   const [deniedPubkey, setDeniedPubkey] = React.useState<string>("");
+  const [persistError, setPersistError] = React.useState<string | null>(null);
   const [isUploadingAvatar, setIsUploadingAvatar] = React.useState(false);
   const [isProfileAdvancePending, setIsProfileAdvancePending] =
     React.useState(false);
+  // Track whether the user imported an existing key. The fresh-key path shows
+  // the backup step; the imported-key path skips it (user already has a backup).
+  const [identityWasImported, setIdentityWasImported] = React.useState(false);
   const [membershipRetryPage, setMembershipRetryPage] =
     React.useState<OnboardingPage>("avatar");
+  const [deniedFromPage, setDeniedFromPage] =
+    React.useState<OnboardingPage>("profile");
+  const [isCommunityChangeOpen, setIsCommunityChangeOpen] =
+    React.useState(false);
+  const [membershipError, setMembershipError] = React.useState<{
+    kind: "unreachable" | "error";
+    message?: string;
+  } | null>(null);
   const [transitionDirection, setTransitionDirection] =
     React.useState<OnboardingTransitionDirection>("forward");
   const systemColorScheme = useSystemColorScheme();
@@ -182,7 +211,11 @@ export function OnboardingFlow({
   }, [accentColor, setAccentColor, setTheme, themeName]);
 
   React.useEffect(() => {
-    if (currentPage === "profile" || currentPage === "avatar") {
+    if (
+      currentPage === "profile" ||
+      currentPage === "backup" ||
+      currentPage === "avatar"
+    ) {
       void preloadThemePreviewVars().catch(() => undefined);
     }
 
@@ -229,6 +262,7 @@ export function OnboardingFlow({
   );
 
   const showProfilePage = React.useCallback(() => {
+    setMembershipError(null);
     setTransitionDirection("backward");
     setCurrentPage("profile");
   }, []);
@@ -236,6 +270,11 @@ export function OnboardingFlow({
   const showKeyImportPage = React.useCallback(() => {
     setTransitionDirection("forward");
     setCurrentPage("key-import");
+  }, []);
+
+  const showBackupPage = React.useCallback(() => {
+    setTransitionDirection("forward");
+    setCurrentPage("backup");
   }, []);
 
   const saveProfileAndContinue = React.useCallback(
@@ -254,16 +293,34 @@ export function OnboardingFlow({
       try {
         // Check membership before attempting the profile save. On open relays
         // this passes instantly. On gated relays it prevents a 403 during save.
-        const denied = await checkMembershipDenied();
-        if (denied) {
+        const membershipStatus = await checkMembershipStatus();
+        setMembershipError(null);
+
+        if (membershipStatus === "denied") {
           try {
             const identity = await getIdentity();
             setDeniedPubkey(identity.pubkey);
           } catch {
             setDeniedPubkey("");
           }
+          setDeniedFromPage((prev) =>
+            currentPage === "membership-denied" ? prev : currentPage,
+          );
           setMembershipRetryPage(nextPage);
           setCurrentPage("membership-denied");
+          return;
+        }
+
+        if (membershipStatus === "unreachable") {
+          setMembershipError({ kind: "unreachable" });
+          return;
+        }
+
+        if (membershipStatus === "error") {
+          setMembershipError({
+            kind: "error",
+            message: "Server error — try again",
+          });
           return;
         }
 
@@ -283,6 +340,9 @@ export function OnboardingFlow({
               } catch {
                 setDeniedPubkey("");
               }
+              setDeniedFromPage((prev) =>
+                currentPage === "membership-denied" ? prev : currentPage,
+              );
               setMembershipRetryPage(nextPage);
               setCurrentPage("membership-denied");
               return;
@@ -293,27 +353,25 @@ export function OnboardingFlow({
           }
         }
 
-        if (nextPage === "avatar") {
-          showAvatarPage();
-          return;
-        }
-
-        if (nextPage === "theme") {
-          showThemePage();
-          return;
-        }
-
-        showSetupPage();
+        const showNextPage: Partial<Record<OnboardingPage, () => void>> = {
+          backup: showBackupPage,
+          avatar: () => showAvatarPage(),
+          theme: showThemePage,
+          setup: showSetupPage,
+        };
+        (showNextPage[nextPage] ?? showSetupPage)();
       } finally {
         setIsProfileAdvancePending(false);
       }
     },
     [
+      currentPage,
       isProfileAdvancePending,
       profileDraft,
       profileUpdateMutation,
       savedProfile,
       showAvatarPage,
+      showBackupPage,
       showSetupPage,
       showThemePage,
     ],
@@ -374,14 +432,31 @@ export function OnboardingFlow({
         }
       : profileStepState.saveRecovery,
   };
-  const currentStep =
-    currentPage === "profile" || currentPage === "key-import"
-      ? 2
-      : currentPage === "avatar"
-        ? 3
-        : currentPage === "theme"
-          ? 4
-          : 5;
+  // Page sequences by path — step 1 is the community-picker that precedes
+  // onboarding, so these pages start at step 2 (STEP_OFFSET below).
+  // Fresh-key path: profile(2) → backup(3) → avatar(4) → theme(5) → setup(6)
+  // Imported-key path: profile(2) → avatar(3) → theme(4) → setup(5)
+  const FRESH_STEPS: OnboardingPage[] = [
+    "profile",
+    "backup",
+    "avatar",
+    "theme",
+    "setup",
+  ];
+  const IMPORT_STEPS: OnboardingPage[] = [
+    "profile",
+    "avatar",
+    "theme",
+    "setup",
+  ];
+  const STEP_OFFSET = 2;
+  const activeSteps = identityWasImported ? IMPORT_STEPS : FRESH_STEPS;
+  // key-import occupies the same position as profile.
+  const normalizedPage: OnboardingPage =
+    currentPage === "key-import" ? "profile" : currentPage;
+  const pageIndex = activeSteps.indexOf(normalizedPage);
+  const currentStep = pageIndex >= 0 ? pageIndex + STEP_OFFSET : STEP_OFFSET;
+  const totalOnboardingSteps = activeSteps.length + 1; // +1 for step 1 (community picker)
   const hideFixedProgressOnCompact =
     currentPage === "avatar" || currentPage === "theme";
 
@@ -397,152 +472,290 @@ export function OnboardingFlow({
       queryClient.removeQueries({ queryKey: profileQueryKey });
       profileUpdateMutation.reset();
       setDeniedPubkey("");
+      setIdentityWasImported(true);
       setTransitionDirection("backward");
       setCurrentPage("profile");
     },
     [profileUpdateMutation, queryClient],
   );
 
+  // Lost-mode "start new identity": confirm first (irreversible), then persist
+  // the ephemeral key so the new identity is durable, then let the stage
+  // machinery (bootedLost + !identityLost) replace this flow with
+  // RelaunchRequiredScreen. No navigation needed here.
+  const handleLostModeBack = React.useCallback(async () => {
+    const confirmed = window.confirm(
+      "This will create a new identity and abandon your previous key. This cannot be undone. Continue?",
+    );
+    if (!confirmed) {
+      return;
+    }
+    try {
+      const identity = await persistCurrentIdentity();
+      queryClient.setQueryData(["identity"], identity);
+    } catch (error) {
+      setPersistError(
+        error instanceof Error
+          ? error.message
+          : "Failed to create a new identity. Please try again.",
+      );
+    }
+  }, [queryClient]);
+
+  const handleInviteRedeemed = React.useCallback(
+    (relayWsUrl: string) => {
+      if (!activeCommunity) return;
+      // Same-relay: membership claim updated this relay — just retry.
+      if (relayWsUrl === activeCommunity.relayUrl) {
+        void saveProfileAndContinue(membershipRetryPage);
+        return;
+      }
+      // Cross-relay: point the active community at the invite's relay.
+      // If that relay already exists as another community, switch to it.
+      const result = updateCommunity(activeCommunity.id, {
+        relayUrl: relayWsUrl,
+      });
+      if (result.kind === "duplicate-relay") {
+        const existing = communities.find((w) => w.relayUrl === relayWsUrl);
+        if (existing) {
+          switchCommunity(existing.id);
+        }
+      }
+      // On "updated", the reinitKey bump triggers a remount that re-runs the
+      // membership gate automatically.
+    },
+    [
+      activeCommunity,
+      communities,
+      membershipRetryPage,
+      saveProfileAndContinue,
+      switchCommunity,
+      updateCommunity,
+    ],
+  );
+
   if (currentPage === "membership-denied") {
     return (
-      <MembershipDenied
-        onChangeKey={
-          canBackToWorkspaceSetup
-            ? () => {
-                setTransitionDirection("backward");
-                onBackToWorkspaceSetup();
-              }
-            : undefined
-        }
-        onImportKey={canBackToWorkspaceSetup ? undefined : importExistingKey}
-        onRetry={() => {
-          void saveProfileAndContinue(membershipRetryPage);
-        }}
-        pubkey={deniedPubkey}
-      />
+      <>
+        <MembershipDenied
+          activeRelayUrl={activeCommunity?.relayUrl ?? ""}
+          onBack={() => {
+            setTransitionDirection("backward");
+            setCurrentPage(deniedFromPage);
+          }}
+          onChangeCommunity={() => setIsCommunityChangeOpen(true)}
+          onImportKey={importExistingKey}
+          onInviteRedeemed={handleInviteRedeemed}
+          onRetry={() => {
+            void saveProfileAndContinue(membershipRetryPage);
+          }}
+          pubkey={deniedPubkey}
+        />
+        {isCommunityChangeOpen ? (
+          <CommunityChangeOverlay
+            onClose={() => setIsCommunityChangeOpen(false)}
+          />
+        ) : null}
+      </>
     );
   }
 
   return (
-    <div
-      className={`buzz-startup-shell flex items-center justify-center bg-background px-4 py-8 text-foreground ${
-        currentPage === "profile" ||
-        currentPage === "avatar" ||
-        currentPage === "key-import"
-          ? "buzz-onboarding-neutral-theme"
-          : ""
-      }`}
-      data-testid="onboarding-gate"
-      data-system-color-scheme={systemColorScheme}
-    >
-      <StartupWindowDragRegion />
+    <>
       <div
-        className={`relative flex w-full flex-col items-center text-center ${
-          currentPage === "theme"
-            ? "max-w-[1180px]"
-            : currentPage === "avatar"
-              ? "max-w-[1080px]"
-              : currentPage === "setup"
-                ? "max-w-[920px]"
-                : "max-w-[500px]"
+        className={`buzz-startup-shell flex items-start justify-center overflow-y-auto bg-background px-4 py-8 text-foreground ${
+          currentPage === "profile" ||
+          currentPage === "backup" ||
+          currentPage === "avatar" ||
+          currentPage === "key-import"
+            ? "buzz-onboarding-neutral-theme"
+            : ""
         }`}
+        data-testid="onboarding-gate"
+        data-system-color-scheme={systemColorScheme}
       >
-        <OnboardingSlideTransition
-          className="w-auto"
-          containerClassName={`fixed bottom-12 left-1/2 z-40 w-auto -translate-x-1/2 ${
-            hideFixedProgressOnCompact ? "max-lg:hidden" : ""
-          }`}
-          direction={transitionDirection}
-          transitionKey={`progress-${currentStep}-${transitionDirection}-${
-            hideFixedProgressOnCompact ? "compact-hidden" : "visible"
+        <StartupWindowDragRegion />
+        <div
+          className={`relative my-auto flex w-full flex-col items-center text-center ${
+            currentPage === "theme"
+              ? "max-w-[1180px]"
+              : currentPage === "avatar"
+                ? "max-w-[1080px]"
+                : currentPage === "setup"
+                  ? "max-w-[920px]"
+                  : "max-w-[500px]"
           }`}
         >
-          <StepProgress
-            activeSegmentClassName="bg-primary"
-            completeSegmentClassName="bg-primary/35"
-            currentStep={currentStep}
-            inactiveSegmentClassName="bg-muted-foreground/25"
-          />
-        </OnboardingSlideTransition>
-
-        {currentPage === "profile" ? (
-          <ProfileStep
-            actions={{
-              advanceWithoutSaving: advanceFromProfileWithoutSaving,
-              back: canBackToWorkspaceSetup
-                ? () => {
-                    setTransitionDirection("backward");
-                    onBackToWorkspaceSetup();
-                  }
-                : undefined,
-              clearAvatarDraft: resetAvatarDraft,
-              importExistingKey: showKeyImportPage,
-              onUploadingChange: setIsUploadingAvatar,
-              skipForNow,
-              submit: () => {
-                void saveProfileAndContinue("avatar");
-              },
-              updateAvatarUrl: updateAvatarUrlDraft,
-              updateDisplayName: updateDisplayNameDraft,
-            }}
-            direction={transitionDirection}
-            state={profileStepState}
-          />
-        ) : currentPage === "key-import" ? (
           <OnboardingSlideTransition
-            className="flex w-full flex-col items-center text-center"
+            className="w-auto"
+            containerClassName={`fixed bottom-12 left-1/2 z-40 w-auto -translate-x-1/2 ${
+              hideFixedProgressOnCompact ? "max-lg:hidden" : ""
+            }`}
             direction={transitionDirection}
-            transitionKey={`key-import-${transitionDirection}`}
+            transitionKey={`progress-${currentStep}-${transitionDirection}-${
+              hideFixedProgressOnCompact ? "compact-hidden" : "visible"
+            }`}
           >
-            <div className="w-full max-w-[440px]">
-              <h1 className="text-3xl font-semibold tracking-tight">
-                Use your existing key
-              </h1>
-              <p className="mt-3 text-sm leading-6 text-muted-foreground">
-                Import your Nostr private key to use that identity with Buzz. If
-                this key already has a profile on the relay, your name and
-                avatar are restored automatically.
-              </p>
-            </div>
-
-            <NostrKeyImportForm
-              onBack={showProfilePage}
-              onImport={importExistingKey}
+            <StepProgress
+              activeSegmentClassName="bg-primary"
+              completeSegmentClassName="bg-primary/35"
+              currentStep={currentStep}
+              inactiveSegmentClassName="bg-muted-foreground/25"
+              totalSteps={totalOnboardingSteps}
             />
           </OnboardingSlideTransition>
-        ) : currentPage === "avatar" ? (
-          <AvatarStep
-            actions={{
-              advanceWithoutSaving: () => showThemePage(),
-              back: showProfilePage,
-              onUploadingChange: setIsUploadingAvatar,
-              skipForNow,
-              submit: () => {
-                void saveProfileAndContinue("theme");
-              },
-              updateAvatarUrl: updateAvatarUrlDraft,
-            }}
-            direction={transitionDirection}
-            state={avatarStepState}
-          />
-        ) : currentPage === "theme" ? (
-          <ThemeStep
-            actions={{
-              skip: showSetupPage,
-              submit: showSetupPage,
-            }}
-            direction={transitionDirection}
-          />
-        ) : (
-          <SetupStep
-            actions={{
-              back: () => showThemePage("backward"),
-              complete,
-            }}
-            direction={transitionDirection}
-          />
-        )}
+
+          {membershipError &&
+          (currentPage === "profile" || currentPage === "avatar") ? (
+            <div className="mb-4 w-full max-w-[500px] rounded-lg border border-destructive/30 bg-destructive/5 p-4 text-sm">
+              {membershipError.kind === "unreachable" ? (
+                <>
+                  <p className="font-medium text-destructive">
+                    Can't reach this relay
+                  </p>
+                  <p className="mt-1 text-muted-foreground">
+                    Check your connection or change your community.
+                  </p>
+                  <Button
+                    className="mt-3"
+                    onClick={() => setIsCommunityChangeOpen(true)}
+                    size="sm"
+                    variant="outline"
+                  >
+                    Change community
+                  </Button>
+                </>
+              ) : (
+                <>
+                  <p className="font-medium text-destructive">
+                    {membershipError.message ?? "Something went wrong"}
+                  </p>
+                  <p className="mt-1 text-muted-foreground">
+                    The relay returned an error. Try again.
+                  </p>
+                </>
+              )}
+            </div>
+          ) : null}
+
+          {currentPage === "profile" ? (
+            <ProfileStep
+              actions={{
+                advanceWithoutSaving: advanceFromProfileWithoutSaving,
+                back: () => {
+                  setMembershipError(null);
+                  setIsCommunityChangeOpen(true);
+                },
+                clearAvatarDraft: resetAvatarDraft,
+                importExistingKey: showKeyImportPage,
+                onUploadingChange: setIsUploadingAvatar,
+                skipForNow,
+                submit: () => {
+                  void saveProfileAndContinue(
+                    identityWasImported ? "avatar" : "backup",
+                  );
+                },
+                updateAvatarUrl: updateAvatarUrlDraft,
+                updateDisplayName: updateDisplayNameDraft,
+              }}
+              direction={transitionDirection}
+              state={profileStepState}
+            />
+          ) : currentPage === "key-import" ? (
+            <OnboardingSlideTransition
+              className="flex w-full flex-col items-center text-center"
+              direction={transitionDirection}
+              transitionKey={`key-import-${transitionDirection}`}
+            >
+              <div className="w-full max-w-[440px]">
+                {identityLost ? (
+                  <>
+                    <h1 className="text-3xl font-semibold tracking-tight">
+                      Re-import your key
+                    </h1>
+                    <p className="mt-3 text-sm leading-6 text-muted-foreground">
+                      Your identity is no longer in the system keyring.
+                      Re-import your nsec to restore it — Buzz will restart to
+                      finish recovery. Or go back to start a new identity with a
+                      fresh key.
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <h1 className="text-3xl font-semibold tracking-tight">
+                      Use your existing key
+                    </h1>
+                    <p className="mt-3 text-sm leading-6 text-muted-foreground">
+                      Import your Nostr private key to use that identity with
+                      Buzz. If this key already has a profile on the relay, your
+                      name and avatar are restored automatically.
+                    </p>
+                  </>
+                )}
+              </div>
+
+              {persistError ? (
+                <p className="mt-4 w-full max-w-[440px] text-sm text-destructive">
+                  {persistError}
+                </p>
+              ) : null}
+
+              <NostrKeyImportForm
+                backLabel={identityLost ? "Start new identity" : undefined}
+                onBack={identityLost ? handleLostModeBack : showProfilePage}
+                onImport={importExistingKey}
+              />
+            </OnboardingSlideTransition>
+          ) : currentPage === "backup" ? (
+            <BackupStep
+              currentStep={currentStep}
+              direction={transitionDirection}
+              onBack={showProfilePage}
+              onNext={() => showAvatarPage()}
+              totalSteps={totalOnboardingSteps}
+            />
+          ) : currentPage === "avatar" ? (
+            <AvatarStep
+              actions={{
+                advanceWithoutSaving: () => showThemePage(),
+                back: identityWasImported ? showProfilePage : showBackupPage,
+                onUploadingChange: setIsUploadingAvatar,
+                skipForNow,
+                submit: () => {
+                  void saveProfileAndContinue("theme");
+                },
+                updateAvatarUrl: updateAvatarUrlDraft,
+              }}
+              currentStep={currentStep}
+              direction={transitionDirection}
+              showAlwaysSkip={true}
+              state={avatarStepState}
+              totalSteps={totalOnboardingSteps}
+            />
+          ) : currentPage === "theme" ? (
+            <ThemeStep
+              actions={{
+                skip: showSetupPage,
+                submit: showSetupPage,
+              }}
+              direction={transitionDirection}
+            />
+          ) : (
+            <SetupStep
+              actions={{
+                back: () => showThemePage("backward"),
+                complete,
+              }}
+              direction={transitionDirection}
+            />
+          )}
+        </div>
       </div>
-    </div>
+      {isCommunityChangeOpen ? (
+        <CommunityChangeOverlay
+          onClose={() => setIsCommunityChangeOpen(false)}
+        />
+      ) : null}
+    </>
   );
 }

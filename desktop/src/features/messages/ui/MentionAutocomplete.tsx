@@ -1,5 +1,6 @@
 import * as React from "react";
-import { Bot } from "lucide-react";
+import { Bot, Users } from "lucide-react";
+import type { TeamMentionMember } from "@/features/messages/lib/mentionCandidates";
 
 import { Badge } from "@/shared/ui/badge";
 import { cn } from "@/shared/lib/cn";
@@ -9,11 +10,15 @@ import {
   POPOVER_SURFACE_CLASS,
 } from "@/shared/ui/popoverSurface";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
+import { safeNpub } from "@/shared/lib/nostrUtils";
+import { truncatePubkey } from "@/shared/lib/pubkey";
 
 export type MentionSuggestion = {
   pubkey?: string;
   personaId?: string;
-  kind?: "identity" | "persona";
+  teamId?: string;
+  teamMembers?: TeamMentionMember[];
+  kind?: "identity" | "persona" | "team";
   displayName: string;
   avatarUrl?: string | null;
   isAgent?: boolean;
@@ -59,6 +64,15 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
     return null;
   }
 
+  // Name collisions are the impersonation vector: a vanity-ground key can
+  // wear any display name. When two suggestions share a name, surface each
+  // one's npub (truncated; full key in the hover tooltip) to tell them apart.
+  const nameCounts = new Map<string, number>();
+  for (const suggestion of suggestions) {
+    const name = suggestion.displayName.toLowerCase();
+    nameCounts.set(name, (nameCounts.get(name) ?? 0) + 1);
+  }
+
   return (
     <div
       className={cn(
@@ -84,8 +98,15 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
           const suggestionKey =
             suggestion.pubkey ??
             (suggestion.personaId ? `persona-${suggestion.personaId}` : null) ??
+            (suggestion.teamId ? `team-${suggestion.teamId}` : null) ??
             suggestion.displayName;
           const agentLabel = "agent";
+          const hasNameCollision =
+            (nameCounts.get(suggestion.displayName.toLowerCase()) ?? 0) > 1;
+          const collisionNpub =
+            hasNameCollision && suggestion.pubkey
+              ? safeNpub(suggestion.pubkey)
+              : null;
 
           return (
             <button
@@ -104,12 +125,18 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
               tabIndex={-1}
               type="button"
             >
-              <UserAvatar
-                avatarUrl={suggestion.avatarUrl ?? null}
-                displayName={suggestion.displayName}
-                size="xs"
-                testId="mention-suggestion-avatar"
-              />
+              {suggestion.kind === "team" ? (
+                <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary">
+                  <Users aria-hidden="true" className="h-4 w-4" />
+                </span>
+              ) : (
+                <UserAvatar
+                  avatarUrl={suggestion.avatarUrl ?? null}
+                  displayName={suggestion.displayName}
+                  size="xs"
+                  testId="mention-suggestion-avatar"
+                />
+              )}
               <span className="flex min-w-0 flex-1 flex-col gap-0.5">
                 <span
                   className="min-w-0 break-words font-medium leading-snug"
@@ -117,7 +144,8 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
                 >
                   {suggestion.displayName}
                 </span>
-                {suggestion.isAgent ||
+                {suggestion.kind === "team" ||
+                suggestion.isAgent ||
                 suggestion.role ||
                 suggestion.ownerLabel ||
                 suggestion.notInChannel ? (
@@ -129,7 +157,12 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
                         : "text-muted-foreground",
                     )}
                   >
-                    {suggestion.isAgent ? (
+                    {suggestion.kind === "team" ? (
+                      <span className="inline-flex shrink-0 items-center gap-1">
+                        <Users aria-hidden="true" className="h-3.5 w-3.5" />
+                        team · {suggestion.teamMembers?.length ?? 0} agents
+                      </span>
+                    ) : suggestion.isAgent ? (
                       <span className="inline-flex shrink-0 items-center gap-1">
                         <Bot
                           aria-hidden="true"
@@ -164,6 +197,20 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
                             : "not in channel"}
                       </span>
                     ) : null}
+                  </span>
+                ) : null}
+                {collisionNpub ? (
+                  <span
+                    className={cn(
+                      "min-w-0 truncate font-mono text-2xs leading-snug",
+                      index === selectedIndex
+                        ? "text-accent-foreground/60"
+                        : "text-muted-foreground",
+                    )}
+                    data-testid="mention-collision-npub"
+                    title={collisionNpub}
+                  >
+                    {truncatePubkey(collisionNpub)}
                   </span>
                 ) : null}
               </span>

@@ -89,6 +89,13 @@ pub struct SessionState {
     /// channel_id → rendered NIP-AE core prompt section, populated once at
     /// session creation per Tyler's spec (no mid-session refresh).
     pub core_sections: HashMap<Uuid, String>,
+    /// channel_id → rendered `[Channel Canvas]` metadata section.
+    ///
+    /// Populated once before session creation (same lifecycle as `core_sections`).
+    /// Absent when the channel has no canvas, the canvas content is blank, or the
+    /// fetch fails — all fail open. Cleared on session invalidation alongside
+    /// `core_sections` so the next session picks up any canvas change.
+    pub canvas_sections: HashMap<Uuid, String>,
 }
 
 impl SessionState {
@@ -110,6 +117,7 @@ impl SessionState {
     pub fn invalidate_channel(&mut self, channel_id: &Uuid) -> bool {
         self.turn_counts.remove(channel_id);
         self.core_sections.remove(channel_id);
+        self.canvas_sections.remove(channel_id);
         self.sessions.remove(channel_id).is_some()
     }
 
@@ -120,6 +128,7 @@ impl SessionState {
         self.heartbeat_session = None;
         self.heartbeat_turn_count = 0;
         self.core_sections.clear();
+        self.canvas_sections.clear();
     }
 
     #[cfg(test)]
@@ -127,6 +136,7 @@ impl SessionState {
         self.sessions.contains_key(channel_id)
             || self.turn_counts.contains_key(channel_id)
             || self.core_sections.contains_key(channel_id)
+            || self.canvas_sections.contains_key(channel_id)
     }
 }
 
@@ -333,16 +343,35 @@ pub enum SteerAck {
     PromptCompletedNeutral,
 }
 
+/// Whether a turn was cut by the idle clock or the hard wall-clock cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeoutKind {
+    /// No ACP wire activity for `idle_timeout` seconds.
+    Idle,
+    /// Turn ran for `max_turn_duration` seconds of wall-clock time.
+    Hard,
+}
+
 /// Outcome of a prompt task.
 #[allow(dead_code)]
 pub enum PromptOutcome {
     Ok(StopReason),
     Error(AcpError),
     AgentExited,
-    Timeout,
+    Timeout(TimeoutKind),
     /// Intentional cancel via `!cancel` command or interrupt mode.
     /// Agent is healthy — no respawn, no retry penalty.
     Cancelled,
+    /// The agent did not stop within `grace` after `session/cancel` was sent
+    /// for a control-signal cancellation (steer fallback, interrupt, or
+    /// explicit stop). Distinct from [`TimeoutKind::Hard`]: this is a bounded
+    /// cleanup deadline, not the turn's configured max-turn wall clock, so it
+    /// must never be reported or dead-lettered as a hard-cap breach. The
+    /// agent process is uncertain — treated as poisoned and respawned, same
+    /// as a hard timeout, but the triggering batch's fate follows the
+    /// `CancelReason` on the batch (steer/interrupt requeue, explicit cancel
+    /// drops) rather than the hard-cap's unconditional dead-letter.
+    CancelDrainTimeout(Duration),
 }
 
 /// Immutable config subset shared (via `Arc`) by all spawned prompt tasks.
@@ -360,6 +389,7 @@ pub struct PromptContext {
     pub turn_liveness_interval: Duration,
     pub dedup_mode: DedupMode,
     pub system_prompt: Option<String>,
+    pub team_instructions: Option<String>,
     pub heartbeat_prompt: Option<String>,
     /// Base prompt content, or `None` if `--no-base-prompt` was passed.
     ///
@@ -650,6 +680,13 @@ const CONTEXT_FETCH_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// Timeout for model-switch requests (`session/set_config_option`, `session/set_model`).
 const MODEL_SWITCH_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Bounded grace window for the post-cancel drain after a control-signal
+/// cancellation (steer fallback, interrupt, or explicit stop). This is a
+/// cleanup deadline, not the turn's configured max-turn wall clock — see
+/// [`AcpClient::cancel_with_cleanup_grace`] and
+/// [`classify_control_cancel_failure`].
+const CONTROL_CANCEL_GRACE: Duration = Duration::from_secs(5);
+
 /// Timeout for permission-mode requests (`session/set_config_option` with `configId: "mode"`).
 const PERMISSION_MODE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -663,17 +700,25 @@ async fn create_session_and_apply_model(
     agent: &mut OwnedAgent,
     ctx: &PromptContext,
     agent_core: Option<&str>,
+    agent_canvas: Option<&str>,
 ) -> Result<String, AcpError> {
-    // Combine base_prompt + system_prompt + agent core into a single
-    // systemPrompt value for the session/new request. Only sent when the agent
-    // declares protocol version >= 2 (supports systemPrompt); legacy agents
+    // Combine base_prompt + system_prompt + agent core + canvas metadata into a
+    // single systemPrompt value for the session/new request. Only sent when the
+    // agent declares protocol version >= 2 (supports systemPrompt); legacy agents
     // ignore it and receive the same content as user-message sections via
-    // `format_prompt`. Core already carries its own `[Agent Memory — core]`
-    // header from `engram_fetch::build_core_section`, so we just append it.
+    // `format_prompt`. Core carries its own `[Agent Memory — core]` header, and
+    // canvas carries its own `[Channel Canvas]` header; both are appended with a
+    // blank-line separator.
     let combined_system_prompt: Option<String> = if agent.protocol_version >= 2 {
-        with_core(
-            framed_system_prompt(&ctx.cwd, ctx.base_prompt, ctx.system_prompt.as_deref()),
-            agent_core,
+        with_canvas(
+            with_core(
+                with_team(
+                    framed_system_prompt(&ctx.cwd, ctx.base_prompt, ctx.system_prompt.as_deref()),
+                    ctx.team_instructions.as_deref(),
+                ),
+                agent_core,
+            ),
+            agent_canvas,
         )
     } else {
         None
@@ -927,6 +972,24 @@ pub(crate) fn prepend_base_for_legacy(
     }
 }
 
+/// Prepend the `[Channel Canvas]` section to the legacy initial-message body.
+///
+/// Protocol-v2 agents already receive the canvas in `systemPrompt`; only
+/// legacy (protocol_version < 2) agents need it injected here so it arrives
+/// before the first prompt — the same "every turn" semantics as per-turn core.
+/// Heartbeats never have an initial_message, so the caller is responsible for
+/// not passing a canvas when `source` is `Heartbeat`.
+pub(crate) fn prepend_canvas_for_legacy(
+    protocol_version: u32,
+    agent_canvas: Option<&str>,
+    body: &str,
+) -> String {
+    match agent_canvas {
+        Some(canvas) if protocol_version < 2 => format!("{canvas}\n\n{body}"),
+        _ => body.to_string(),
+    }
+}
+
 /// Frame the `session/new` `systemPrompt` so each present prompt carries its own
 /// header, keeping the base/persona boundary recoverable downstream.
 ///
@@ -985,6 +1048,21 @@ fn workspace_section(cwd: &str) -> Option<String> {
     }
 }
 
+/// Append the team-owned instruction section after `[System]` and before core memory.
+fn with_team(prompt: Option<String>, instructions: Option<&str>) -> Option<String> {
+    let instructions = instructions
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match (prompt, instructions) {
+        (Some(prompt), Some(instructions)) => {
+            Some(format!("{prompt}\n\n[Team Instructions]\n{instructions}"))
+        }
+        (None, Some(instructions)) => Some(format!("[Team Instructions]\n{instructions}")),
+        (Some(prompt), None) => Some(prompt),
+        (None, None) => None,
+    }
+}
+
 /// Append the agent's core memory section onto the framed system prompt.
 ///
 /// Core already carries its own `[Agent Memory — core]` header from
@@ -995,6 +1073,20 @@ fn with_core(framed: Option<String>, core: Option<&str>) -> Option<String> {
         (Some(framed), Some(core)) => Some(format!("{framed}\n\n{core}")),
         (Some(framed), None) => Some(framed),
         (None, Some(core)) => Some(core.to_string()),
+        (None, None) => None,
+    }
+}
+
+/// Append the `[Channel Canvas]` metadata section onto the accumulated system prompt.
+///
+/// The canvas section already carries its `[Channel Canvas]` header (from
+/// `render_canvas_section`), so it is joined with a blank-line separator.
+/// Either side may be absent.
+fn with_canvas(prompt: Option<String>, canvas: Option<&str>) -> Option<String> {
+    match (prompt, canvas) {
+        (Some(prompt), Some(canvas)) => Some(format!("{prompt}\n\n{canvas}")),
+        (Some(prompt), None) => Some(prompt),
+        (None, Some(canvas)) => Some(canvas.to_string()),
         (None, None) => None,
     }
 }
@@ -1160,10 +1252,55 @@ pub async fn run_prompt_task(
         }
     }
 
+    // Canvas metadata fetch — same lifecycle as core: once per new channel session,
+    // never for heartbeats, cached until session invalidation.
+    //
+    // DM check: use startup channel_info first; lazy-fetch only when missing.
+    // A confirmed DM never receives a canvas section. If the channel type cannot
+    // be determined (metadata absent and lazy fetch fails/unknown), skip the canvas
+    // rather than assuming non-DM — failing closed on DM ambiguity is safer.
+    //
+    // I3 lifecycle: hold the fetched section in a local `pending_canvas` and
+    // commit it to `canvas_sections` only after session creation succeeds. This
+    // prevents a stale revision A surviving a failed create and being re-used by
+    // the next attempt after the canvas was cleared.
+    let mut pending_canvas: Option<(Uuid, String)> = None;
+    if let PromptSource::Channel(cid) = &source {
+        let is_new_channel_session = !agent.state.sessions.contains_key(cid);
+        if is_new_channel_session && !agent.state.canvas_sections.contains_key(cid) {
+            // Resolve DM status: prefer the startup cache, lazy-fetch as fallback.
+            // Unknown → treat as DM (fail-closed).
+            let is_dm = match ctx.channel_info.get(cid) {
+                Some(ci) => ci.channel_type == "dm",
+                None => fetch_channel_info(*cid, &ctx.rest_client)
+                    .await
+                    .map(|ci| ci.channel_type == "dm")
+                    .unwrap_or(true),
+            };
+            if !is_dm {
+                if let Some(section) = fetch_canvas_section(*cid, &ctx.rest_client).await {
+                    pending_canvas = Some((*cid, section));
+                }
+            }
+        }
+    }
+
     // The core section to fold into the system prompt for this turn's session.
     // Channel-scoped; heartbeats carry no owner core.
     let agent_core: Option<String> = match &source {
         PromptSource::Channel(cid) => agent.state.core_sections.get(cid).cloned(),
+        PromptSource::Heartbeat => None,
+    };
+
+    // The canvas metadata section — channel-scoped, absent for heartbeats/DMs.
+    // Prefer the committed cache; fall back to pending (for new sessions being created now).
+    let agent_canvas: Option<String> = match &source {
+        PromptSource::Channel(cid) => agent
+            .state
+            .canvas_sections
+            .get(cid)
+            .cloned()
+            .or_else(|| pending_canvas.as_ref().map(|(_, s)| s.clone())),
         PromptSource::Heartbeat => None,
     };
 
@@ -1173,7 +1310,13 @@ pub async fn run_prompt_task(
                 (sid.clone(), false)
             } else {
                 // Create new session with model application.
-                match create_session_and_apply_model(&mut agent, &ctx, agent_core.as_deref()).await
+                match create_session_and_apply_model(
+                    &mut agent,
+                    &ctx,
+                    agent_core.as_deref(),
+                    agent_canvas.as_deref(),
+                )
+                .await
                 {
                     Ok(sid) => {
                         tracing::info!(
@@ -1181,6 +1324,10 @@ pub async fn run_prompt_task(
                             "created session {sid} for channel {cid}"
                         );
                         agent.state.sessions.insert(*cid, sid.clone());
+                        // Commit canvas only after session creation succeeds (I3).
+                        if let Some((pending_cid, section)) = pending_canvas.take() {
+                            agent.state.canvas_sections.insert(pending_cid, section);
+                        }
                         (sid, true)
                     }
                     Err(AcpError::AgentExited) => {
@@ -1195,6 +1342,8 @@ pub async fn run_prompt_task(
                         return;
                     }
                     Err(e) => {
+                        // Session creation failed; pending canvas was never committed,
+                        // so the next retry will re-fetch a fresh revision.
                         send_prompt_result(
                             &result_tx,
                             agent,
@@ -1211,7 +1360,7 @@ pub async fn run_prompt_task(
             if let Some(sid) = &agent.state.heartbeat_session {
                 (sid.clone(), false)
             } else {
-                match create_session_and_apply_model(&mut agent, &ctx, None).await {
+                match create_session_and_apply_model(&mut agent, &ctx, None, None).await {
                     Ok(sid) => {
                         tracing::info!(
                             target: "pool::session",
@@ -1269,8 +1418,16 @@ pub async fn run_prompt_task(
             // For agents with systemPrompt support (protocol_version >= 2),
             // base_prompt is delivered via the system role in session/new.
             // Legacy agents receive it via [Base] in the user message instead.
+            // Canvas is also injected here for legacy agents: protocol-v2 agents
+            // already have it in systemPrompt; legacy agents need it before the
+            // first prompt, matching the "every turn" per-turn delivery semantics.
             let init_msg =
                 prepend_base_for_legacy(agent.protocol_version, ctx.base_prompt, initial_msg);
+            let init_msg = prepend_canvas_for_legacy(
+                agent.protocol_version,
+                agent_canvas.as_deref(),
+                &init_msg,
+            );
             let init_result = agent
                 .acp
                 .session_prompt_with_idle_timeout(
@@ -1336,7 +1493,7 @@ pub async fn run_prompt_task(
                         &result_tx,
                         agent,
                         source,
-                        PromptOutcome::Timeout,
+                        PromptOutcome::Timeout(TimeoutKind::Idle),
                         requeue_batch_if_queue(&ctx, batch),
                     );
                     return;
@@ -1352,7 +1509,7 @@ pub async fn run_prompt_task(
                         &result_tx,
                         agent,
                         source,
-                        PromptOutcome::Timeout,
+                        PromptOutcome::Timeout(TimeoutKind::Hard),
                         requeue_batch_if_queue(&ctx, batch),
                     );
                     return;
@@ -1431,6 +1588,8 @@ pub async fn run_prompt_task(
                 has_system_prompt_support: agent.protocol_version >= 2,
                 base_prompt: ctx.base_prompt,
                 system_prompt: ctx.system_prompt.as_deref(),
+                team_instructions: ctx.team_instructions.as_deref(),
+                agent_canvas: agent_canvas.as_deref(),
             },
         )
     } else {
@@ -1530,10 +1689,7 @@ pub async fn run_prompt_task(
                         // Prompt is genuinely in-flight — cancel it.
                         match agent
                             .acp
-                            .cancel_with_cleanup_grace(
-                                &session_id,
-                                std::time::Duration::from_secs(5),
-                            )
+                            .cancel_with_cleanup_grace(&session_id, CONTROL_CANCEL_GRACE)
                             .await
                         {
                             Ok(stop_reason) => {
@@ -1561,35 +1717,21 @@ pub async fn run_prompt_task(
                                 );
                                 return;
                             }
-                            Err(AcpError::AgentExited) => {
-                                agent.state.invalidate_all();
-                                let retry_batch =
-                                    requeue_cancelled_batch(&ctx, control_signal, batch);
-
-                                let usage = agent.acp.take_turn_usage();
-                                publish_agent_turn_metric(
+                            Err(error) => {
+                                // Single production arm: classify the error→outcome
+                                // and outcome→batch-fate boundary once via the seam
+                                // shared with tests, then invalidate/publish/send once.
+                                let failure = classify_control_cancel_failure(
                                     &ctx,
-                                    usage,
-                                    observer_channel_id,
-                                    &session_id,
-                                    &turn_id,
-                                    Some(buzz_core::agent_turn_metric::StopReason::Error),
-                                )
-                                .await;
-                                send_prompt_result(
-                                    &result_tx,
-                                    agent,
-                                    source,
-                                    PromptOutcome::AgentExited,
-                                    retry_batch,
+                                    error,
+                                    control_signal,
+                                    batch,
                                 );
-                                return;
-                            }
-                            Err(AcpError::IdleTimeout(_) | AcpError::HardTimeout) => {
-                                // Cancel drain timed out — agent state uncertain.
-                                agent.state.invalidate(&source);
-                                let retry_batch =
-                                    requeue_cancelled_batch(&ctx, control_signal, batch);
+                                if failure.invalidate_all {
+                                    agent.state.invalidate_all();
+                                } else {
+                                    agent.state.invalidate(&source);
+                                }
 
                                 let usage = agent.acp.take_turn_usage();
                                 publish_agent_turn_metric(
@@ -1605,32 +1747,8 @@ pub async fn run_prompt_task(
                                     &result_tx,
                                     agent,
                                     source,
-                                    PromptOutcome::Timeout,
-                                    retry_batch,
-                                );
-                                return;
-                            }
-                            Err(e) => {
-                                agent.state.invalidate(&source);
-                                let retry_batch =
-                                    requeue_cancelled_batch(&ctx, control_signal, batch);
-
-                                let usage = agent.acp.take_turn_usage();
-                                publish_agent_turn_metric(
-                                    &ctx,
-                                    usage,
-                                    observer_channel_id,
-                                    &session_id,
-                                    &turn_id,
-                                    Some(buzz_core::agent_turn_metric::StopReason::Error),
-                                )
-                                .await;
-                                send_prompt_result(
-                                    &result_tx,
-                                    agent,
-                                    source,
-                                    PromptOutcome::Error(e),
-                                    retry_batch,
+                                    failure.outcome,
+                                    failure.retry_batch,
                                 );
                                 return;
                             }
@@ -1799,7 +1917,7 @@ pub async fn run_prompt_task(
                         &result_tx,
                         agent,
                         source,
-                        PromptOutcome::Timeout,
+                        PromptOutcome::Timeout(TimeoutKind::Idle),
                         requeue_batch_if_queue(&ctx, batch),
                     );
                 }
@@ -1848,7 +1966,7 @@ pub async fn run_prompt_task(
                         &result_tx,
                         agent,
                         source,
-                        PromptOutcome::Timeout,
+                        PromptOutcome::Timeout(TimeoutKind::Idle),
                         requeue_batch_if_queue(&ctx, batch),
                     );
                 }
@@ -1875,7 +1993,7 @@ pub async fn run_prompt_task(
                 &result_tx,
                 agent,
                 source,
-                PromptOutcome::Timeout,
+                PromptOutcome::Timeout(TimeoutKind::Hard),
                 requeue_batch_if_queue(&ctx, batch),
             );
         }
@@ -1884,7 +2002,7 @@ pub async fn run_prompt_task(
             // AgentError means the agent caught a problem before mutating
             // session state (e.g. bad LLM response). The session is healthy —
             // don't invalidate it. Other errors may have corrupted state.
-            if !matches!(e, AcpError::AgentError(_)) {
+            if !matches!(e, AcpError::AgentError { .. }) {
                 agent.state.invalidate(&source);
             }
             let usage = agent.acp.take_turn_usage();
@@ -1995,6 +2113,200 @@ async fn fetch_channel_info(channel_id: Uuid, rest: &RestClient) -> Option<Promp
         }
     })
     .await
+}
+
+/// Fetch the latest canvas event for `channel_id` and return a rendered
+/// `[Channel Canvas]` metadata section, or `None` if absent/blank/error.
+///
+/// Failure modes (all fail open — no crash, no block):
+/// * relay returns no event → `None`
+/// * latest event's content is blank → `None` (cleared canvas; older revisions
+///   are NOT resurrected)
+/// * malformed JSON array, missing fields, bad event ID, bad timestamp →
+///   logged at `warn`; returns `None`
+/// * REST error or timeout → returns `None`
+///
+/// Called at most once per new channel session; the result is cached in
+/// `SessionState::canvas_sections` and cleared on session invalidation.
+async fn fetch_canvas_section(channel_id: Uuid, rest: &RestClient) -> Option<String> {
+    use nostr::{Alphabet, SingleLetterTag};
+
+    let h_tag = SingleLetterTag::lowercase(Alphabet::H);
+    let filter = nostr::Filter::new()
+        .kind(nostr::Kind::Custom(buzz_core::kind::KIND_CANVAS as u16))
+        .custom_tags(h_tag, [channel_id.to_string()])
+        .limit(1);
+
+    const CANVAS_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+    let json = match tokio::time::timeout(
+        CANVAS_FETCH_TIMEOUT,
+        rest.query(std::slice::from_ref(&filter)),
+    )
+    .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                target: "canvas::fetch",
+                channel = %channel_id,
+                "canvas query failed: {e} — emitting no section"
+            );
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!(
+                target: "canvas::fetch",
+                channel = %channel_id,
+                timeout_ms = CANVAS_FETCH_TIMEOUT.as_millis() as u64,
+                "canvas fetch timed out — emitting no section"
+            );
+            return None;
+        }
+    };
+
+    let events = match json.as_array() {
+        Some(arr) => arr,
+        None => {
+            tracing::warn!(
+                target: "canvas::fetch",
+                channel = %channel_id,
+                "canvas query response is not a JSON array — emitting no section"
+            );
+            return None;
+        }
+    };
+
+    canvas_section_from_query_response(events, &channel_id.to_string())
+}
+
+/// Parse a canvas query response array and render a `[Channel Canvas]` section.
+///
+/// Extracted as a pure function so tests can exercise the parsing/validation
+/// logic without async machinery or relay connectivity.
+///
+/// Returns `None` on: empty array, blank content, malformed/partial event JSON
+/// (requires a complete, structurally valid Nostr event), or an out-of-range
+/// `created_at` timestamp. Never falls back to epoch or raw integers.
+pub(crate) fn canvas_section_from_query_response(
+    events: &[serde_json::Value],
+    channel_uuid: &str,
+) -> Option<String> {
+    let raw = events.first()?;
+
+    // Deserialise as a complete Nostr Event. Partial objects (missing pubkey,
+    // sig, kind, or tags) are rejected here rather than trusted implicitly.
+    let event = match serde_json::from_value::<nostr::Event>(raw.clone()) {
+        Ok(ev) => ev,
+        Err(err) => {
+            tracing::warn!(
+                target: "canvas::fetch",
+                channel = %channel_uuid,
+                %err,
+                "canvas query returned a malformed event — emitting no section",
+            );
+            return None;
+        }
+    };
+
+    // Verify the event's id and signature agree with its content.
+    // A structurally complete but tampered event must not supply trusted metadata.
+    if let Err(err) = event.verify() {
+        tracing::warn!(
+            target: "canvas::fetch",
+            channel = %channel_uuid,
+            %err,
+            "canvas event failed signature verification — emitting no section",
+        );
+        return None;
+    }
+
+    // Validate kind: must be KIND_CANVAS (40100).
+    if event.kind != nostr::Kind::Custom(buzz_core::kind::KIND_CANVAS as u16) {
+        tracing::warn!(
+            target: "canvas::fetch",
+            channel = %channel_uuid,
+            kind = %event.kind.as_u16(),
+            "canvas event has unexpected kind — emitting no section",
+        );
+        return None;
+    }
+
+    // Validate h-tag: must carry the channel UUID we queried.
+    // The REST boundary filters by #h, but we verify here to prevent a
+    // misbehaving relay from injecting a different channel's canvas.
+    let h_tag_matches = event.tags.iter().any(|tag| {
+        let v = tag.as_slice();
+        v.len() >= 2 && v[0] == "h" && v[1] == channel_uuid
+    });
+    if !h_tag_matches {
+        tracing::warn!(
+            target: "canvas::fetch",
+            channel = %channel_uuid,
+            "canvas event is missing expected h-tag — emitting no section",
+        );
+        return None;
+    }
+
+    // Blank content means the canvas was cleared; do not fall back to older events.
+    if event.content.trim().is_empty() {
+        tracing::debug!(
+            target: "canvas::fetch",
+            channel = %channel_uuid,
+            "latest canvas event has blank content — emitting no section"
+        );
+        return None;
+    }
+
+    let id = event.id.to_hex();
+
+    // Convert the Nostr timestamp to a UTC RFC3339 string with Z suffix.
+    // Use checked conversion: a u64 that exceeds i64::MAX (e.g. Timestamp::max())
+    // wraps silently with `as i64`, producing a negative value that chrono would
+    // accept as a date in 1969. Reject out-of-range values explicitly instead.
+    let ts_secs = match i64::try_from(event.created_at.as_secs()) {
+        Ok(s) => s,
+        Err(_) => {
+            tracing::warn!(
+                target: "canvas::fetch",
+                channel = %channel_uuid,
+                "canvas event created_at overflows i64 — emitting no section",
+            );
+            return None;
+        }
+    };
+    let timestamp = match chrono::DateTime::from_timestamp(ts_secs, 0) {
+        Some(dt) => dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        None => {
+            tracing::warn!(
+                target: "canvas::fetch",
+                channel = %channel_uuid,
+                ts_secs,
+                "canvas event has out-of-range created_at — emitting no section",
+            );
+            return None;
+        }
+    };
+
+    tracing::info!(
+        target: "canvas::fetch",
+        channel = %channel_uuid,
+        event_id = %id,
+        "injected channel canvas metadata section into system prompt"
+    );
+    Some(render_canvas_section(&id, &timestamp, channel_uuid))
+}
+
+/// Render the `[Channel Canvas]` metadata section string.
+///
+/// Pure function — kept separate so unit tests can exercise rendering
+/// without async machinery or relay connectivity.
+pub(crate) fn render_canvas_section(event_id: &str, timestamp: &str, channel_uuid: &str) -> String {
+    format!(
+        "[Channel Canvas]\n\
+         Canvas revision (event ID): {event_id}\n\
+         Last modified: {timestamp}\n\
+         Fetch current content with: buzz canvas get --channel {channel_uuid}"
+    )
 }
 
 /// Fetch conversation context (thread or DM) for a batch before prompting.
@@ -2512,6 +2824,60 @@ fn requeue_cancelled_batch(
     })
 }
 
+/// Result of classifying a failed [`AcpClient::cancel_with_cleanup_grace`]
+/// call: the [`PromptOutcome`] to report and the triggering batch's fate,
+/// decided together so tests cross the exact error→outcome→batch-fate
+/// boundary the production `Err(error)` arm uses.
+struct ControlCancelFailure {
+    outcome: PromptOutcome,
+    retry_batch: Option<FlushBatch>,
+    /// `AgentExited` invalidates every session on the agent; every other
+    /// failure invalidates only the source that triggered this turn.
+    invalidate_all: bool,
+}
+
+/// Classify a failed control-signal cancellation (steer fallback, interrupt,
+/// or explicit stop) into the [`PromptOutcome`] to report and the triggering
+/// batch's fate. This is the single production seam used by the `Err(error)`
+/// arm of the control-cancel branch in [`run_prompt_task`] — the boundary
+/// this exists to keep singular, so regressions there are regression-tested.
+///
+/// [`AcpError::CancelDrainTimeout`] is the expected, common case: the agent
+/// didn't stop within its bounded grace window. [`AcpError::HardTimeout`] is
+/// not expected here — [`AcpClient::cancel_with_cleanup_grace`] translates its
+/// own drain-deadline `HardTimeout` into `CancelDrainTimeout` before
+/// returning — but for defense in depth an unexpected `HardTimeout` at this
+/// bounded cancellation boundary must never regain real hard-cap/dead-letter
+/// classification, so it maps to `CancelDrainTimeout(CONTROL_CANCEL_GRACE)`
+/// rather than `Timeout(Hard)`.
+fn classify_control_cancel_failure(
+    ctx: &PromptContext,
+    error: AcpError,
+    signal: ControlSignal,
+    batch: Option<FlushBatch>,
+) -> ControlCancelFailure {
+    let (outcome, invalidate_all) = match error {
+        AcpError::AgentExited => (PromptOutcome::AgentExited, true),
+        AcpError::IdleTimeout(_) => (PromptOutcome::Timeout(TimeoutKind::Idle), false),
+        AcpError::CancelDrainTimeout(grace) => (PromptOutcome::CancelDrainTimeout(grace), false),
+        // Defense in depth: this bounded cancellation API is documented to
+        // translate its own HardTimeout into CancelDrainTimeout, so this arm
+        // should be unreachable in practice. If it ever fires anyway, still
+        // report the truthful non-hard outcome rather than the real hard-cap
+        // (which would dead-letter the batch and claim the configured cap).
+        AcpError::HardTimeout => (
+            PromptOutcome::CancelDrainTimeout(CONTROL_CANCEL_GRACE),
+            false,
+        ),
+        other => (PromptOutcome::Error(other), false),
+    };
+    ControlCancelFailure {
+        outcome,
+        retry_batch: requeue_cancelled_batch(ctx, signal, batch),
+        invalidate_all,
+    }
+}
+
 /// Log a stop reason at the appropriate tracing level.
 fn log_stop_reason(source: &PromptSource, stop_reason: &StopReason) {
     let label = match source {
@@ -2743,7 +3109,7 @@ async fn publish_agent_turn_metric(
     let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let payload = AgentTurnMetricPayload {
         harness: ctx.harness_name.clone(),
-        model: None,
+        model: usage.model.clone(),
         channel_id: channel_id.map(|id| id.to_string()),
         session_id: Some(usage.session_id.clone()),
         turn_id: Some(turn_id.to_string()),
@@ -3031,7 +3397,7 @@ async fn clear_reactions(rest: crate::relay::RestClient, event_ids: Vec<String>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr::{EventBuilder, Keys, Kind, Tag};
+    use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
     use serde_json::json;
 
     // These pin the initial_message dispatch path (run_prompt_task, ~line 855):
@@ -3060,6 +3426,80 @@ mod tests {
         // No base_prompt configured: nothing to prepend regardless of version.
         let composed = prepend_base_for_legacy(1, None, "hello channel");
         assert_eq!(composed, "hello channel");
+    }
+
+    // ── prepend_canvas_for_legacy ─────────────────────────────────────────────
+
+    #[test]
+    fn test_initial_message_legacy_agent_gets_canvas_prepended() {
+        // Legacy agents (protocol_version < 2) receive the canvas section before
+        // the initial-message body so it arrives before the first prompt.
+        let canvas = "[Channel Canvas]\nCanvas revision (event ID): abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234\nLast modified: 2024-01-15T10:30:00Z\nFetch current content with: buzz canvas get --channel 00f1ccaf-1506-4dd7-9a0e-fa67e9e486ae";
+        let composed = prepend_canvas_for_legacy(1, Some(canvas), "do the thing");
+        assert!(
+            composed.starts_with("[Channel Canvas]"),
+            "canvas must precede the body"
+        );
+        assert!(
+            composed.ends_with("do the thing"),
+            "body must follow the canvas"
+        );
+        assert!(
+            composed.contains("\n\ndo the thing"),
+            "canvas and body separated by blank line"
+        );
+    }
+
+    #[test]
+    fn test_initial_message_modern_agent_omits_canvas_from_body() {
+        // Protocol-v2 agents receive canvas in systemPrompt; it must NOT be
+        // duplicated in the initial-message user turn.
+        let canvas = "[Channel Canvas]\nsome section";
+        let composed = prepend_canvas_for_legacy(2, Some(canvas), "do the thing");
+        assert_eq!(
+            composed, "do the thing",
+            "modern agent initial message must not contain canvas"
+        );
+        assert!(
+            !composed.contains("[Channel Canvas]"),
+            "canvas must be absent from modern agent initial message"
+        );
+    }
+
+    #[test]
+    fn test_initial_message_legacy_agent_no_canvas_is_unchanged() {
+        // No canvas present: body passes through unmodified.
+        let composed = prepend_canvas_for_legacy(1, None, "do the thing");
+        assert_eq!(composed, "do the thing");
+    }
+
+    #[test]
+    fn test_initial_message_legacy_canvas_and_base_compose_correctly() {
+        // Verify the full composition order when both base and canvas are present:
+        // [Base] → canvas section → initial-message body.
+        let canvas = "[Channel Canvas]\ncanvas content";
+        let base_composed = prepend_base_for_legacy(1, Some("be helpful"), "do the thing");
+        let full = prepend_canvas_for_legacy(1, Some(canvas), &base_composed);
+        assert!(
+            full.starts_with("[Channel Canvas]"),
+            "canvas must be first in composed message"
+        );
+        assert!(
+            full.contains("[Base]"),
+            "base must be present in composed message"
+        );
+        assert!(
+            full.ends_with("do the thing"),
+            "body must be last in composed message"
+        );
+        // Order: canvas → base → body
+        let canvas_pos = full.find("[Channel Canvas]").unwrap();
+        let base_pos = full.find("[Base]").unwrap();
+        let body_pos = full.find("do the thing").unwrap();
+        assert!(
+            canvas_pos < base_pos && base_pos < body_pos,
+            "order must be: canvas → base → body"
+        );
     }
 
     // Pin the session/new systemPrompt framing: each present prompt carries its
@@ -3716,6 +4156,240 @@ mod tests {
         assert_eq!(*s.turn_counts.get(&ch_b).unwrap(), 3);
     }
 
+    // ── requeue_cancelled_batch ────────────────────────────────────────────
+    // Table-driven pin of the `ControlSignal` → `CancelReason` ownership that
+    // decides whether a cancel-drain-expiry batch is merged into the next
+    // flush or dropped outright. `Cancel`/`Rotate` must return `None` — a
+    // regression here would silently fall through to
+    // `unwrap_or(CancelReason::Steer)` at the requeue site and preserve a
+    // batch that should have been discarded.
+
+    fn one_event_batch(channel_id: Uuid) -> FlushBatch {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(9), "test")
+            .sign_with_keys(&keys)
+            .unwrap();
+        FlushBatch {
+            channel_id,
+            events: vec![crate::queue::BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        }
+    }
+
+    #[test]
+    fn test_requeue_cancelled_batch_maps_control_signal_to_cancel_reason() {
+        let cases = [
+            (ControlSignal::Steer, Some(CancelReason::Steer)),
+            (ControlSignal::Interrupt, Some(CancelReason::Interrupt)),
+            (
+                ControlSignal::SwitchModel("gpt-5".into()),
+                Some(CancelReason::Interrupt),
+            ),
+            (ControlSignal::Cancel, None),
+            (ControlSignal::Rotate, None),
+        ];
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.dedup_mode = DedupMode::Queue;
+
+        for (signal, expected_reason) in cases {
+            let channel_id = Uuid::new_v4();
+            let batch = one_event_batch(channel_id);
+            let result = requeue_cancelled_batch(&ctx, signal.clone(), Some(batch));
+            match expected_reason {
+                Some(reason) => {
+                    let batch = result
+                        .unwrap_or_else(|| panic!("{signal:?} must preserve the batch, got None"));
+                    assert_eq!(
+                        batch.cancel_reason,
+                        Some(reason),
+                        "{signal:?} must stamp {reason:?}"
+                    );
+                }
+                None => assert!(
+                    result.is_none(),
+                    "{signal:?} must drop the batch, got {result:?}"
+                ),
+            }
+        }
+    }
+
+    // ── classify_control_cancel_failure ─────────────────────────────────────
+    // Table-driven pin of the single production seam used by the
+    // `Err(error)` arm in `run_prompt_task`'s control-cancel branch. Crosses
+    // the exact error→outcome AND outcome→batch-fate boundary in one call,
+    // so a regression to the old per-arm duplication (or to routing an
+    // unexpected HardTimeout back through the real hard-cap path) fails
+    // here rather than only in independently-manufactured unit tests.
+
+    /// Assert `outcome` is the expected `PromptOutcome` variant. `PromptOutcome`
+    /// has no `PartialEq` (it wraps `AcpError`, which isn't `PartialEq`), so
+    /// this matches by shape instead of deriving equality onto the whole enum.
+    fn assert_outcome_matches(outcome: &PromptOutcome, expected: &str) {
+        let label = match outcome {
+            PromptOutcome::AgentExited => "AgentExited",
+            PromptOutcome::Timeout(TimeoutKind::Idle) => "Timeout(Idle)",
+            PromptOutcome::Timeout(TimeoutKind::Hard) => "Timeout(Hard)",
+            PromptOutcome::CancelDrainTimeout(_) => "CancelDrainTimeout",
+            PromptOutcome::Error(_) => "Error",
+            PromptOutcome::Cancelled => "Cancelled",
+            PromptOutcome::Ok(_) => "Ok",
+        };
+        assert_eq!(
+            label, expected,
+            "got outcome shape {label}, want {expected}"
+        );
+    }
+
+    #[test]
+    fn test_classify_control_cancel_failure_crosses_error_outcome_and_batch_fate() {
+        let ctx = {
+            let mut ctx = make_prompt_context_no_owner();
+            ctx.dedup_mode = DedupMode::Queue;
+            ctx
+        };
+
+        struct Case {
+            name: &'static str,
+            error: fn() -> AcpError,
+            signal: ControlSignal,
+            expected_outcome: &'static str,
+            batch_preserved: bool,
+            expected_reason: Option<CancelReason>,
+            invalidate_all: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "CancelDrainTimeout + Steer preserves batch with Steer reason",
+                error: || AcpError::CancelDrainTimeout(CONTROL_CANCEL_GRACE),
+                signal: ControlSignal::Steer,
+                expected_outcome: "CancelDrainTimeout",
+                batch_preserved: true,
+                expected_reason: Some(CancelReason::Steer),
+                invalidate_all: false,
+            },
+            Case {
+                name: "CancelDrainTimeout + Cancel drops the batch",
+                error: || AcpError::CancelDrainTimeout(CONTROL_CANCEL_GRACE),
+                signal: ControlSignal::Cancel,
+                expected_outcome: "CancelDrainTimeout",
+                batch_preserved: false,
+                expected_reason: None,
+                invalidate_all: false,
+            },
+            Case {
+                name: "CancelDrainTimeout + Interrupt preserves batch with Interrupt reason",
+                error: || AcpError::CancelDrainTimeout(CONTROL_CANCEL_GRACE),
+                signal: ControlSignal::Interrupt,
+                expected_outcome: "CancelDrainTimeout",
+                batch_preserved: true,
+                expected_reason: Some(CancelReason::Interrupt),
+                invalidate_all: false,
+            },
+            Case {
+                name: "CancelDrainTimeout + Rotate drops the batch",
+                error: || AcpError::CancelDrainTimeout(CONTROL_CANCEL_GRACE),
+                signal: ControlSignal::Rotate,
+                expected_outcome: "CancelDrainTimeout",
+                batch_preserved: false,
+                expected_reason: None,
+                invalidate_all: false,
+            },
+            Case {
+                name: "CancelDrainTimeout + SwitchModel preserves batch with Interrupt reason",
+                error: || AcpError::CancelDrainTimeout(CONTROL_CANCEL_GRACE),
+                signal: ControlSignal::SwitchModel("gpt-5".to_string()),
+                expected_outcome: "CancelDrainTimeout",
+                batch_preserved: true,
+                expected_reason: Some(CancelReason::Interrupt),
+                invalidate_all: false,
+            },
+            Case {
+                name: "unexpected HardTimeout cannot become Timeout(Hard)",
+                error: || AcpError::HardTimeout,
+                signal: ControlSignal::Steer,
+                expected_outcome: "CancelDrainTimeout",
+                batch_preserved: true,
+                expected_reason: Some(CancelReason::Steer),
+                invalidate_all: false,
+            },
+            Case {
+                name: "AgentExited requests all-session invalidation and preserves via Steer",
+                error: || AcpError::AgentExited,
+                signal: ControlSignal::Steer,
+                expected_outcome: "AgentExited",
+                batch_preserved: true,
+                expected_reason: Some(CancelReason::Steer),
+                invalidate_all: true,
+            },
+            Case {
+                name: "AgentExited + Cancel still drops the batch",
+                error: || AcpError::AgentExited,
+                signal: ControlSignal::Cancel,
+                expected_outcome: "AgentExited",
+                batch_preserved: false,
+                expected_reason: None,
+                invalidate_all: true,
+            },
+            Case {
+                name: "IdleTimeout maps to Timeout(Idle)",
+                error: || AcpError::IdleTimeout(Duration::from_secs(30)),
+                signal: ControlSignal::Steer,
+                expected_outcome: "Timeout(Idle)",
+                batch_preserved: true,
+                expected_reason: Some(CancelReason::Steer),
+                invalidate_all: false,
+            },
+        ];
+
+        for case in cases {
+            let channel_id = Uuid::new_v4();
+            let batch = one_event_batch(channel_id);
+            let failure = classify_control_cancel_failure(
+                &ctx,
+                (case.error)(),
+                case.signal.clone(),
+                Some(batch),
+            );
+            assert_outcome_matches(&failure.outcome, case.expected_outcome);
+            assert_eq!(
+                failure.invalidate_all, case.invalidate_all,
+                "{}: invalidate_all mismatch",
+                case.name
+            );
+            match case.expected_reason {
+                Some(reason) => {
+                    let batch = failure
+                        .retry_batch
+                        .unwrap_or_else(|| panic!("{}: batch must be preserved", case.name));
+                    assert_eq!(
+                        batch.cancel_reason,
+                        Some(reason),
+                        "{}: cancel_reason mismatch",
+                        case.name
+                    );
+                }
+                None => assert!(
+                    failure.retry_batch.is_none(),
+                    "{}: batch must be dropped, got {:?}",
+                    case.name,
+                    failure.retry_batch
+                ),
+            }
+            assert_eq!(
+                case.batch_preserved,
+                case.expected_reason.is_some(),
+                "{}: test table internally inconsistent",
+                case.name
+            );
+        }
+    }
+
     // ── turn liveness emission ───────────────────────────────────────────────
     // `run_turn_liveness` is raced against a "prompt" future the same way
     // `run_prompt_task` does it: the prompt wins the select and the liveness
@@ -3818,9 +4492,14 @@ mod tests {
     /// `install_steer_rx` does not panic.
     #[tokio::test]
     async fn test_send_prompt_result_clears_steer_rx_on_early_return() {
-        let acp = AcpClient::spawn("bash", &["-c".to_string(), "sleep 10".to_string()], &[])
-            .await
-            .expect("failed to spawn test agent");
+        let acp = AcpClient::spawn(
+            "bash",
+            &["-c".to_string(), "sleep 10".to_string()],
+            &[],
+            false,
+        )
+        .await
+        .expect("failed to spawn test agent");
         let mut agent = OwnedAgent {
             index: 0,
             acp,
@@ -3868,9 +4547,14 @@ mod tests {
     /// and the next `install_steer_rx` does not panic.
     #[tokio::test]
     async fn test_send_prompt_result_is_noop_when_steer_rx_already_consumed() {
-        let acp = AcpClient::spawn("bash", &["-c".to_string(), "sleep 10".to_string()], &[])
-            .await
-            .expect("failed to spawn test agent");
+        let acp = AcpClient::spawn(
+            "bash",
+            &["-c".to_string(), "sleep 10".to_string()],
+            &[],
+            false,
+        )
+        .await
+        .expect("failed to spawn test agent");
         let agent = OwnedAgent {
             index: 0,
             acp,
@@ -3965,6 +4649,7 @@ mod tests {
             cumulative_input_tokens: 100,
             cumulative_output_tokens: 50,
             cumulative_cost_usd: None,
+            model: None,
         };
         // owner_pubkey = None → early return, no panic.
         publish_agent_turn_metric(
@@ -3996,6 +4681,7 @@ mod tests {
             cumulative_input_tokens: 200,
             cumulative_output_tokens: 80,
             cumulative_cost_usd: Some(0.001),
+            model: None,
         };
         // Will try to publish and fail (no real relay) but must not panic.
         publish_agent_turn_metric(
@@ -4028,6 +4714,7 @@ mod tests {
             cumulative_input_tokens: 150,
             cumulative_output_tokens: 70,
             cumulative_cost_usd: None,
+            model: None,
         };
         // Must not panic; HTTP submit will fail (no real relay) — that's fine.
         publish_agent_turn_metric(
@@ -4060,6 +4747,7 @@ mod tests {
             cumulative_input_tokens: 400,
             cumulative_output_tokens: 100,
             cumulative_cost_usd: None,
+            model: None,
         };
         // Will try to publish (encrypt succeeds) and fail HTTP (no relay) — must not panic.
         publish_agent_turn_metric(
@@ -4098,6 +4786,7 @@ mod tests {
             turn_liveness_interval: Duration::ZERO,
             dedup_mode: DedupMode::Drop,
             system_prompt: None,
+            team_instructions: None,
             heartbeat_prompt: None,
             base_prompt: None,
             cwd: ".".to_string(),
@@ -4116,5 +4805,313 @@ mod tests {
             memory_enabled: false,
             harness_name: "goose".to_string(),
         }
+    }
+
+    // ── render_canvas_section ────────────────────────────────────────────────
+
+    #[test]
+    fn test_render_canvas_section_produces_exact_shape() {
+        let id = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let ts = "2024-01-15T10:30:00+00:00";
+        let uuid = "00f1ccaf-1506-4dd7-9a0e-fa67e9e486ae";
+        let section = render_canvas_section(id, ts, uuid);
+        assert_eq!(
+            section,
+            "[Channel Canvas]\n\
+             Canvas revision (event ID): a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2\n\
+             Last modified: 2024-01-15T10:30:00+00:00\n\
+             Fetch current content with: buzz canvas get --channel 00f1ccaf-1506-4dd7-9a0e-fa67e9e486ae"
+        );
+    }
+
+    // ── with_canvas ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_with_canvas_appends_to_existing_prompt() {
+        let result = with_canvas(Some("base content".into()), Some("[Channel Canvas]\nstuff"));
+        assert_eq!(result.unwrap(), "base content\n\n[Channel Canvas]\nstuff");
+    }
+
+    #[test]
+    fn test_with_canvas_returns_canvas_alone_when_no_prompt() {
+        let result = with_canvas(None, Some("[Channel Canvas]\nstuff"));
+        assert_eq!(result.unwrap(), "[Channel Canvas]\nstuff");
+    }
+
+    #[test]
+    fn test_with_canvas_returns_prompt_alone_when_no_canvas() {
+        let result = with_canvas(Some("base content".into()), None);
+        assert_eq!(result.unwrap(), "base content");
+    }
+
+    #[test]
+    fn test_with_canvas_returns_none_when_both_absent() {
+        let result = with_canvas(None, None);
+        assert!(result.is_none());
+    }
+
+    // ── canvas_sections cache invalidation ───────────────────────────────────
+
+    #[test]
+    fn test_invalidate_channel_clears_canvas_section() {
+        let ch = Uuid::new_v4();
+        let mut s = SessionState::default();
+        s.sessions.insert(ch, "sess".into());
+        s.canvas_sections
+            .insert(ch, "[Channel Canvas]\nrev abc".into());
+
+        s.invalidate_channel(&ch);
+
+        assert!(!s.canvas_sections.contains_key(&ch));
+        assert!(!s.sessions.contains_key(&ch));
+    }
+
+    #[test]
+    fn test_invalidate_all_clears_canvas_sections() {
+        let ch_a = Uuid::new_v4();
+        let ch_b = Uuid::new_v4();
+        let mut s = SessionState::default();
+        s.canvas_sections.insert(ch_a, "canvas-a".into());
+        s.canvas_sections.insert(ch_b, "canvas-b".into());
+        s.sessions.insert(ch_a, "sess-a".into());
+
+        s.invalidate_all();
+
+        assert!(s.canvas_sections.is_empty());
+        assert!(s.sessions.is_empty());
+    }
+
+    #[test]
+    fn test_invalidate_channel_leaves_other_channels_canvas_intact() {
+        let ch_a = Uuid::new_v4();
+        let ch_b = Uuid::new_v4();
+        let mut s = SessionState::default();
+        s.sessions.insert(ch_a, "sess-a".into());
+        s.sessions.insert(ch_b, "sess-b".into());
+        s.canvas_sections.insert(ch_a, "canvas-a".into());
+        s.canvas_sections.insert(ch_b, "canvas-b".into());
+
+        s.invalidate_channel(&ch_a);
+
+        assert!(!s.canvas_sections.contains_key(&ch_a));
+        assert_eq!(s.canvas_sections.get(&ch_b).unwrap(), "canvas-b");
+    }
+
+    #[test]
+    fn test_has_channel_state_true_when_only_canvas_section_present() {
+        let ch = Uuid::new_v4();
+        let mut s = SessionState::default();
+        s.canvas_sections.insert(ch, "canvas".into());
+        assert!(s.has_channel_state(&ch));
+    }
+
+    // ── canvas_section_from_query_response ───────────────────────────────────
+
+    const CHANNEL_UUID: &str = "00f1ccaf-1506-4dd7-9a0e-fa67e9e486ae";
+
+    /// Build a real, cryptographically signed Nostr canvas event for tests.
+    ///
+    /// Includes the correct kind (40100) and an `h` tag carrying `CHANNEL_UUID`
+    /// so all structural and content validations pass.
+    fn make_canvas_event_value(content: &str) -> serde_json::Value {
+        let keys = Keys::generate();
+        let h_tag = Tag::parse(["h", CHANNEL_UUID]).expect("h tag");
+        let event = EventBuilder::new(Kind::Custom(buzz_core::kind::KIND_CANVAS as u16), content)
+            .tags([h_tag])
+            .sign_with_keys(&keys)
+            .expect("sign");
+        serde_json::to_value(&event).expect("serialise")
+    }
+
+    #[test]
+    fn test_canvas_section_from_query_response_happy_path() {
+        let ev = make_canvas_event_value("# Team instructions\nBe helpful.");
+        let id = ev["id"].as_str().unwrap().to_string();
+        let result = canvas_section_from_query_response(&[ev], CHANNEL_UUID);
+        let section = result.expect("expected Some");
+        assert!(section.contains(&id), "section must contain the event id");
+        assert!(section.contains("buzz canvas get --channel"));
+        assert!(section.contains(CHANNEL_UUID));
+        assert!(section.starts_with("[Channel Canvas]"));
+        // Timestamp must use Z suffix, not +00:00
+        assert!(section.contains('Z'), "timestamp must use Z suffix");
+    }
+
+    #[test]
+    fn test_canvas_section_from_query_response_empty_array_returns_none() {
+        let result = canvas_section_from_query_response(&[], CHANNEL_UUID);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_canvas_section_from_query_response_blank_content_returns_none() {
+        let ev = make_canvas_event_value("   ");
+        let result = canvas_section_from_query_response(&[ev], CHANNEL_UUID);
+        assert!(
+            result.is_none(),
+            "blank content must return None (cleared canvas)"
+        );
+    }
+
+    #[test]
+    fn test_canvas_section_from_query_response_empty_content_returns_none() {
+        let ev = make_canvas_event_value("");
+        let result = canvas_section_from_query_response(&[ev], CHANNEL_UUID);
+        assert!(result.is_none());
+    }
+
+    /// A bare JSON object with a plausible-looking id but missing pubkey/sig/kind/tags
+    /// must be rejected — not silently accepted with partial metadata.
+    #[test]
+    fn test_canvas_section_from_query_response_partial_object_returns_none() {
+        let partial = serde_json::json!({
+            "id": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+            "created_at": 1705312200_i64,
+            "content": "some instructions"
+        });
+        let result = canvas_section_from_query_response(&[partial], CHANNEL_UUID);
+        assert!(
+            result.is_none(),
+            "partial event object (missing pubkey/sig/kind/tags) must return None"
+        );
+    }
+
+    /// A JSON object that looks like an event but has `created_at` as a string
+    /// must be rejected — the nostr::Event parser enforces integer type.
+    #[test]
+    fn test_canvas_section_from_query_response_string_timestamp_returns_none() {
+        let keys = Keys::generate();
+        let h_tag = Tag::parse(["h", CHANNEL_UUID]).expect("h tag");
+        let mut ev = serde_json::to_value(
+            EventBuilder::new(Kind::Custom(buzz_core::kind::KIND_CANVAS as u16), "content")
+                .tags([h_tag])
+                .sign_with_keys(&keys)
+                .expect("sign"),
+        )
+        .expect("serialise");
+        // Corrupt created_at to a string value.
+        ev["created_at"] = serde_json::Value::String("2026-03-15T16:30:00+00:00".into());
+        let result = canvas_section_from_query_response(&[ev], CHANNEL_UUID);
+        assert!(
+            result.is_none(),
+            "string created_at must be rejected by nostr::Event deserialiser"
+        );
+    }
+
+    /// A JSON object that looks like an event but is missing `created_at`
+    /// must be rejected — nostr::Event requires the field.
+    #[test]
+    fn test_canvas_section_from_query_response_missing_timestamp_returns_none() {
+        let keys = Keys::generate();
+        let h_tag = Tag::parse(["h", CHANNEL_UUID]).expect("h tag");
+        let mut ev = serde_json::to_value(
+            EventBuilder::new(Kind::Custom(buzz_core::kind::KIND_CANVAS as u16), "content")
+                .tags([h_tag])
+                .sign_with_keys(&keys)
+                .expect("sign"),
+        )
+        .expect("serialise");
+        ev.as_object_mut().unwrap().remove("created_at");
+        let result = canvas_section_from_query_response(&[ev], CHANNEL_UUID);
+        assert!(
+            result.is_none(),
+            "missing created_at must be rejected by nostr::Event deserialiser"
+        );
+    }
+
+    /// An event with a timestamp at Timestamp::max() (u64::MAX) must return None.
+    ///
+    /// `u64::MAX as i64` wraps to -1, which chrono silently accepts as
+    /// 1969-12-31T23:59:59Z. The checked i64::try_from must reject it first.
+    #[test]
+    fn test_canvas_section_from_query_response_timestamp_max_returns_none() {
+        let keys = Keys::generate();
+        let h_tag = Tag::parse(["h", CHANNEL_UUID]).expect("h tag");
+        let ev = serde_json::to_value(
+            EventBuilder::new(Kind::Custom(buzz_core::kind::KIND_CANVAS as u16), "content")
+                .tags([h_tag])
+                .custom_created_at(Timestamp::max())
+                .sign_with_keys(&keys)
+                .expect("sign"),
+        )
+        .expect("serialise");
+        let result = canvas_section_from_query_response(&[ev], CHANNEL_UUID);
+        assert!(
+            result.is_none(),
+            "Timestamp::max() (u64::MAX) must return None — not wrap to 1969"
+        );
+    }
+
+    /// A structurally complete but tampered event (content altered after signing)
+    /// must be rejected by event.verify().
+    #[test]
+    fn test_canvas_section_from_query_response_tampered_event_returns_none() {
+        let keys = Keys::generate();
+        let h_tag = Tag::parse(["h", CHANNEL_UUID]).expect("h tag");
+        let mut ev = serde_json::to_value(
+            EventBuilder::new(
+                Kind::Custom(buzz_core::kind::KIND_CANVAS as u16),
+                "original",
+            )
+            .tags([h_tag])
+            .sign_with_keys(&keys)
+            .expect("sign"),
+        )
+        .expect("serialise");
+        // Tamper the content after signing — id and sig no longer agree.
+        ev["content"] = serde_json::Value::String("injected instructions".into());
+        let result = canvas_section_from_query_response(&[ev], CHANNEL_UUID);
+        assert!(
+            result.is_none(),
+            "tampered event must fail verify() and return None"
+        );
+    }
+
+    /// An event with the wrong kind (not 40100) must be rejected.
+    #[test]
+    fn test_canvas_section_from_query_response_wrong_kind_returns_none() {
+        let keys = Keys::generate();
+        let h_tag = Tag::parse(["h", CHANNEL_UUID]).expect("h tag");
+        let ev = serde_json::to_value(
+            EventBuilder::new(Kind::Custom(9), "content")
+                .tags([h_tag])
+                .sign_with_keys(&keys)
+                .expect("sign"),
+        )
+        .expect("serialise");
+        let result = canvas_section_from_query_response(&[ev], CHANNEL_UUID);
+        assert!(result.is_none(), "wrong kind must return None");
+    }
+
+    /// An event missing the expected h-tag (or carrying a different channel UUID)
+    /// must be rejected.
+    #[test]
+    fn test_canvas_section_from_query_response_wrong_h_tag_returns_none() {
+        let keys = Keys::generate();
+        let wrong_h = Tag::parse(["h", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"]).expect("h tag");
+        let ev = serde_json::to_value(
+            EventBuilder::new(Kind::Custom(buzz_core::kind::KIND_CANVAS as u16), "content")
+                .tags([wrong_h])
+                .sign_with_keys(&keys)
+                .expect("sign"),
+        )
+        .expect("serialise");
+        let result = canvas_section_from_query_response(&[ev], CHANNEL_UUID);
+        assert!(result.is_none(), "mismatched h-tag must return None");
+    }
+
+    #[test]
+    fn test_canvas_section_from_query_response_timestamp_uses_z_suffix() {
+        let ev = make_canvas_event_value("instructions");
+        let result = canvas_section_from_query_response(&[ev], CHANNEL_UUID);
+        let section = result.expect("valid event must produce a section");
+        assert!(
+            section.contains('Z'),
+            "RFC3339 timestamp must use Z suffix, not +00:00"
+        );
+        assert!(
+            !section.contains("+00:00"),
+            "timestamp must not use +00:00 offset"
+        );
     }
 }

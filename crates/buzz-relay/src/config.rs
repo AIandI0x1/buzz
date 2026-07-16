@@ -1,6 +1,7 @@
 //! Relay configuration from environment variables.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use thiserror::Error;
 use tracing::warn;
@@ -33,6 +34,8 @@ pub struct Config {
     pub redis_url: String,
     /// Public WebSocket URL of this relay, advertised in NIP-11.
     pub relay_url: String,
+    /// Public WebSocket URL of the dedicated device-pairing relay, when configured.
+    pub pairing_relay_url: Option<String>,
     /// Maximum number of concurrent WebSocket connections.
     pub max_connections: usize,
     /// Maximum number of concurrently executing message handlers.
@@ -93,10 +96,46 @@ pub struct Config {
     /// service lands.
     pub huddle_audio_available: bool,
 
+    /// Inter-relay mesh configuration (`BUZZ_MESH`, `BUZZ_MESH_BIND_ADDR`).
+    /// Opt-in: mesh forms only when `BUZZ_MESH=on` is explicit. The default
+    /// (absent/off) is exact single-instance behavior — no bind, no Redis
+    /// registry write — so an image upgrade with untouched env is a strict
+    /// no-regression rollout.
+    pub mesh: buzz_relay_mesh::MeshConfig,
+
+    /// Testbed-only reliable-stream echo consumer (`BUZZ_MESH_DEMO_ECHO`).
+    /// When `on`, the owner side of an inbound reliable mesh stream echoes
+    /// every validated `Data` frame back to the sender — a transport/
+    /// session-routing smoke for cross-pod evidence runs, NOT a product flow.
+    /// Same strict opt-in as `BUZZ_MESH`; default off means inbound reliable
+    /// streams are accepted, logged, and closed (no session consumer yet).
+    pub mesh_demo_echo: bool,
+
     /// Optional hex-encoded pubkey of the relay owner.
     /// When set, this pubkey is automatically bootstrapped into `relay_members`
     /// with the `owner` role on first startup.
     pub relay_owner_pubkey: Option<String>,
+
+    /// Canonical HTTP origin of the deployment-global operator API.
+    ///
+    /// Every operator NIP-98 `u` tag is verified against this origin, independent
+    /// of the inbound HTTP `Host` header and tenant registry. Required when
+    /// `RELAY_OPERATOR_PUBKEYS` is non-empty. Set via `RELAY_OPERATOR_API_ORIGIN`
+    /// as an `http://` or `https://` origin with no path, query, or fragment.
+    pub relay_operator_api_origin: Option<String>,
+
+    /// Deployment-level relay operator pubkeys allowed to use the
+    /// `/operator/communities` management endpoints.
+    ///
+    /// Unlike `relay_owner_pubkey` (a role *within* the deployment community),
+    /// operators span tenants: they may create new communities and bootstrap
+    /// initial owners, but hold no implicit tenant membership row.
+    /// Empty (the default) disables community provisioning entirely — fail closed.
+    ///
+    /// Set via `RELAY_OPERATOR_PUBKEYS` as a comma-separated list of 64-char
+    /// hex pubkeys. Invalid entries are rejected at startup (config error), not
+    /// skipped — a typo must not silently disable an operator.
+    pub relay_operator_pubkeys: Vec<String>,
 
     /// Allow NIP-OA owner attestation for relay membership.
     ///
@@ -121,6 +160,10 @@ pub struct Config {
     /// Maximum media upload starts accepted from one pubkey per minute.
     pub media_uploads_per_minute: u32,
 
+    /// Require Blossom kind:24242 `t=get` auth plus relay membership before
+    /// serving media GET/HEAD. Default off for staged client rollout.
+    pub require_media_get_auth: bool,
+
     /// Optional override for ephemeral channel TTL (in seconds).
     /// When set, any channel created with a TTL tag will use this value instead
     /// of the client-provided one. Useful for testing ephemeral expiry quickly.
@@ -130,12 +173,10 @@ pub struct Config {
 
     /// Root directory for the relay's local git scratch. No per-repo bare repos
     /// or persistent git state live here — runtime reads/writes hydrate
-    /// ephemeral repos from object storage per request, and repo-name
-    /// uniqueness now lives in Postgres (`git_repo_names`), not on disk. Retained
-    /// for ephemeral working space and env compatibility; the relay no longer
-    /// depends on this path being persistent or shared across replicas, so it
-    /// needs no ReadWriteMany volume. (Removing the field entirely is a
-    /// follow-up cleanup once the deploy chart drops the git PVC mount.)
+    /// ephemeral repos from object storage per request, and all temporary Git
+    /// workspaces and buffered subprocess output are created beneath this path.
+    /// Repo-name uniqueness lives in Postgres (`git_repo_names`), not on disk,
+    /// so this directory need not be persistent or shared across replicas.
     pub git_repo_path: std::path::PathBuf,
     /// Maximum pack file size for git push (bytes). Default: 500 MB.
     pub git_max_pack_bytes: u64,
@@ -152,15 +193,71 @@ pub struct Config {
     /// Used to authenticate internal policy endpoint requests.
     pub git_hook_hmac_secret: String,
 
+    /// Descriptor key identifier accepted in kind:30350 `exec` tags.
+    pub push_executor_key_id: String,
+    /// Exact HTTPS gateway endpoint used to submit client-authorized APNs delivery capabilities.
+    /// Push lease support is disabled when unset.
+    pub push_gateway_delivery_url: Option<url::Url>,
+    /// Hard timeout for one gateway delivery request.
+    pub push_gateway_timeout: Duration,
+
     /// Optional path to the web UI `dist/` directory.
-    /// When set, the relay serves the SPA from this directory for browser requests.
+    /// When set, the relay serves the invite landing page and its static assets.
     /// When unset, no static file serving happens (relay behaves as before).
     pub web_dir: Option<std::path::PathBuf>,
+    /// Whether the configured web bundle serves Git browser routes in addition
+    /// to the public invite landing page. Defaults to false.
+    pub serve_git_web_gui: bool,
 }
 
 fn parse_bind_addr(raw: &str) -> Result<SocketAddr, ConfigError> {
     raw.parse::<SocketAddr>()
         .map_err(|e| ConfigError::InvalidBindAddr(e.to_string()))
+}
+
+fn parse_operator_api_origin(raw: &str) -> Result<String, ConfigError> {
+    let raw = raw.trim();
+    let url = url::Url::parse(raw).map_err(|e| {
+        ConfigError::InvalidValue(format!("RELAY_OPERATOR_API_ORIGIN is not a valid URL: {e}"))
+    })?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ConfigError::InvalidValue(
+            "RELAY_OPERATOR_API_ORIGIN must be an http(s) origin with no credentials, path, query, or fragment"
+                .to_string(),
+        ));
+    }
+    Ok(raw.trim_end_matches('/').to_string())
+}
+
+const DEFAULT_PUSH_GATEWAY_DELIVERY_URL: &str = "https://push.buzz.xyz/v1/deliveries/apns";
+
+fn parse_push_gateway_delivery_url(raw: &str) -> Result<url::Url, ConfigError> {
+    let url = url::Url::parse(raw.trim()).map_err(|e| {
+        ConfigError::InvalidValue(format!(
+            "BUZZ_PUSH_GATEWAY_DELIVERY_URL is not a valid URL: {e}"
+        ))
+    })?;
+    if url.scheme() != "https"
+        || url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/v1/deliveries/apns"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ConfigError::InvalidValue(
+            "BUZZ_PUSH_GATEWAY_DELIVERY_URL must be an exact HTTPS /v1/deliveries/apns URL without credentials, query, or fragment"
+                .to_string(),
+        ));
+    }
+    Ok(url)
 }
 
 fn ensure_git_repo_path(
@@ -184,13 +281,32 @@ impl Config {
         let bind_addr = parse_bind_addr(&bind_addr_raw)?;
 
         let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string());
+            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()); // sadscan:disable np.postgres.1
 
         let redis_url =
             std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
 
         let relay_url =
             std::env::var("RELAY_URL").unwrap_or_else(|_| "ws://localhost:3000".to_string());
+
+        let pairing_relay_url = std::env::var("BUZZ_PAIRING_RELAY_URL")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                let parsed = url::Url::parse(&value).map_err(|e| {
+                    ConfigError::InvalidValue(format!(
+                        "BUZZ_PAIRING_RELAY_URL must be a valid ws:// or wss:// URL: {e}"
+                    ))
+                })?;
+                if !matches!(parsed.scheme(), "ws" | "wss") || parsed.host_str().is_none() {
+                    return Err(ConfigError::InvalidValue(
+                        "BUZZ_PAIRING_RELAY_URL must be a valid ws:// or wss:// URL".to_string(),
+                    ));
+                }
+                Ok(value)
+            })
+            .transpose()?;
 
         let max_connections = std::env::var("BUZZ_MAX_CONNECTIONS")
             .ok()
@@ -236,6 +352,33 @@ impl Config {
             .map(|v| !(v == "false" || v == "0"))
             .unwrap_or(true);
 
+        // Mesh opt-in: default OFF. Strict rollout no-regression — an image
+        // upgrade with untouched env must not bind a new UDP port or write a
+        // new Redis key. Horizontally-scaled deployments explicitly set
+        // `BUZZ_MESH=on`; anything else (absent, `off`, other values) keeps
+        // exact single-instance behavior.
+        let mesh_enabled = std::env::var("BUZZ_MESH")
+            .map(|v| v.eq_ignore_ascii_case("on") || v == "true" || v == "1")
+            .unwrap_or(false);
+        let mesh_bind_addr = std::env::var("BUZZ_MESH_BIND_ADDR")
+            .map(|raw| {
+                raw.parse::<SocketAddr>().map_err(|e| {
+                    ConfigError::InvalidValue(format!("invalid BUZZ_MESH_BIND_ADDR: {e}"))
+                })
+            })
+            .unwrap_or_else(|_| Ok("0.0.0.0:3478".parse().expect("static default parses")))?;
+        let mesh = buzz_relay_mesh::MeshConfig {
+            enabled: mesh_enabled,
+            bind_addr: mesh_bind_addr,
+            registry_refresh: std::time::Duration::from_secs(15),
+        };
+
+        // Demo echo opt-in: same strict pattern as BUZZ_MESH — explicit
+        // `on`/`true`/`1` only, anything else (absent, `off`, typos) is off.
+        let mesh_demo_echo = std::env::var("BUZZ_MESH_DEMO_ECHO")
+            .map(|v| v.eq_ignore_ascii_case("on") || v == "true" || v == "1")
+            .unwrap_or(false);
+
         let allow_nip_oa_auth = std::env::var("BUZZ_ALLOW_NIP_OA_AUTH")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
@@ -259,6 +402,46 @@ impl Config {
                     None
                 }
             });
+
+        // Note: intentionally not prefixed with BUZZ_ — same relay-identity
+        // config family as RELAY_OWNER_PUBKEY. Comma-separated 64-char hex
+        // pubkeys. Unlike RELAY_OWNER_PUBKEY (warn-and-ignore), an invalid
+        // entry here is a hard config error: silently dropping an operator
+        // pubkey would silently disable provisioning for that operator.
+        let relay_operator_api_origin = std::env::var("RELAY_OPERATOR_API_ORIGIN")
+            .ok()
+            .filter(|raw| !raw.trim().is_empty())
+            .map(|raw| parse_operator_api_origin(&raw))
+            .transpose()?;
+
+        let relay_operator_pubkeys = match std::env::var("RELAY_OPERATOR_PUBKEYS") {
+            Ok(raw) => {
+                let mut pubkeys = Vec::new();
+                for entry in raw.split(',') {
+                    let entry = entry.trim().to_lowercase();
+                    if entry.is_empty() {
+                        continue;
+                    }
+                    let valid = entry.len() == 64 && entry.chars().all(|c| c.is_ascii_hexdigit());
+                    if !valid {
+                        return Err(ConfigError::InvalidValue(format!(
+                            "RELAY_OPERATOR_PUBKEYS entry is not a valid 64-char hex pubkey: {entry:?}"
+                        )));
+                    }
+                    if !pubkeys.contains(&entry) {
+                        pubkeys.push(entry);
+                    }
+                }
+                pubkeys
+            }
+            Err(_) => Vec::new(),
+        };
+        if !relay_operator_pubkeys.is_empty() && relay_operator_api_origin.is_none() {
+            return Err(ConfigError::InvalidValue(
+                "RELAY_OPERATOR_API_ORIGIN is required when RELAY_OPERATOR_PUBKEYS is configured"
+                    .to_string(),
+            ));
+        }
 
         let auth = buzz_auth::AuthConfig::default();
 
@@ -322,6 +505,20 @@ impl Config {
                 .unwrap_or(100 * 1024 * 1024),
             public_base_url: std::env::var("BUZZ_MEDIA_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:3000/media".to_string()),
+            // Per-upload-event records (`_uploads/` moderation side channel).
+            // Off by default; coherence between the three knobs is enforced in
+            // MediaConfig::validate at startup.
+            upload_records_enabled: std::env::var("BUZZ_MEDIA_UPLOAD_RECORDS")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
+            upload_ip_header: std::env::var("BUZZ_MEDIA_UPLOAD_IP_HEADER")
+                .ok()
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty()),
+            upload_port_header: std::env::var("BUZZ_MEDIA_UPLOAD_PORT_HEADER")
+                .ok()
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty()),
         };
         let media_max_concurrent_uploads: usize =
             std::env::var("BUZZ_MEDIA_MAX_CONCURRENT_UPLOADS")
@@ -341,6 +538,15 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .filter(|&v| v > 0)
             .unwrap_or(30);
+
+        let require_media_get_auth = std::env::var("BUZZ_REQUIRE_MEDIA_GET_AUTH")
+            .map(|v| {
+                v == "true"
+                    || v == "1"
+                    || v.eq_ignore_ascii_case("yes")
+                    || v.eq_ignore_ascii_case("on")
+            })
+            .unwrap_or(false);
 
         let ephemeral_ttl_override = std::env::var("BUZZ_EPHEMERAL_TTL_OVERRIDE")
             .ok()
@@ -380,12 +586,44 @@ impl Config {
                 let secret: [u8; 32] = rand::random();
                 hex::encode(secret)
             });
+        let push_executor_key_id =
+            std::env::var("BUZZ_PUSH_EXECUTOR_KEY_ID").unwrap_or_else(|_| "relay-v1".to_string());
+        if push_executor_key_id.is_empty() || push_executor_key_id.len() > 64 {
+            return Err(ConfigError::InvalidValue(
+                "BUZZ_PUSH_EXECUTOR_KEY_ID must contain 1..=64 bytes".to_string(),
+            ));
+        }
+        let push_gateway_delivery_url = match std::env::var("BUZZ_PUSH_GATEWAY_DELIVERY_URL") {
+            Ok(raw) if raw.trim().is_empty() => None,
+            Ok(raw) => Some(parse_push_gateway_delivery_url(&raw)?),
+            Err(_) => Some(parse_push_gateway_delivery_url(
+                DEFAULT_PUSH_GATEWAY_DELIVERY_URL,
+            )?),
+        };
+        let push_gateway_timeout_millis = match std::env::var("BUZZ_PUSH_GATEWAY_TIMEOUT_MS") {
+            Ok(raw) => raw
+                .parse::<u64>()
+                .ok()
+                .filter(|millis| (100..=10_000).contains(millis))
+                .ok_or_else(|| {
+                    ConfigError::InvalidValue(
+                        "BUZZ_PUSH_GATEWAY_TIMEOUT_MS must be an integer in 100..=10000"
+                            .to_string(),
+                    )
+                })?,
+            Err(_) => 2_000,
+        };
+        let push_gateway_timeout = Duration::from_millis(push_gateway_timeout_millis);
+
         // Web UI static file serving
         let web_dir = std::env::var("BUZZ_WEB_DIR")
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .map(std::path::PathBuf::from);
+        let serve_git_web_gui = std::env::var("BUZZ_SERVE_GIT_WEB_GUI")
+            .map(|value| value == "true" || value == "1")
+            .unwrap_or(false);
 
         if let Some(ref dir) = web_dir {
             if !dir.join("index.html").is_file() {
@@ -412,6 +650,7 @@ impl Config {
             database_url,
             redis_url,
             relay_url,
+            pairing_relay_url,
             max_connections,
             max_concurrent_handlers,
             send_buffer_size,
@@ -427,12 +666,17 @@ impl Config {
             pubkey_allowlist_enabled,
             require_relay_membership,
             huddle_audio_available,
+            mesh,
+            mesh_demo_echo,
             relay_owner_pubkey,
+            relay_operator_api_origin,
+            relay_operator_pubkeys,
             allow_nip_oa_auth,
             media,
             media_max_concurrent_uploads,
             media_max_concurrent_uploads_per_pubkey,
             media_uploads_per_minute,
+            require_media_get_auth,
             ephemeral_ttl_override,
             git_repo_path,
             git_max_pack_bytes,
@@ -440,7 +684,11 @@ impl Config {
             git_max_repos_per_pubkey,
             git_max_concurrent_ops,
             git_hook_hmac_secret,
+            push_executor_key_id,
+            push_gateway_delivery_url,
+            push_gateway_timeout,
             web_dir,
+            serve_git_web_gui,
         })
     }
 }
@@ -478,13 +726,159 @@ mod tests {
             "relay_owner_pubkey should default to None"
         );
         assert!(
+            config.relay_operator_pubkeys.is_empty(),
+            "relay_operator_pubkeys should default empty (provisioning disabled)"
+        );
+        assert!(
             !config.allow_nip_oa_auth,
             "allow_nip_oa_auth should default to false"
+        );
+        assert!(
+            !config.serve_git_web_gui,
+            "serve_git_web_gui should default to false"
+        );
+        assert!(
+            !config.require_media_get_auth,
+            "require_media_get_auth should default to false for staged client rollout"
         );
         assert!(
             config.huddle_audio_available,
             "huddle_audio_available should default to true so single-pod (N=1) keeps today's huddle behavior"
         );
+    }
+
+    #[test]
+    fn relay_operator_pubkeys_parse_dedupe_and_normalize() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        std::env::set_var(
+            "RELAY_OPERATOR_PUBKEYS",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA,bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        std::env::set_var(
+            "RELAY_OPERATOR_API_ORIGIN",
+            "http://buzz.mesh.bb-production.com",
+        );
+        let config = Config::from_env().expect("config");
+        std::env::remove_var("RELAY_OPERATOR_PUBKEYS");
+        std::env::remove_var("RELAY_OPERATOR_API_ORIGIN");
+
+        assert_eq!(
+            config.relay_operator_pubkeys,
+            vec![
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn relay_operator_pubkeys_invalid_entry_is_error() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("RELAY_OPERATOR_PUBKEYS", "not-a-pubkey");
+        let result = Config::from_env();
+        std::env::remove_var("RELAY_OPERATOR_PUBKEYS");
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidValue(ref msg)) if msg.contains("RELAY_OPERATOR_PUBKEYS")
+        ));
+    }
+
+    #[test]
+    fn relay_operator_pubkeys_require_api_origin() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        std::env::set_var(
+            "RELAY_OPERATOR_PUBKEYS",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        std::env::remove_var("RELAY_OPERATOR_API_ORIGIN");
+        let result = Config::from_env();
+        std::env::remove_var("RELAY_OPERATOR_PUBKEYS");
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidValue(ref msg)) if msg.contains("RELAY_OPERATOR_API_ORIGIN is required")
+        ));
+    }
+
+    #[test]
+    fn relay_operator_api_origin_rejects_paths() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("RELAY_OPERATOR_API_ORIGIN", "https://buzz.example/operator");
+        let result = Config::from_env();
+        std::env::remove_var("RELAY_OPERATOR_API_ORIGIN");
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidValue(ref msg)) if msg.contains("must be an http(s) origin")
+        ));
+    }
+
+    #[test]
+    fn push_gateway_defaults_to_buzz_and_can_be_disabled() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous = std::env::var_os("BUZZ_PUSH_GATEWAY_DELIVERY_URL");
+        std::env::remove_var("BUZZ_PUSH_GATEWAY_DELIVERY_URL");
+        let config = Config::from_env().expect("default config");
+        assert_eq!(
+            config
+                .push_gateway_delivery_url
+                .as_ref()
+                .map(url::Url::as_str),
+            Some(DEFAULT_PUSH_GATEWAY_DELIVERY_URL)
+        );
+
+        std::env::set_var("BUZZ_PUSH_GATEWAY_DELIVERY_URL", "");
+        let config = Config::from_env().expect("disabled push config");
+        assert!(config.push_gateway_delivery_url.is_none());
+
+        if let Some(value) = previous {
+            std::env::set_var("BUZZ_PUSH_GATEWAY_DELIVERY_URL", value);
+        } else {
+            std::env::remove_var("BUZZ_PUSH_GATEWAY_DELIVERY_URL");
+        }
+    }
+
+    #[test]
+    fn push_gateway_url_is_exact_and_fail_closed() {
+        assert!(parse_push_gateway_delivery_url("https://push.example/v1/deliveries/apns").is_ok());
+        for invalid in [
+            "http://push.example/v1/deliveries/apns",
+            "https://push.example/v1/deliveries/apns/",
+            "https://push.example/v1/deliveries/apns?token=x",
+            "https://user@push.example/v1/deliveries/apns",
+        ] {
+            assert!(
+                parse_push_gateway_delivery_url(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_push_gateway_timeout_is_not_silently_defaulted() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("BUZZ_PUSH_GATEWAY_TIMEOUT_MS", "99");
+        let result = Config::from_env();
+        std::env::remove_var("BUZZ_PUSH_GATEWAY_TIMEOUT_MS");
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidValue(ref message))
+                if message.contains("BUZZ_PUSH_GATEWAY_TIMEOUT_MS")
+        ));
+    }
+
+    #[test]
+    fn invalid_push_executor_key_id_is_rejected() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("BUZZ_PUSH_EXECUTOR_KEY_ID", "");
+        let result = Config::from_env();
+        std::env::remove_var("BUZZ_PUSH_EXECUTOR_KEY_ID");
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidValue(ref message))
+                if message.contains("BUZZ_PUSH_EXECUTOR_KEY_ID")
+        ));
     }
 
     #[test]
@@ -504,6 +898,25 @@ mod tests {
         assert!(matches!(
             parse_bind_addr("not-an-addr"),
             Err(ConfigError::InvalidBindAddr(_))
+        ));
+    }
+
+    #[test]
+    fn pairing_relay_url_accepts_websocket_urls_and_rejects_http() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("BUZZ_PAIRING_RELAY_URL", "wss://pairing.buzz.xyz");
+        let config = Config::from_env().expect("config");
+        assert_eq!(
+            config.pairing_relay_url.as_deref(),
+            Some("wss://pairing.buzz.xyz")
+        );
+
+        std::env::set_var("BUZZ_PAIRING_RELAY_URL", "https://pairing.buzz.xyz");
+        let result = Config::from_env();
+        std::env::remove_var("BUZZ_PAIRING_RELAY_URL");
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidValue(ref msg)) if msg.contains("BUZZ_PAIRING_RELAY_URL")
         ));
     }
 

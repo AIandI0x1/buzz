@@ -12,6 +12,7 @@ use axum::{
     Router,
 };
 use serde_json::json;
+use tower::ServiceExt;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::ServeDir;
@@ -60,8 +61,41 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/events", post(api::bridge::submit_event))
         .route("/query", post(api::bridge::query_events))
         .route("/count", post(api::bridge::count_events))
+        .route(
+            "/operator/communities",
+            get(api::operator::list_owned_communities).post(api::operator::provision_community),
+        )
+        .route(
+            "/operator/communities/archive",
+            post(api::operator::archive_community),
+        )
+        .route(
+            "/operator/communities/unarchive",
+            post(api::operator::unarchive_community),
+        )
+        .route(
+            "/operator/communities/availability",
+            get(api::operator::community_availability),
+        )
+        .route(
+            "/operator/communities/transfer",
+            post(api::operator::transfer_community),
+        )
+        // Relay invites: mint (owner/admin) + claim (membership-gate exempt)
+        .route("/api/invites", post(api::invites::mint_invite))
+        .route("/api/invites/claim", post(api::invites::claim_invite))
+        // Moderation queue reads (NIP-98 auth + mod-authz gate, L6)
+        .route("/moderation/reports", get(api::bridge::moderation_reports))
+        .route("/moderation/audit", get(api::bridge::moderation_audit))
+        .route(
+            "/moderation/restricted",
+            get(api::bridge::moderation_restricted),
+        )
         // Webhook trigger (secret-authenticated, no NIP-98)
         .route("/hooks/{id}", post(api::bridge::workflow_webhook))
+        // Mesh demo echo probe — testbed-only; 404 unless BUZZ_MESH=on and
+        // BUZZ_MESH_DEMO_ECHO=on (see api::mesh_demo).
+        .route("/_mesh/demo/echo", post(api::mesh_demo::demo_echo))
         // Huddle audio WebSocket route
         .route(
             "/huddle/{channel_id}/audio",
@@ -78,40 +112,31 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(git_router)
         .merge(git_policy_router);
 
-    // When BUZZ_WEB_DIR is set, serve the SPA as a fallback for unmatched routes.
+    // When BUZZ_WEB_DIR is set, serve either the full SPA or its invite-only
+    // surface. Invite-only mode deliberately exposes only /invite/{code} and
+    // hashed build assets; root and repository browser routes remain absent.
     if let Some(ref web_dir) = state.config.web_dir {
         let index_path = web_dir.join("index.html");
-        let spa_fallback = ServeDir::new(web_dir).not_found_service(tower::service_fn(
-            move |req: axum::extract::Request| {
-                let index = index_path.clone();
-                async move {
-                    let path = req.uri().path();
-                    // Reserved API prefixes must 404 normally, not serve index.html.
-                    let reserved = path.starts_with("/api/")
-                        || path.starts_with("/media/")
-                        || path.starts_with("/git/")
-                        || path.starts_with("/internal/")
-                        || path.starts_with("/.well-known/")
-                        || path.starts_with("/huddle/")
-                        || path == "/health"
-                        || path == "/_liveness"
-                        || path == "/_readiness"
-                        || path == "/_status"
-                        || path == "/info";
-                    // Files with extensions (e.g. /assets/missing.js) should 404.
-                    let has_ext = path.rsplit('/').next().is_some_and(|seg| seg.contains('.'));
-                    if reserved || has_ext {
-                        Ok(StatusCode::NOT_FOUND.into_response())
-                    } else {
-                        // SPA client-side route → serve index.html
-                        match tokio::fs::read(&index).await {
-                            Ok(body) => Ok(axum::response::Html(body).into_response()),
-                            Err(_) => Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response()),
-                        }
-                    }
+        let static_files = ServeDir::new(web_dir);
+        let serve_git_web_gui = state.config.serve_git_web_gui;
+        let spa_fallback = tower::service_fn(move |req: axum::extract::Request| {
+            let index = index_path.clone();
+            let static_files = static_files.clone();
+            async move {
+                let path = req.uri().path();
+                if path.starts_with("/assets/") {
+                    return static_files
+                        .oneshot(req)
+                        .await
+                        .map(IntoResponse::into_response);
                 }
-            },
-        ));
+
+                if should_serve_spa(path, serve_git_web_gui) {
+                    return Ok(read_spa_index(&index).await);
+                }
+                Ok(StatusCode::NOT_FOUND.into_response())
+            }
+        });
         merged = merged.fallback_service(spa_fallback);
     }
 
@@ -119,6 +144,26 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .layer(middleware::from_fn(track_metrics))
         .layer(TraceLayer::new_for_http())
         .layer(build_cors_layer(&state.config.cors_origins))
+}
+
+fn is_invite_landing_path(path: &str) -> bool {
+    path.strip_prefix("/invite/")
+        .is_some_and(|code| !code.is_empty() && !code.contains('/'))
+}
+
+fn should_serve_spa(path: &str, serve_git_web_gui: bool) -> bool {
+    is_invite_landing_path(path) || (serve_git_web_gui && is_git_web_gui_path(path))
+}
+
+fn is_git_web_gui_path(path: &str) -> bool {
+    path == "/" || path == "/repos" || path.starts_with("/repos/")
+}
+
+async fn read_spa_index(index: &std::path::Path) -> axum::response::Response {
+    match tokio::fs::read(index).await {
+        Ok(body) => axum::response::Html(body).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 /// Build the health-only router for K8s probes (port 8080 in CAKE).
@@ -129,6 +174,7 @@ pub fn build_health_router(state: Arc<AppState>) -> Router {
         .route("/_liveness", get(liveness_handler))
         .route("/_readiness", get(readiness_handler))
         .route("/_status", get(status_handler))
+        .route("/_mesh", get(mesh_status_handler))
         .with_state(state)
 }
 
@@ -184,12 +230,14 @@ async fn nip11_or_ws_handler(
             .on_upgrade(move |socket| handle_connection(socket, state, addr, tenant))
             .into_response(),
         Err(_) => {
-            // Browser requesting HTML and web UI is configured → serve SPA.
-            if let Some(ref dir) = state.config.web_dir {
-                if accept.contains("text/html") {
-                    let index = dir.join("index.html");
-                    if let Ok(body) = tokio::fs::read(&index).await {
-                        return axum::response::Html(body).into_response();
+            // Browser requesting HTML and Git web GUI is enabled → serve SPA.
+            if state.config.serve_git_web_gui {
+                if let Some(ref dir) = state.config.web_dir {
+                    if accept.contains("text/html") {
+                        let index = dir.join("index.html");
+                        if let Ok(body) = tokio::fs::read(&index).await {
+                            return axum::response::Html(body).into_response();
+                        }
                     }
                 }
             }
@@ -251,6 +299,18 @@ async fn status_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
     }))
 }
 
+/// `/_mesh` — live mesh status: peer table, connection/phi state, per-peer
+/// counters, fence-rejection totals. Mesh-off reports `{"enabled": false}` so
+/// operators can distinguish "off" from "on with zero peers".
+async fn mesh_status_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match state.mesh() {
+        Some(handle) => Json(serde_json::to_value(handle.status()).unwrap_or_else(
+            |e| json!({"enabled": true, "error": format!("status serialize: {e}")}),
+        )),
+        None => Json(json!({"enabled": false})),
+    }
+}
+
 /// Build a CORS layer from the configured origins list.
 fn build_cors_layer(cors_origins: &[String]) -> CorsLayer {
     if cors_origins.is_empty() {
@@ -275,4 +335,39 @@ fn build_cors_layer(cors_origins: &[String]) -> CorsLayer {
         .allow_origin(AllowOrigin::list(origins))
         .allow_methods(tower_http::cors::Any)
         .allow_headers(tower_http::cors::Any)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_git_web_gui_path, is_invite_landing_path, should_serve_spa};
+
+    #[test]
+    fn invite_landing_path_requires_exactly_one_nonempty_code_segment() {
+        assert!(is_invite_landing_path("/invite/payload.mac"));
+        assert!(!is_invite_landing_path("/invite/"));
+        assert!(!is_invite_landing_path("/invite/code/extra"));
+        assert!(!is_invite_landing_path("/repos"));
+        assert!(!is_invite_landing_path("/"));
+    }
+
+    #[test]
+    fn git_web_gui_paths_are_explicit() {
+        assert!(is_git_web_gui_path("/"));
+        assert!(is_git_web_gui_path("/repos"));
+        assert!(is_git_web_gui_path("/repos/example"));
+        assert!(!is_git_web_gui_path("/repository"));
+        assert!(!is_git_web_gui_path("/arbitrary"));
+        assert!(!is_git_web_gui_path("/api/invites"));
+    }
+
+    #[test]
+    fn invite_is_always_served_but_git_gui_requires_opt_in() {
+        assert!(should_serve_spa("/invite/payload.mac", false));
+        assert!(should_serve_spa("/invite/payload.mac", true));
+        assert!(!should_serve_spa("/", false));
+        assert!(!should_serve_spa("/repos/example", false));
+        assert!(should_serve_spa("/", true));
+        assert!(should_serve_spa("/repos/example", true));
+        assert!(!should_serve_spa("/arbitrary", true));
+    }
 }

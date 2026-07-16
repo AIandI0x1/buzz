@@ -4,7 +4,7 @@
  * Delegates all reconnect logic to the module-level `relayReconnectController`
  * singleton so that all mounted hook instances (banner + sidebar card) share
  * a single in-flight state. Deliberately uses `preconnect()` rather than the
- * full `reconnectWorkspace()` path to avoid unmounting the React tree and
+ * full `reconnectCommunity()` path to avoid unmounting the React tree and
  * clearing draft state.
  *
  * See `relayReconnectController.ts` for the three-phase strategy details.
@@ -16,6 +16,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 
 import { relayClient } from "@/shared/api/relayClient";
+import { isRelayDependentQuery } from "@/shared/api/relayQueryInvalidation";
 import { relayReconnectController } from "@/shared/api/relayReconnectController";
 
 function buildDeps(onSuccess: () => void, onBackstop: () => void) {
@@ -59,12 +60,14 @@ export function useReconnectRelay(): {
   onSuccessRef.current = React.useCallback(() => {
     // Defer query invalidation so callers render the recovered state first.
     window.setTimeout(() => {
-      void queryClient.invalidateQueries().catch((err) => {
-        console.error(
-          "[useReconnectRelay] failed to refresh queries after reconnect:",
-          err,
-        );
-      });
+      void queryClient
+        .invalidateQueries({ predicate: isRelayDependentQuery })
+        .catch((err) => {
+          console.error(
+            "[useReconnectRelay] failed to refresh queries after reconnect:",
+            err,
+          );
+        });
     }, 0);
   }, [queryClient]);
 

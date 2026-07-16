@@ -167,6 +167,8 @@ pub(crate) fn read_config_surface(
     let config_file_path = runtime_meta
         .and_then(|m| m.config_file_path)
         .map(resolve_tilde);
+    let mcp_config_file_path = runtime_meta.and_then(mcp_config_file_path_for_runtime);
+    let extensions = file_config.extensions.clone();
 
     let sources = ConfigSourceReport {
         acp_native: if supports_acp_native {
@@ -197,6 +199,7 @@ pub(crate) fn read_config_surface(
             ConfigTierStatus::NotApplicable
         },
         config_file_path,
+        mcp_config_file_path,
     };
 
     RuntimeConfigSurface {
@@ -205,10 +208,25 @@ pub(crate) fn read_config_surface(
         is_pre_spawn,
         normalized,
         advanced,
+        extensions,
         sources,
     }
 }
 
+fn mcp_config_file_path_for_runtime(runtime: &KnownAcpRuntime) -> Option<String> {
+    match runtime.id {
+        "goose" => {
+            super::goose::goose_config_path().map(|path| path.to_string_lossy().into_owned())
+        }
+        "claude" => Some(resolve_tilde("~/.claude.json")),
+        "codex" => {
+            super::codex::codex_config_path().map(|path| path.to_string_lossy().into_owned())
+        }
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_model_field(
     record_model: &Option<String>,
     file_model: &Option<String>,
@@ -360,7 +378,11 @@ fn build_provider_field(
         (record_provider.as_deref(), ConfigOrigin::BuzzExplicit),
         (file_provider.as_deref(), ConfigOrigin::ConfigFile),
     ];
-    let (value, origin, overridden_value, overridden_origin) = resolve_with_override(tiers)?;
+    let (value, origin, overridden_value, overridden_origin) = match resolve_with_override(tiers) {
+        Some(resolved) => resolved,
+        None if is_required => (None, ConfigOrigin::EnvVar, None, None),
+        None => return None,
+    };
 
     let write_via = if let Some(env_key) = provider_env_var {
         ConfigWriteMechanism::RespawnWithEnvVar {
@@ -512,18 +534,19 @@ fn build_system_prompt_field(
     })
 }
 
-/// Picks the first `Some` value from `tiers` (highest-precedence first) and
-/// returns `(value, origin, overridden_value, overridden_origin)` where the
-/// overridden pair is the next `Some` tier after the winner. Returns `None`
-/// when no tier has a value.
-fn resolve_with_override(
-    tiers: &[(Option<&str>, ConfigOrigin)],
-) -> Option<(
+/// `(value, origin, overridden_value, overridden_origin)` — the resolved
+/// winner plus the next `Some` tier it shadows, if any.
+type ResolvedOverride = (
     Option<String>,
     ConfigOrigin,
     Option<String>,
     Option<ConfigOrigin>,
-)> {
+);
+
+/// Picks the first `Some` value from `tiers` (highest-precedence first);
+/// the overridden pair is the next `Some` tier after the winner. Returns
+/// `None` when no tier has a value.
+fn resolve_with_override(tiers: &[(Option<&str>, ConfigOrigin)]) -> Option<ResolvedOverride> {
     let winner_idx = tiers.iter().position(|(v, _)| v.is_some())?;
     let (value, origin) = &tiers[winner_idx];
     let value = value.map(str::to_string);

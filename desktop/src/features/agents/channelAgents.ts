@@ -6,15 +6,15 @@ import {
 } from "@/features/agents/agentReuse";
 export { findReusableAgent } from "@/features/agents/agentReuse";
 import { normalizePubkey } from "@/shared/lib/pubkey";
+import { resolveManagedAgentAvatarUrl } from "@/features/agents/ui/managedAgentAvatar";
 import {
   addChannelMembers,
   createManagedAgent,
   getChannelMembers,
   listManagedAgents,
-  startManagedAgent,
   updateManagedAgent,
-  uploadMediaBytes,
 } from "@/shared/api/tauri";
+import { startManagedAgent } from "@/shared/api/tauriManagedAgents";
 import type {
   AcpRuntime,
   ChannelRole,
@@ -58,6 +58,8 @@ export type CreateChannelManagedAgentInput = {
   systemPrompt?: string;
   avatarUrl?: string;
   personaId?: string | null;
+  /** Team this instance is deployed from; prevents cross-team reuse. */
+  teamId?: string | null;
   /**
    * True when `runtime` is a runtime the user deliberately picked to override
    * the persona (a deploy-dialog runtime selector), as opposed to a
@@ -83,6 +85,12 @@ export type CreateChannelManagedAgentResult =
     created: boolean;
     runtimeId: string;
   };
+
+export type ProvisionChannelManagedAgentResult = {
+  agent: ManagedAgent;
+  created: boolean;
+  runtimeId: string;
+};
 
 export type CreateChannelManagedAgentBatchFailure = {
   kind: "generic" | "persona";
@@ -238,16 +246,13 @@ export async function ensureChannelAgentPresetInChannel(
   };
 }
 
-export async function createChannelManagedAgent(
-  channelId: string,
+export async function provisionChannelManagedAgent(
   input: CreateChannelManagedAgentInput,
   context?: {
     managedAgents?: ManagedAgent[];
     channelMemberPubkeys?: ReadonlySet<string>;
   },
-): Promise<CreateChannelManagedAgentResult> {
-  const role = input.role ?? "bot";
-  const ensureRunning = input.ensureRunning ?? true;
+): Promise<ProvisionChannelManagedAgentResult> {
   const trimmedName = input.name.trim();
 
   if (trimmedName.length === 0) {
@@ -285,13 +290,8 @@ export async function createChannelManagedAgent(
           ).agent
         : reusable;
 
-      const attached = await attachManagedAgentToChannel(channelId, {
-        agent: updatedAgent,
-        role,
-        ensureRunning,
-      });
       return {
-        ...attached,
+        agent: updatedAgent,
         created: false,
         runtimeId: input.runtime.id,
       };
@@ -328,34 +328,20 @@ export async function createChannelManagedAgent(
           ).agent
         : reusable;
 
-      const attached = await attachManagedAgentToChannel(channelId, {
-        agent: updatedAgent,
-        role,
-        ensureRunning,
-      });
       return {
-        ...attached,
+        agent: updatedAgent,
         created: false,
         runtimeId: input.runtime.id,
       };
     }
   }
 
-  // If the avatar is a data URI (e.g. from a persona PNG card import),
-  // upload it to get a hosted URL the relay can serve.
-  let resolvedAvatarUrl = input.avatarUrl?.trim() || undefined;
-  if (resolvedAvatarUrl?.startsWith("data:image/")) {
-    try {
-      const [, b64] = resolvedAvatarUrl.split(",", 2);
-      if (!b64) throw new Error("empty data URI payload");
-      const bytes = Array.from(atob(b64), (c) => c.charCodeAt(0));
-      const blob = await uploadMediaBytes(bytes);
-      resolvedAvatarUrl = blob.url;
-    } catch (err) {
-      console.warn("Avatar upload failed, proceeding without avatar:", err);
-      resolvedAvatarUrl = undefined;
-    }
-  }
+  // Resolve the avatar for the channel-managed agent. Base64 data URIs (e.g.
+  // from a persona PNG card import) are uploaded to a hosted URL the relay can
+  // serve; percent-encoded emoji SVG data URLs pass through unchanged so the
+  // selected emoji survives deployment. Shared with agent creation so both
+  // paths handle emoji avatars identically.
+  const resolvedAvatarUrl = await resolveManagedAgentAvatarUrl(input.avatarUrl);
 
   const isProviderMode = input.backend?.type === "provider";
 
@@ -367,6 +353,7 @@ export async function createChannelManagedAgent(
     agentArgs: input.runtime.defaultArgs,
     mcpCommand: input.runtime.mcpCommand ?? "",
     personaId: input.personaId ?? undefined,
+    teamId: input.teamId ?? undefined,
     systemPrompt: input.systemPrompt?.trim() || undefined,
     avatarUrl: resolvedAvatarUrl,
     model: input.model?.trim() || undefined,
@@ -382,16 +369,32 @@ export async function createChannelManagedAgent(
     throw new Error(created.spawnError);
   }
 
-  const attached = await attachManagedAgentToChannel(channelId, {
+  return {
     agent: created.agent,
-    role,
-    ensureRunning,
+    created: true,
+    runtimeId: input.runtime.id,
+  };
+}
+
+export async function createChannelManagedAgent(
+  channelId: string,
+  input: CreateChannelManagedAgentInput,
+  context?: {
+    managedAgents?: ManagedAgent[];
+    channelMemberPubkeys?: ReadonlySet<string>;
+  },
+): Promise<CreateChannelManagedAgentResult> {
+  const provisioned = await provisionChannelManagedAgent(input, context);
+  const attached = await attachManagedAgentToChannel(channelId, {
+    agent: provisioned.agent,
+    role: input.role ?? "bot",
+    ensureRunning: input.ensureRunning ?? true,
   });
 
   return {
     ...attached,
-    created: true,
-    runtimeId: input.runtime.id,
+    created: provisioned.created,
+    runtimeId: provisioned.runtimeId,
   };
 }
 

@@ -8,6 +8,7 @@ mod observer;
 mod pool;
 mod queue;
 mod relay;
+mod setup_mode;
 mod usage;
 
 pub use usage::TurnUsage;
@@ -33,9 +34,9 @@ use futures_util::FutureExt;
 use nostr::{PublicKey, ToBech32};
 use pool::{
     AgentPool, ControlSignal, IdleSwitchResult, OwnedAgent, PromptContext, PromptOutcome,
-    PromptResult, PromptSource, SessionState,
+    PromptResult, PromptSource, SessionState, TimeoutKind,
 };
-use queue::{CancelReason, EventQueue, QueuedEvent, ThreadTags};
+use queue::{CancelReason, EventQueue, FlushBatch, QueuedEvent, ThreadTags};
 use relay::{HarnessRelay, RelayEventPublisher};
 use tokio::sync::{mpsc, watch};
 use tracing_subscriber::EnvFilter;
@@ -1094,6 +1095,19 @@ async fn tokio_main() -> Result<()> {
         .init();
 
     let mut config = Config::from_cli().map_err(|e| anyhow::anyhow!("configuration error: {e}"))?;
+
+    // ── Setup-mode early branch ───────────────────────────────────────────────
+    //
+    // When the desktop determines an agent is not ready (missing credentials,
+    // model, or provider), it spawns buzz-acp with BUZZ_ACP_SETUP_PAYLOAD set.
+    // We enter the minimal setup-listener path and never start the agent pool.
+    if let Some(payload) = setup_mode::SetupPayload::from_env()
+        .map_err(|e| anyhow::anyhow!("setup payload error: {e}"))?
+    {
+        tracing::info!("buzz-acp: setup payload present, entering setup-listener mode");
+        return setup_mode::run_setup_listener(config, payload).await;
+    }
+
     tracing::info!("buzz-acp starting: {}", config.summary());
 
     let observer = config
@@ -1129,6 +1143,7 @@ async fn tokio_main() -> Result<()> {
             &config.agent_command,
             &config.agent_args,
             &config.persona_env_vars,
+            config.has_generated_codex_config,
         )
         .await;
         match spawn_result {
@@ -1372,7 +1387,8 @@ async fn tokio_main() -> Result<()> {
     }
 
     let dedup_mode = config.dedup_mode;
-    let mut queue = EventQueue::new(dedup_mode);
+    let mut queue =
+        EventQueue::new(dedup_mode).with_in_flight_deadline(config.max_turn_duration_secs);
 
     let base_prompt_content = config.base_prompt_content.take();
     let ctx = Arc::new(PromptContext {
@@ -1383,6 +1399,7 @@ async fn tokio_main() -> Result<()> {
         turn_liveness_interval: Duration::from_secs(config.turn_liveness_secs),
         dedup_mode: config.dedup_mode,
         system_prompt: config.system_prompt.clone(),
+        team_instructions: config.team_instructions.clone(),
         base_prompt: if config.no_base_prompt {
             None
         } else if let Some(content) = base_prompt_content {
@@ -1567,10 +1584,11 @@ async fn tokio_main() -> Result<()> {
                 let cmd = config.agent_command.clone();
                 let args = config.agent_args.clone();
                 let env = config.persona_env_vars.clone();
+                let has_codex = config.has_generated_codex_config;
                 let observer = observer.clone();
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
                 respawn_tasks.spawn(async move {
-                    let result = spawn_and_init(&cmd, &args, &env, idx, observer).await;
+                    let result = spawn_and_init(&cmd, &args, &env, has_codex, idx, observer).await;
                     guard.send(result);
                 });
             }
@@ -2655,6 +2673,29 @@ fn dispatch_pending(
     dispatched_channels
 }
 
+/// Spawn a task that posts a user-visible failure notice to the relay.
+///
+/// Shared by the hard-cap immediate dead-letter path and the retries-exhausted
+/// dead-letter path so neither duplicates the tokio::spawn block.
+fn spawn_failure_notice(
+    rest_client: Option<&relay::RestClient>,
+    batch: &FlushBatch,
+    content: String,
+) {
+    if let Some(rest) = rest_client {
+        let thread_tags = batch
+            .events
+            .last()
+            .map(|be| queue::parse_thread_tags(&be.event))
+            .unwrap_or_default();
+        let rest = rest.clone();
+        let channel_id = batch.channel_id;
+        tokio::spawn(async move {
+            pool::post_failure_notice(&rest, channel_id, &thread_tags, &content).await;
+        });
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_prompt_result(
     pool: &mut AgentPool,
@@ -2684,7 +2725,10 @@ fn handle_prompt_result(
         // Don't requeue batches for channels the agent was removed from —
         // those events are stale and should be silently dropped.
         if !removed_channels.contains(&batch.channel_id) {
-            if matches!(result.outcome, PromptOutcome::Cancelled) {
+            if matches!(
+                result.outcome,
+                PromptOutcome::Cancelled | PromptOutcome::CancelDrainTimeout(_)
+            ) {
                 // Cancel re-prompt: store as cancelled events so flush_next()
                 // merges them into the next FlushBatch.cancelled_events,
                 // enabling the annotated merged-prompt format. The batch's
@@ -2693,33 +2737,50 @@ fn handle_prompt_result(
                 // path; if somehow unset, fall back to the gentler Steer framing
                 // — consistent with MergeFraming::for_reason(None) and the
                 // system default — rather than telling the agent to supersede.
+                //
+                // CancelDrainTimeout shares this path with Cancelled: a failed
+                // 5s drain after a control-signal cancel is a cleanup-deadline
+                // problem, not the deterministic hard-cap death below — the
+                // original batch must survive with no retry/dead-letter
+                // accounting, same as a clean cancel.
                 let reason = batch.cancel_reason.unwrap_or(CancelReason::Steer);
                 queue.requeue_as_cancelled(batch, reason);
+            } else if matches!(result.outcome, PromptOutcome::Timeout(TimeoutKind::Hard)) {
+                // Hard-cap timeout is deterministic: re-running the same task
+                // from a fresh session will reproduce the same death. Dead-letter
+                // immediately without requeueing so the channel isn't subjected to
+                // up to 10 × 1-hour retry cycles.
+                tracing::error!(
+                    channel_id = %batch.channel_id,
+                    events = batch.events.len(),
+                    "dead-lettering batch after hard-cap timeout — discarding {} events",
+                    batch.events.len(),
+                );
+                let content = format!(
+                    "⚠️ I couldn't process the last request (the turn exceeded the maximum duration ({}s)). Please re-send if it's still needed.",
+                    config.max_turn_duration_secs
+                );
+                spawn_failure_notice(rest_client, &batch, content);
             } else if let Some(dead) = queue.requeue(batch) {
                 // Dead-lettered: retries exhausted and the events are gone.
                 // Post a visible notice so the channel isn't left waiting on
                 // a turn that will never happen.
-                if let Some(rest) = rest_client {
-                    let thread_tags = dead
-                        .events
-                        .last()
-                        .map(|be| queue::parse_thread_tags(&be.event))
-                        .unwrap_or_default();
-                    let reason = match &result.outcome {
-                        PromptOutcome::Timeout => "the turn timed out".to_string(),
-                        PromptOutcome::AgentExited => "the agent process exited".to_string(),
-                        PromptOutcome::Error(e) => format!("{e}"),
-                        _ => "repeated failures".to_string(),
-                    };
-                    let content = format!(
-                        "⚠️ I couldn't process the last request after multiple retries ({reason}). Please re-send if it's still needed."
-                    );
-                    let rest = rest.clone();
-                    let channel_id = dead.channel_id;
-                    tokio::spawn(async move {
-                        pool::post_failure_notice(&rest, channel_id, &thread_tags, &content).await;
-                    });
-                }
+                let reason = match &result.outcome {
+                    PromptOutcome::Timeout(TimeoutKind::Idle) => "the turn timed out".to_string(),
+                    // Unreachable today: Timeout(Hard) is consumed by the immediate
+                    // dead-letter arm above before requeue() runs. Fail soft rather
+                    // than panicking the main loop if that chain is ever reordered.
+                    PromptOutcome::Timeout(TimeoutKind::Hard) => {
+                        "the turn exceeded the maximum duration".to_string()
+                    }
+                    PromptOutcome::AgentExited => "the agent process exited".to_string(),
+                    PromptOutcome::Error(e) => format!("{e}"),
+                    _ => "repeated failures".to_string(),
+                };
+                let content = format!(
+                    "⚠️ I couldn't process the last request after multiple retries ({reason}). Please re-send if it's still needed."
+                );
+                spawn_failure_notice(rest_client, &dead, content);
             }
         } else {
             tracing::debug!(
@@ -2745,26 +2806,45 @@ fn handle_prompt_result(
     let outcome_label = match &result.outcome {
         PromptOutcome::Ok(_) => "ok",
         PromptOutcome::Error(_) => "error",
-        PromptOutcome::Timeout => "timeout",
+        PromptOutcome::Timeout(TimeoutKind::Idle) => "idle_timeout",
+        PromptOutcome::Timeout(TimeoutKind::Hard) => "hard_timeout",
         PromptOutcome::AgentExited => "exited",
         PromptOutcome::Cancelled => "cancelled",
+        PromptOutcome::CancelDrainTimeout(_) => "cancel_drain_timeout",
     };
     let agent_index = result.agent.index;
+    // Capture the spawn-time configured model and our PID before the agent is
+    // moved into match arms below. `desired_model` reflects the config/persona
+    // model at spawn time — it does NOT reflect `session/set_model` overrides,
+    // which live in buzz-agent's session state and are what `llm: (model) …`
+    // errors carry. The two can legitimately differ; `configured_model=` is
+    // still valuable for identifying a stale orphan running an old model.
+    let harness_configured_model = result
+        .agent
+        .desired_model
+        .as_deref()
+        .unwrap_or("<none>")
+        .to_string();
+    let harness_pid = std::process::id();
 
     let channel_id = match &result.source {
         PromptSource::Channel(ch) => Some(*ch),
         PromptSource::Heartbeat => None,
     };
-    let emit_turn_error = |error_msg: &str| {
+    let emit_turn_error = |error_msg: &str, error_code: Option<i64>| {
         if let Some(ref observer) = observer {
+            let mut payload = serde_json::json!({
+                "outcome": outcome_label,
+                "error": error_msg,
+            });
+            if let Some(code) = error_code {
+                payload["code"] = serde_json::json!(code);
+            }
             observer.emit(
                 "turn_error",
                 Some(agent_index),
                 &observer::context_for(channel_id, None, None),
-                serde_json::json!({
-                    "outcome": outcome_label,
-                    "error": error_msg,
-                }),
+                payload,
             );
         }
     };
@@ -2780,17 +2860,63 @@ fn handle_prompt_result(
             pool.return_agent(result.agent);
         }
         // Fatal outcomes: the agent subprocess is dead or poisoned — respawn it.
-        PromptOutcome::AgentExited | PromptOutcome::Timeout => {
+        PromptOutcome::AgentExited | PromptOutcome::Timeout(_) => {
             tracing::warn!(
                 agent = agent_index,
                 outcome = outcome_label,
+                configured_model = %harness_configured_model,
+                pid = harness_pid,
                 "agent_returned — respawning"
             );
-            let death_message = match outcome_label {
-                "exited" => "Agent process exited unexpectedly",
-                _ => "Agent session timed out due to inactivity",
+            let death_message: String = match outcome_label {
+                "exited" => "Agent process exited unexpectedly".to_string(),
+                "hard_timeout" => format!(
+                    "Agent turn exceeded the maximum duration ({}s)",
+                    config.max_turn_duration_secs
+                ),
+                _ => "Agent session timed out due to inactivity".to_string(),
             };
-            emit_turn_error(death_message);
+            emit_turn_error(&death_message, None);
+
+            let index = result.agent.index;
+            let slot_history = &mut crash_history[index];
+            if !spawn_respawn_task(
+                result.agent,
+                config,
+                slot_history,
+                respawn_tx,
+                respawn_tasks,
+                observer.clone(),
+            ) {
+                // Circuit open — slot stays empty until maintenance refill.
+                if pool.live_count() == 0 && !any_respawn_in_flight(crash_history) {
+                    tracing::error!("all agents dead — exiting");
+                    return LoopAction::Exit;
+                }
+            }
+        }
+        // Cancel-drain expiry: a control-signal cancel (steer fallback,
+        // interrupt, or explicit stop) did not drain within its bounded
+        // grace window. The process is poisoned/uncertain like a hard
+        // timeout — respawn it — but this is NOT the configured max-turn
+        // cap, so the message must name the actual grace, not
+        // `max_turn_duration_secs`. The triggering batch's fate (preserved
+        // for Steer/Interrupt, dropped for explicit Cancel/Rotate or a
+        // removed channel) is decided above — the message stays fate-neutral
+        // since it must be true in every case.
+        PromptOutcome::CancelDrainTimeout(grace) => {
+            tracing::warn!(
+                agent = agent_index,
+                outcome = outcome_label,
+                configured_model = %harness_configured_model,
+                pid = harness_pid,
+                grace = ?grace,
+                "agent_returned — respawning (cancel-drain timeout)"
+            );
+            let death_message = format!(
+                "Agent did not stop within {grace:?} after cancellation; the agent process is being replaced."
+            );
+            emit_turn_error(&death_message, None);
 
             let index = result.agent.index;
             let slot_history = &mut crash_history[index];
@@ -2828,6 +2954,8 @@ fn handle_prompt_result(
             tracing::debug!(
                 agent = agent_index,
                 outcome = outcome_label,
+                configured_model = %harness_configured_model,
+                pid = harness_pid,
                 "agent_returned (cancelled)"
             );
             pool.return_agent(result.agent);
@@ -2840,14 +2968,20 @@ fn handle_prompt_result(
                     | acp::AcpError::Timeout(_)
                     | acp::AcpError::Protocol(_)
             );
+            let error_code = match &e {
+                acp::AcpError::AgentError { code, .. } => Some(*code),
+                _ => None,
+            };
             if is_transport_error {
                 tracing::warn!(
                     agent = agent_index,
                     outcome = outcome_label,
+                    configured_model = %harness_configured_model,
+                    pid = harness_pid,
                     error = %e,
                     "transport/protocol error — respawning agent"
                 );
-                emit_turn_error(&e.to_string());
+                emit_turn_error(&e.to_string(), error_code);
 
                 let index = result.agent.index;
                 let slot_history = &mut crash_history[index];
@@ -2868,10 +3002,12 @@ fn handle_prompt_result(
                 tracing::warn!(
                     agent = agent_index,
                     outcome = outcome_label,
+                    configured_model = %harness_configured_model,
+                    pid = harness_pid,
                     error = %e,
                     "agent_returned (application error — pipe intact)"
                 );
-                emit_turn_error(&e.to_string());
+                emit_turn_error(&e.to_string(), error_code);
                 pool.return_agent(result.agent);
             }
         }
@@ -2967,12 +3103,13 @@ fn recover_panicked_agent(
     let cmd = config.agent_command.clone();
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
+    let has_codex = config.has_generated_codex_config;
     let guard = RespawnGuard::new(i, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let result = spawn_and_init(&cmd, &args, &env, i, observer).await;
+        let result = spawn_and_init(&cmd, &args, &env, has_codex, i, observer).await;
         guard.send(result);
     });
 }
@@ -3057,6 +3194,19 @@ fn dispatch_heartbeat(
     tracing::info!(agent = agent_index, "heartbeat_fired");
 }
 
+#[cfg(test)]
+mod agent_draft_prompt_tests {
+    #[test]
+    fn shared_base_prompt_teaches_portable_agent_drafts() {
+        let prompt = include_str!("base_prompt.md");
+        assert!(prompt.contains("buzz agents draft-create"));
+        assert!(prompt.contains("ask for at most two things"));
+        assert!(prompt.contains("what it should do day-to-day"));
+        assert!(prompt.contains("owner saves it"));
+        assert!(prompt.contains("Do not ask about runtime, provider, model, credentials"));
+    }
+}
+
 fn default_heartbeat_prompt() -> String {
     let now = chrono::Utc::now().to_rfc3339();
     format!(
@@ -3115,6 +3265,7 @@ fn spawn_respawn_task(
     let cmd = config.agent_command.clone();
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
+    let has_codex = config.has_generated_codex_config;
     let guard = RespawnGuard::new(index, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         // Shutdown old agent (reap child, prevent zombie).
@@ -3126,7 +3277,7 @@ fn spawn_respawn_task(
             tokio::time::sleep(delay).await;
         }
 
-        let result = spawn_and_init(&cmd, &args, &env, index, observer).await;
+        let result = spawn_and_init(&cmd, &args, &env, has_codex, index, observer).await;
         guard.send(result);
     });
 
@@ -3142,10 +3293,11 @@ async fn spawn_and_init(
     command: &str,
     args: &[String],
     extra_env: &[(String, String)],
+    has_generated_codex_config: bool,
     agent_index: usize,
     observer: Option<observer::ObserverHandle>,
 ) -> Result<(AcpClient, u32, bool)> {
-    let mut acp = AcpClient::spawn(command, args, extra_env)
+    let mut acp = AcpClient::spawn(command, args, extra_env, has_generated_codex_config)
         .await
         .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
     acp.set_observer(observer, agent_index);
@@ -3187,8 +3339,8 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
         .to_string();
 
     // Spawn outside the timeout so we always own the child for cleanup.
-    // `models` subcommand doesn't use persona packs — no extra env.
-    let mut client = match AcpClient::spawn(&args.agent_command, &agent_args, &[]).await {
+    // `models` subcommand doesn't use persona packs — no extra env, no codex config.
+    let mut client = match AcpClient::spawn(&args.agent_command, &agent_args, &[], false).await {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error: failed to spawn agent: {e}");
@@ -3787,12 +3939,13 @@ mod build_mcp_servers_tests {
             agent_args: vec!["acp".into()],
             mcp_command: "test-mcp-server".into(),
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
-            max_turn_duration_secs: 3600,
+            max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
             heartbeat_interval_secs: 0,
             turn_liveness_secs: 10,
             heartbeat_prompt: None,
             system_prompt: None,
+            team_instructions: None,
             initial_message: None,
             subscribe_mode: config::SubscribeMode::All,
             dedup_mode: config::DedupMode::Queue,
@@ -3813,6 +3966,7 @@ mod build_mcp_servers_tests {
             respond_to_allowlist: std::collections::HashSet::new(),
             allowed_respond_to: vec![],
             persona_env_vars: vec![],
+            has_generated_codex_config: false,
             relay_observer: false,
             agent_owner: None,
             no_base_prompt: false,
@@ -3932,7 +4086,11 @@ mod error_outcome_emission_tests {
     use super::*;
     use crate::acp::{AcpClient, AcpError};
     use crate::observer::ObserverHandle;
-    use crate::pool::{AgentPool, OwnedAgent, PromptOutcome, PromptResult, PromptSource};
+    use crate::pool::{
+        AgentPool, OwnedAgent, PromptOutcome, PromptResult, PromptSource, TimeoutKind,
+    };
+    use crate::queue::{BatchEvent, FlushBatch};
+    use nostr::{EventBuilder, Keys, Kind};
     use std::collections::HashSet;
 
     fn test_config() -> Config {
@@ -3946,12 +4104,13 @@ mod error_outcome_emission_tests {
             agent_args: vec![],
             mcp_command: "test-mcp-server".into(),
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
-            max_turn_duration_secs: 3600,
+            max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
             heartbeat_interval_secs: 0,
             turn_liveness_secs: 10,
             heartbeat_prompt: None,
             system_prompt: None,
+            team_instructions: None,
             initial_message: None,
             subscribe_mode: config::SubscribeMode::All,
             dedup_mode: config::DedupMode::Queue,
@@ -3972,6 +4131,7 @@ mod error_outcome_emission_tests {
             respond_to_allowlist: HashSet::new(),
             allowed_respond_to: vec![],
             persona_env_vars: vec![],
+            has_generated_codex_config: false,
             relay_observer: false,
             agent_owner: None,
             no_base_prompt: false,
@@ -3985,7 +4145,7 @@ mod error_outcome_emission_tests {
     async fn dummy_agent(index: usize) -> OwnedAgent {
         OwnedAgent {
             index,
-            acp: AcpClient::spawn("cat", &[], &[])
+            acp: AcpClient::spawn("cat", &[], &[], false)
                 .await
                 .expect("spawn cat as inert agent"),
             state: Default::default(),
@@ -4067,8 +4227,456 @@ mod error_outcome_emission_tests {
     }
 
     #[tokio::test]
-    async fn timeout_emits_exactly_one_feed_event() {
-        assert_eq!(turn_errors_emitted_for(PromptOutcome::Timeout).await, 1);
+    async fn idle_timeout_emits_exactly_one_feed_event() {
+        assert_eq!(
+            turn_errors_emitted_for(PromptOutcome::Timeout(TimeoutKind::Idle)).await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_timeout_emits_exactly_one_feed_event() {
+        assert_eq!(
+            turn_errors_emitted_for(PromptOutcome::Timeout(TimeoutKind::Hard)).await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_drain_timeout_emits_exactly_one_feed_event() {
+        assert_eq!(
+            turn_errors_emitted_for(PromptOutcome::CancelDrainTimeout(
+                std::time::Duration::from_secs(5)
+            ))
+            .await,
+            1
+        );
+    }
+
+    /// idle_timeout outcome_label is "idle_timeout"; hard_timeout is "hard_timeout".
+    #[tokio::test]
+    async fn timeout_outcome_labels_differ() {
+        let check_label = |outcome: PromptOutcome, expected_label: &'static str| async move {
+            let agent = dummy_agent(0).await;
+            let mut pool = AgentPool::from_slots(vec![None]);
+            let task_id = pool.join_set.spawn(async {}).id();
+            pool.task_map_mut().insert(
+                task_id,
+                crate::pool::TaskMeta {
+                    agent_index: 0,
+                    channel_id: None,
+                    recoverable_batch: None,
+                    control_tx: None,
+                    steer_tx: None,
+                },
+            );
+            let mut queue = EventQueue::new(config::DedupMode::Queue);
+            let config = test_config();
+            let mut heartbeat_in_flight = false;
+            let removed_channels = HashSet::new();
+            let mut crash_history = vec![SlotCircuit {
+                crash_times: Vec::new(),
+                open_until: None,
+                respawn_in_flight: false,
+            }];
+            let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+            let mut respawn_tasks = tokio::task::JoinSet::new();
+            let observer = ObserverHandle::in_process();
+            let result = PromptResult {
+                agent,
+                source: PromptSource::Channel(Uuid::new_v4()),
+                outcome,
+                batch: None,
+            };
+            handle_prompt_result(
+                &mut pool,
+                &mut queue,
+                &config,
+                result,
+                &mut heartbeat_in_flight,
+                &removed_channels,
+                &mut crash_history,
+                &respawn_tx,
+                &mut respawn_tasks,
+                Some(observer.clone()),
+                None,
+            );
+            let events = observer.snapshot();
+            let turn_error = events.iter().find(|e| e.kind == "turn_error").unwrap();
+            assert_eq!(
+                turn_error.payload["outcome"].as_str().unwrap(),
+                expected_label
+            );
+        };
+        check_label(PromptOutcome::Timeout(TimeoutKind::Idle), "idle_timeout").await;
+        check_label(PromptOutcome::Timeout(TimeoutKind::Hard), "hard_timeout").await;
+        check_label(
+            PromptOutcome::CancelDrainTimeout(std::time::Duration::from_secs(5)),
+            "cancel_drain_timeout",
+        )
+        .await;
+    }
+
+    /// hard-cap timeout dead-letters immediately (no requeue); idle timeout is requeued.
+    #[tokio::test]
+    async fn hard_timeout_not_requeued_idle_timeout_is_requeued() {
+        let make_batch = || {
+            let keys = Keys::generate();
+            let event = EventBuilder::new(Kind::Custom(9), "test")
+                .sign_with_keys(&keys)
+                .unwrap();
+            FlushBatch {
+                channel_id: Uuid::new_v4(),
+                events: vec![BatchEvent {
+                    event,
+                    prompt_tag: "test".into(),
+                    received_at: std::time::Instant::now(),
+                }],
+                cancelled_events: vec![],
+                cancel_reason: None,
+            }
+        };
+
+        // Returns (pending_channels, queued_event_count_for_channel).
+        let run = |outcome: PromptOutcome, batch: FlushBatch| async move {
+            let channel_id = batch.channel_id;
+            let agent = dummy_agent(0).await;
+            let mut pool = AgentPool::from_slots(vec![None]);
+            let task_id = pool.join_set.spawn(async {}).id();
+            pool.task_map_mut().insert(
+                task_id,
+                crate::pool::TaskMeta {
+                    agent_index: 0,
+                    channel_id: None,
+                    recoverable_batch: None,
+                    control_tx: None,
+                    steer_tx: None,
+                },
+            );
+            let mut queue = EventQueue::new(config::DedupMode::Queue);
+            let config = test_config();
+            let mut heartbeat_in_flight = false;
+            let removed_channels = HashSet::new();
+            let mut crash_history = vec![SlotCircuit {
+                crash_times: Vec::new(),
+                open_until: None,
+                respawn_in_flight: false,
+            }];
+            let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+            let mut respawn_tasks = tokio::task::JoinSet::new();
+            let result = PromptResult {
+                agent,
+                source: PromptSource::Channel(channel_id),
+                outcome,
+                batch: Some(batch),
+            };
+            handle_prompt_result(
+                &mut pool,
+                &mut queue,
+                &config,
+                result,
+                &mut heartbeat_in_flight,
+                &removed_channels,
+                &mut crash_history,
+                &respawn_tx,
+                &mut respawn_tasks,
+                None,
+                None,
+            );
+            (
+                queue.pending_channels(),
+                queue.queued_event_count(&channel_id),
+            )
+        };
+
+        // Hard timeout: batch must NOT be requeued (dead-lettered immediately).
+        let hard_batch = make_batch();
+        let (hard_channels, hard_events) =
+            run(PromptOutcome::Timeout(TimeoutKind::Hard), hard_batch).await;
+        assert_eq!(
+            hard_channels, 0,
+            "hard-cap timeout must not requeue the batch"
+        );
+        assert_eq!(hard_events, 0, "hard-cap timeout must drop all events");
+
+        // Idle timeout: batch IS requeued (first attempt, not yet dead-lettered).
+        let idle_batch = make_batch();
+        let (idle_channels, idle_events) =
+            run(PromptOutcome::Timeout(TimeoutKind::Idle), idle_batch).await;
+        assert_eq!(
+            idle_channels, 1,
+            "idle timeout must requeue the batch for retry"
+        );
+        assert_eq!(
+            idle_events, 1,
+            "idle timeout must preserve the event for retry"
+        );
+    }
+
+    /// Cancel-drain-timeout batches are requeued as cancelled (merge into the
+    /// next flush, `CancelReason` preserved) — never dead-lettered like a real
+    /// hard-cap. The agent itself is NOT returned to the idle pool: it is
+    /// handed to `spawn_respawn_task` instead, mirroring a fatal `Timeout`.
+    ///
+    /// This reproduces the full steer-fallback incident, not just the
+    /// original batch in isolation: the steer ack handler already released
+    /// the new triggering event back to `queue` (`lib.rs`'s
+    /// `ExpectedRunIdMissing` path) before the cancel-drain expiry fires. The
+    /// next `flush_next()` must merge the surviving original event (via
+    /// `cancelled_events`) with that already-queued new event (via `events`)
+    /// exactly once each — proving no loss and no duplication.
+    #[tokio::test]
+    async fn cancel_drain_timeout_requeues_batch_and_does_not_return_agent() {
+        let keys = Keys::generate();
+        let original_event = EventBuilder::new(Kind::Custom(9), "original")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let new_event = EventBuilder::new(Kind::Custom(9), "new")
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert_ne!(
+            original_event.id, new_event.id,
+            "test fixture must use two distinct events"
+        );
+        let channel_id = Uuid::new_v4();
+        let batch = FlushBatch {
+            channel_id,
+            events: vec![BatchEvent {
+                event: original_event.clone(),
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: Some(CancelReason::Steer),
+        };
+
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: None,
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        // The steer ack handler releases the new event to the queue BEFORE
+        // signaling the fallback ControlSignal::Steer that ultimately times
+        // out on drain — so it is already queued by the time
+        // handle_prompt_result runs.
+        queue.push(QueuedEvent {
+            channel_id,
+            event: new_event.clone(),
+            received_at: std::time::Instant::now(),
+            prompt_tag: "test".into(),
+        });
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let observer = ObserverHandle::in_process();
+        let grace = std::time::Duration::from_secs(5);
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(channel_id),
+            outcome: PromptOutcome::CancelDrainTimeout(grace),
+            batch: Some(batch),
+        };
+
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            Some(observer.clone()),
+            None,
+        );
+
+        // Batch preserved as a cancelled merge, not dead-lettered — same
+        // treatment as a normal `Cancelled` outcome. `handle_prompt_result`
+        // already called `mark_complete` internally, releasing the channel.
+        // `flush_next()` must merge the already-queued new event with the
+        // preserved original: each exactly once, in the correct bucket.
+        let requeued = queue.flush_next().expect("batch must be requeued");
+        assert_eq!(
+            requeued.events.len(),
+            1,
+            "exactly one new event must be in the regular events bucket"
+        );
+        assert_eq!(
+            requeued.events[0].event.id, new_event.id,
+            "the regular events bucket must hold the new (already-queued) event"
+        );
+        assert_eq!(
+            requeued.cancelled_events.len(),
+            1,
+            "exactly one original event must be in the cancelled_events bucket"
+        );
+        assert_eq!(
+            requeued.cancelled_events[0].event.id, original_event.id,
+            "the cancelled_events bucket must hold the original (interrupted) event"
+        );
+        assert_ne!(
+            requeued.events[0].event.id, requeued.cancelled_events[0].event.id,
+            "the new and original events must not be the same event"
+        );
+        assert_eq!(
+            requeued.cancel_reason,
+            Some(CancelReason::Steer),
+            "CancelReason must ride through to the requeued batch"
+        );
+
+        // Agent must NOT be back in the idle pool — it was handed to respawn.
+        assert_eq!(
+            pool.live_count(),
+            0,
+            "agent must not be returned to the pool after a cancel-drain timeout"
+        );
+        assert_eq!(
+            respawn_tasks.len(),
+            1,
+            "a respawn task must be spawned for the poisoned agent"
+        );
+
+        // The observer payload must be fate-neutral: it names the grace and
+        // the process replacement, and must NOT claim the batch was
+        // preserved — that claim is false for explicit Stop/removed-channel
+        // drops (see the sibling dropped-Stop test below), so the same
+        // wording is used regardless of fate.
+        let events = observer.snapshot();
+        let turn_error = events
+            .iter()
+            .find(|e| e.kind == "turn_error")
+            .expect("exactly one turn_error event must be emitted");
+        assert_eq!(
+            turn_error.payload["outcome"].as_str().unwrap(),
+            "cancel_drain_timeout"
+        );
+        assert_eq!(
+            turn_error.payload["error"].as_str().unwrap(),
+            format!("Agent did not stop within {grace:?} after cancellation; the agent process is being replaced."),
+            "observer message must name the actual grace and must not claim preservation"
+        );
+        assert_eq!(
+            events.iter().filter(|e| e.kind == "turn_error").count(),
+            1,
+            "exactly one turn_error event must be emitted"
+        );
+    }
+
+    /// Explicit Stop (`ControlSignal::Cancel`) on cancel-drain expiry drops
+    /// the triggering batch — `requeue_cancelled_batch` returns `None` for
+    /// `Cancel`/`Rotate`. The observer payload must be the SAME fate-neutral
+    /// text as the preserved-Steer case above: it must never claim work was
+    /// preserved when it was intentionally discarded. The poisoned agent is
+    /// still respawned exactly as in the preserved case.
+    #[tokio::test]
+    async fn cancel_drain_timeout_dropped_stop_batch_none_same_neutral_payload() {
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: None,
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let observer = ObserverHandle::in_process();
+        let grace = std::time::Duration::from_secs(5);
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(Uuid::new_v4()),
+            outcome: PromptOutcome::CancelDrainTimeout(grace),
+            // Explicit Stop already dropped the batch upstream in
+            // `classify_control_cancel_failure` — `handle_prompt_result`
+            // never sees one to requeue.
+            batch: None,
+        };
+
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            Some(observer.clone()),
+            None,
+        );
+
+        // No batch to merge — the queue has nothing pending for any channel.
+        assert_eq!(
+            queue.pending_channels(),
+            0,
+            "a dropped Stop batch must not leave anything queued"
+        );
+
+        // Same respawn treatment as the preserved case: never returned idle.
+        assert_eq!(
+            pool.live_count(),
+            0,
+            "agent must not be returned to the pool after a cancel-drain timeout"
+        );
+        assert_eq!(
+            respawn_tasks.len(),
+            1,
+            "a respawn task must be spawned for the poisoned agent"
+        );
+
+        // The observer payload is byte-identical to the preserved-Steer case:
+        // fate-neutral, naming the grace, with no preservation claim.
+        let events = observer.snapshot();
+        let turn_error = events
+            .iter()
+            .find(|e| e.kind == "turn_error")
+            .expect("exactly one turn_error event must be emitted");
+        assert_eq!(
+            turn_error.payload["outcome"].as_str().unwrap(),
+            "cancel_drain_timeout"
+        );
+        assert_eq!(
+            turn_error.payload["error"].as_str().unwrap(),
+            format!("Agent did not stop within {grace:?} after cancellation; the agent process is being replaced."),
+            "observer message must be fate-neutral even though the batch was dropped"
+        );
+        assert_eq!(
+            events.iter().filter(|e| e.kind == "turn_error").count(),
+            1,
+            "exactly one turn_error event must be emitted"
+        );
     }
 
     #[tokio::test]

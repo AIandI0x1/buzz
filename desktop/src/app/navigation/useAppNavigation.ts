@@ -145,6 +145,14 @@ export function useAppNavigation() {
     (
       channelId: string,
       options?: {
+        /** Open the agent activity pane for this agent pubkey on arrival. */
+        agentSession?: string;
+        /**
+         * When set, the main composer auto-submits the draft with this key
+         * once on mount. Clears itself (via `?autoSend` search param) after
+         * firing. Used by the Drafts panel "Send message" confirm flow.
+         */
+        autoSend?: string;
         messageId?: string;
         replace?: boolean;
         threadRootId?: string | null;
@@ -156,17 +164,34 @@ export function useAppNavigation() {
           params: {
             channelId,
           },
-          search: options?.messageId
-            ? {
-                messageId: options.messageId,
-                threadRootId: options.threadRootId ?? undefined,
-              }
-            : {},
+          search: {
+            ...(options?.messageId
+              ? {
+                  messageId: options.messageId,
+                  threadRootId: options.threadRootId ?? undefined,
+                }
+              : {}),
+            ...(options?.agentSession
+              ? { agentSession: options.agentSession }
+              : {}),
+            ...(options?.autoSend ? { autoSend: options.autoSend } : {}),
+          },
         },
         {
           replace: options?.replace,
           resetScroll: options?.messageId ? true : undefined,
         },
+      ),
+    [commitNavigation],
+  );
+
+  const goNewMessage = React.useCallback(
+    (behavior?: NavigationBehavior) =>
+      commitNavigation(
+        {
+          to: "/messages/new",
+        },
+        behavior,
       ),
     [commitNavigation],
   );
@@ -270,6 +295,7 @@ export function useAppNavigation() {
     goChannel,
     goForumPost,
     goHome,
+    goNewMessage,
     goProject,
     goProjects,
     goPulse,

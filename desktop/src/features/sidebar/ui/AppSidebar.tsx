@@ -1,12 +1,10 @@
 // biome-ignore format: keep compact to stay within file size limit
-import { MessageCirclePlus } from "lucide-react";
-
 import * as React from "react";
 import { FeatureGate } from "@/shared/features";
 import { SidebarDndContext } from "@/features/sidebar/ui/SidebarDnd";
 
-import type { Workspace } from "@/features/workspaces/types";
-import { AddWorkspaceDialog } from "@/features/workspaces/ui/AddWorkspaceDialog";
+import type { Community } from "@/features/communities/types";
+import { AddCommunityDialog } from "@/features/communities/ui/AddCommunityDialog";
 import { useIsMobile } from "@/shared/hooks/use-mobile";
 import { useDeferredLoad } from "@/shared/hooks/useDeferredStartup";
 import {
@@ -15,7 +13,12 @@ import {
 } from "@/features/sidebar/lib/useChannelSections";
 import { useActiveWorkingChannelsById } from "@/features/sidebar/lib/useActiveWorkingChannelsById";
 import { useDmSidebarMetadata } from "@/features/sidebar/useDmSidebarMetadata";
-import { sortDmChannelsByLabel } from "@/features/sidebar/lib/dmSidebarSort";
+import { sortDmChannelsForSidebar } from "@/features/sidebar/lib/dmSidebarSort";
+import {
+  sectionSortGroupKey,
+  sortChannelsForSidebar,
+} from "@/features/sidebar/lib/channelSortPreference";
+import { useChannelSortPreference } from "@/features/sidebar/lib/useChannelSortPreference";
 import { useSidebarScrollLock } from "@/features/sidebar/lib/useSidebarScrollLock";
 import { useUnreadOverflow } from "@/features/sidebar/lib/useUnreadOverflow";
 import {
@@ -31,9 +34,10 @@ import { SidebarSection } from "@/features/sidebar/ui/SidebarSection";
 import {
   ChannelGroupSection,
   CustomChannelSection,
+  SectionActionsMenu,
+  SectionQuickAction,
 } from "@/features/sidebar/ui/CustomChannelSection";
 import { CreateChannelDialog } from "@/features/sidebar/ui/CreateChannelDialog";
-import { NewDirectMessageDialog } from "@/features/sidebar/ui/NewDirectMessageDialog";
 import { SidebarProfileCard } from "@/features/sidebar/ui/SidebarProfileCard";
 import { SidebarRelayConnectionCard } from "@/features/sidebar/ui/SidebarRelayConnectionCard";
 import type { useSidebarRelayConnectionCard } from "@/features/sidebar/ui/useSidebarRelayConnectionCard";
@@ -41,10 +45,6 @@ import {
   SidebarLoadingContent,
   useSidebarLoadingShape,
 } from "@/features/sidebar/ui/sidebarLoadingSkeleton";
-import {
-  SECTION_ACTION_VISIBILITY_CLASS,
-  SECTION_ICON_BUTTON_CLASS,
-} from "@/features/sidebar/ui/sidebarSectionStyles";
 import { useDeferredModalOpen } from "@/shared/ui/deferredModalOpen";
 import { SidebarUpdateCard } from "@/features/settings/SidebarUpdateCard";
 import { useUpdaterContext } from "@/features/settings/hooks/UpdaterProvider";
@@ -76,16 +76,15 @@ type CollapsibleSidebarGroup =
 type CreateChannelKind = "stream" | "forum";
 
 type AppSidebarProps = {
-  activeWorkspace: Workspace | null;
+  activeCommunity: Community | null;
   channels: Channel[];
   currentPubkey?: string;
   fallbackDisplayName?: string;
   homeBadgeCount: number;
-  isAddWorkspaceOpen?: boolean;
+  isAddCommunityOpen?: boolean;
   isLoading: boolean;
   isCreatingChannel: boolean;
   isCreatingForum: boolean;
-  isOpeningDm: boolean;
   profile?: Profile;
   relayConnectionCard: ReturnType<typeof useSidebarRelayConnectionCard>;
   selfPresenceStatus: PresenceStatus;
@@ -94,15 +93,16 @@ type AppSidebarProps = {
   selectedView:
     | "home"
     | "channel"
+    | "messages"
     | "agents"
     | "workflows"
     | "pulse"
     | "projects";
   unreadChannelCounts: ReadonlyMap<string, number>;
   unreadChannelIds: ReadonlySet<string>;
-  workspaces: Workspace[];
-  onAddWorkspace: (workspace: Workspace) => void;
-  onAddWorkspaceOpenChange?: (open: boolean) => void;
+  communities: Community[];
+  onAddCommunity: (community: Community) => void;
+  onAddCommunityOpenChange?: (open: boolean) => void;
   onCreateChannel: (input: {
     name: string;
     description?: string;
@@ -117,7 +117,8 @@ type AppSidebarProps = {
     ttlSeconds?: number;
     templateId?: string;
   }) => Promise<void>;
-  onOpenAddWorkspace: () => void;
+  onOpenAddCommunity: () => void;
+  onSendFeedback?: () => void;
   onHideDm: (channelId: string) => void;
   onMarkChannelUnread: (channelId: string) => void;
   onMarkChannelRead: (
@@ -127,11 +128,11 @@ type AppSidebarProps = {
   onMarkAllChannelsRead: () => void;
   onBrowseChannels?: () => void;
   onOpenDm: (input: { pubkeys: string[] }) => Promise<void>;
-  onUpdateWorkspace: (
+  onUpdateCommunity: (
     id: string,
-    updates: Partial<Pick<Workspace, "name" | "relayUrl" | "token">>,
+    updates: Partial<Pick<Community, "name" | "relayUrl" | "token">>,
   ) => void;
-  onRemoveWorkspace: (id: string) => void;
+  onRemoveCommunity: (id: string) => void;
   onCreateAgent: () => void;
   onSelectAgents: () => void;
   onSelectProjects: () => void;
@@ -151,11 +152,10 @@ type AppSidebarProps = {
   onSetPresenceStatus?: (status: "online" | "away" | "offline") => void;
   onSetUserStatus: (text: string, emoji: string) => void;
   onClearUserStatus: () => void;
-  onSwitchWorkspace: (id: string) => void;
+  onSwitchCommunity: (id: string) => void;
   selfUserStatus?: UserStatus;
   isPresencePending?: boolean;
-  isNewDmOpen?: boolean;
-  onNewDmOpenChange?: (open: boolean) => void;
+  onNewMessage: () => void;
   isCreateChannelOpen?: boolean;
   onCreateChannelOpenChange?: (open: boolean) => void;
   mutedChannelIds?: ReadonlySet<string>;
@@ -167,16 +167,15 @@ type AppSidebarProps = {
 };
 
 export function AppSidebar({
-  activeWorkspace,
+  activeCommunity,
   channels,
   currentPubkey,
   fallbackDisplayName,
   homeBadgeCount,
-  isAddWorkspaceOpen,
+  isAddCommunityOpen,
   isLoading,
   isCreatingChannel,
   isCreatingForum,
-  isOpeningDm,
   profile,
   relayConnectionCard,
   selfPresenceStatus,
@@ -185,20 +184,21 @@ export function AppSidebar({
   selectedView,
   unreadChannelCounts,
   unreadChannelIds,
-  workspaces,
-  onAddWorkspace,
-  onAddWorkspaceOpenChange,
+  communities,
+  onAddCommunity,
+  onAddCommunityOpenChange,
   onCreateChannel,
   onCreateForum,
-  onOpenAddWorkspace,
+  onOpenAddCommunity,
+  onSendFeedback,
   onHideDm,
   onMarkChannelUnread,
   onMarkChannelRead,
   onMarkAllChannelsRead,
   onBrowseChannels,
   onOpenDm,
-  onUpdateWorkspace,
-  onRemoveWorkspace,
+  onUpdateCommunity,
+  onRemoveCommunity,
   onCreateAgent,
   onSelectAgents,
   onSelectProjects,
@@ -213,11 +213,10 @@ export function AppSidebar({
   onSetPresenceStatus,
   onSetUserStatus,
   onClearUserStatus,
-  onSwitchWorkspace,
+  onSwitchCommunity,
   selfUserStatus,
   isPresencePending,
-  isNewDmOpen: isNewDmOpenProp,
-  onNewDmOpenChange,
+  onNewMessage,
   isCreateChannelOpen: isCreateChannelOpenProp,
   onCreateChannelOpenChange,
   mutedChannelIds,
@@ -236,9 +235,7 @@ export function AppSidebar({
     React.useState(false);
   const showSidebarUpdateCard =
     canShowSidebarUpdateCard && !isSidebarUpdateCardDismissed;
-  const [isNewDmOpenInternal, setIsNewDmOpenInternal] = React.useState(false);
-  const isNewDmOpen = isNewDmOpenProp ?? isNewDmOpenInternal;
-  const setIsNewDmOpen = onNewDmOpenChange ?? setIsNewDmOpenInternal;
+  const [dmActionsMenuOpen, setDmActionsMenuOpen] = React.useState(false);
   const scrollRef = React.useRef<HTMLDivElement>(null);
   useSidebarScrollLock(scrollRef);
 
@@ -347,7 +344,18 @@ export function AppSidebar({
     reorderSections,
     assignChannel,
     unassignChannel,
-  } = useChannelSections(currentPubkey, activeWorkspace?.relayUrl);
+  } = useChannelSections(currentPubkey, activeCommunity?.relayUrl);
+
+  const sectionIds = React.useMemo(
+    () => channelSections.map((s) => s.id),
+    [channelSections],
+  );
+
+  const { sortModeFor, setSortModeFor } = useChannelSortPreference(
+    currentPubkey,
+    activeCommunity?.relayUrl,
+    sectionIds,
+  );
 
   const [createSectionState, setCreateSectionState] = React.useState<{
     open: boolean;
@@ -359,11 +367,6 @@ export function AppSidebar({
     React.useState<ChannelSection | null>(null);
   const { requestLeaveChannel, dialog: leaveChannelDialog } =
     useLeaveChannelDialog();
-
-  const sectionIds = React.useMemo(
-    () => channelSections.map((s) => s.id),
-    [channelSections],
-  );
 
   const streamChannels = React.useMemo(
     () => channels.filter((channel) => channel.channelType === "stream"),
@@ -387,15 +390,33 @@ export function AppSidebar({
         unassigned.push(channel);
       }
     }
-    return { bySection, unassigned };
-  }, [streamChannels, channelSections, channelAssignments, starredChannelIds]);
+    // Apply each grouping's own sort preference; section membership itself
+    // is untouched.
+    for (const sectionId of Object.keys(bySection)) {
+      bySection[sectionId] = sortChannelsForSidebar(
+        bySection[sectionId],
+        sortModeFor(sectionSortGroupKey(sectionId)),
+      );
+    }
+    return {
+      bySection,
+      unassigned: sortChannelsForSidebar(unassigned, sortModeFor("channels")),
+    };
+  }, [
+    streamChannels,
+    channelSections,
+    channelAssignments,
+    starredChannelIds,
+    sortModeFor,
+  ]);
 
   const starredChannels = React.useMemo(() => {
     if (!starredChannelIds || starredChannelIds.size === 0) return [];
-    return streamChannels.filter((channel) =>
-      starredChannelIds.has(channel.id),
+    return sortChannelsForSidebar(
+      streamChannels.filter((channel) => starredChannelIds.has(channel.id)),
+      sortModeFor("starred"),
     );
-  }, [streamChannels, starredChannelIds]);
+  }, [streamChannels, starredChannelIds, sortModeFor]);
 
   const handleCreateSectionForChannel = React.useCallback(
     (channelId: string) => {
@@ -419,8 +440,12 @@ export function AppSidebar({
   );
 
   const forumChannels = React.useMemo(
-    () => channels.filter((channel) => channel.channelType === "forum"),
-    [channels],
+    () =>
+      sortChannelsForSidebar(
+        channels.filter((channel) => channel.channelType === "forum"),
+        sortModeFor("forums"),
+      ),
+    [channels, sortModeFor],
   );
   const directMessages = React.useMemo(
     () => channels.filter((channel) => channel.channelType === "dm"),
@@ -442,11 +467,16 @@ export function AppSidebar({
       profileDisplayName: profile?.displayName,
     });
   const sortedDirectMessages = React.useMemo(
-    () => sortDmChannelsByLabel(directMessages, dmChannelLabels),
-    [directMessages, dmChannelLabels],
+    () =>
+      sortDmChannelsForSidebar(
+        directMessages,
+        dmChannelLabels,
+        sortModeFor("dms"),
+      ),
+    [directMessages, dmChannelLabels, sortModeFor],
   );
   const sidebarLoadingShape = useSidebarLoadingShape({
-    activeWorkspaceId: activeWorkspace?.id,
+    activeCommunityId: activeCommunity?.id,
     currentPubkey,
     directMessages,
     dmChannelLabels,
@@ -553,7 +583,6 @@ export function AppSidebar({
               <>
                 {starredChannels.length > 0 ? (
                   <ChannelGroupSection
-                    createAriaLabel="Starred channels"
                     hasUnread={starredChannels.some((c) =>
                       unreadChannelIds.has(c.id),
                     )}
@@ -561,6 +590,9 @@ export function AppSidebar({
                     isActiveChannel={selectedView === "channel"}
                     activeWorkingByChannelId={activeWorkingByChannelId}
                     items={starredChannels}
+                    sortMode={sortModeFor("starred")}
+                    onSortModeChange={(mode) => setSortModeFor("starred", mode)}
+                    actionsTestId="section-actions-starred"
                     listTestId="starred-list"
                     onMarkAllRead={() => {
                       for (const channel of starredChannels) {
@@ -612,6 +644,10 @@ export function AppSidebar({
                       assignments={channelAssignments}
                       isFirst={idx === 0}
                       isLast={idx === channelSections.length - 1}
+                      sortMode={sortModeFor(sectionSortGroupKey(section.id))}
+                      onSortModeChange={(mode) =>
+                        setSortModeFor(sectionSortGroupKey(section.id), mode)
+                      }
                       onToggleCollapsed={() =>
                         toggleCollapsedSection(section.id)
                       }
@@ -642,17 +678,23 @@ export function AppSidebar({
                     />
                   ))}
                   <ChannelGroupSection
-                    browseAriaLabel="Browse channels"
-                    createAriaLabel="Create a channel"
+                    browseLabel="Browse channels"
+                    createLabel="New channel"
                     draggable
                     hasUnread={unreadChannelIds.size > 0}
                     isCollapsed={collapsedGroups.channels}
                     isActiveChannel={selectedView === "channel"}
                     activeWorkingByChannelId={activeWorkingByChannelId}
                     items={sectionBuckets.unassigned}
+                    sortMode={sortModeFor("channels")}
+                    onSortModeChange={(mode) =>
+                      setSortModeFor("channels", mode)
+                    }
+                    actionsTestId="section-actions-channels"
                     listTestId="stream-list"
                     onBrowseClick={onBrowseChannels}
                     onCreateClick={() => openCreateDialog("stream")}
+                    showQuickCreate
                     onMarkAllRead={onMarkAllChannelsRead}
                     onMarkChannelRead={onMarkChannelRead}
                     onMarkChannelUnread={onMarkChannelUnread}
@@ -678,12 +720,15 @@ export function AppSidebar({
                 </SidebarDndContext>
                 <FeatureGate feature="forum">
                   <ChannelGroupSection
-                    createAriaLabel="Create a forum"
+                    createLabel="New forum"
                     hasUnread={unreadChannelIds.size > 0}
                     isCollapsed={collapsedGroups.forums}
                     isActiveChannel={selectedView === "channel"}
                     activeWorkingByChannelId={activeWorkingByChannelId}
                     items={forumChannels}
+                    sortMode={sortModeFor("forums")}
+                    onSortModeChange={(mode) => setSortModeFor("forums", mode)}
+                    actionsTestId="section-actions-forums"
                     listTestId="forum-list"
                     onCreateClick={() => openCreateDialog("forum")}
                     onMarkAllRead={onMarkAllChannelsRead}
@@ -703,19 +748,19 @@ export function AppSidebar({
                 <SidebarSection
                   action={
                     <div className="absolute right-1 top-1/2 z-10 flex -translate-y-1/2 items-center gap-0.5">
-                      <button
-                        aria-expanded={isNewDmOpen}
-                        aria-label="Compose new message"
-                        className={`${SECTION_ICON_BUTTON_CLASS} ${SECTION_ACTION_VISIBILITY_CLASS}`}
-                        data-testid="new-dm-trigger"
-                        onClick={() => {
-                          setIsNewDmOpen(true);
-                        }}
-                        title="Compose new message"
-                        type="button"
-                      >
-                        <MessageCirclePlus className="h-4 w-4" />
-                      </button>
+                      <SectionQuickAction
+                        label="New message"
+                        onClick={onNewMessage}
+                        testId="section-actions-dms-quick-create"
+                      />
+                      <SectionActionsMenu
+                        sectionLabel="direct messages"
+                        testId="section-actions-dms"
+                        onOpenChange={setDmActionsMenuOpen}
+                        onNewMessage={onNewMessage}
+                        sortMode={sortModeFor("dms")}
+                        onSortModeChange={(mode) => setSortModeFor("dms", mode)}
+                      />
                     </div>
                   }
                   dmParticipantsByChannelId={dmParticipantsByChannelId}
@@ -735,6 +780,7 @@ export function AppSidebar({
                   selectedChannelId={selectedChannelId}
                   testId="dm-list"
                   title="Direct messages"
+                  sectionActionsOpen={dmActionsMenuOpen}
                   unreadChannelCounts={unreadChannelCounts}
                   unreadChannelIds={unreadChannelIds}
                   mutedChannelIds={mutedChannelIds}
@@ -752,7 +798,7 @@ export function AppSidebar({
           </SidebarContent>
         </div>
 
-        <div className="relative z-30 shrink-0">
+        <div className="relative z-30 shrink-0" data-buzz-glass-footer-wrap>
           {unreadBelowCount > 0 ? (
             <MoreUnreadButton
               bottomClassName="bottom-full"
@@ -787,21 +833,22 @@ export function AppSidebar({
             <SidebarMenu>
               <SidebarMenuItem>
                 <SidebarProfileCard
-                  activeWorkspace={activeWorkspace}
+                  activeCommunity={activeCommunity}
                   isPresencePending={isPresencePending}
-                  onOpenAddWorkspace={onOpenAddWorkspace}
+                  onOpenAddCommunity={onOpenAddCommunity}
                   onOpenSettings={onSelectSettings}
-                  onRemoveWorkspace={onRemoveWorkspace}
+                  onSendFeedback={onSendFeedback}
+                  onRemoveCommunity={onRemoveCommunity}
                   onSetPresenceStatus={onSetPresenceStatus}
                   onSetUserStatus={onSetUserStatus}
                   onClearUserStatus={onClearUserStatus}
-                  onSwitchWorkspace={onSwitchWorkspace}
-                  onUpdateWorkspace={onUpdateWorkspace}
+                  onSwitchCommunity={onSwitchCommunity}
+                  onUpdateCommunity={onUpdateCommunity}
                   profile={profile}
                   resolvedDisplayName={resolvedDisplayName}
                   selfPresenceStatus={selfPresenceStatus}
                   selfUserStatus={selfUserStatus}
-                  workspaces={workspaces}
+                  communities={communities}
                 />
               </SidebarMenuItem>
             </SidebarMenu>
@@ -825,18 +872,10 @@ export function AppSidebar({
         onCreate={handleCreateFromDialog}
       />
 
-      <NewDirectMessageDialog
-        currentPubkey={currentPubkey}
-        isPending={isOpeningDm}
-        onOpenChange={setIsNewDmOpen}
-        onSubmit={onOpenDm}
-        open={isNewDmOpen}
-      />
-
-      <AddWorkspaceDialog
-        onOpenChange={onAddWorkspaceOpenChange ?? (() => {})}
-        onSubmit={onAddWorkspace}
-        open={isAddWorkspaceOpen ?? false}
+      <AddCommunityDialog
+        onOpenChange={onAddCommunityOpenChange ?? (() => {})}
+        onSubmit={onAddCommunity}
+        open={isAddCommunityOpen ?? false}
       />
 
       <CreateSectionDialog

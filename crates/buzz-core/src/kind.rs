@@ -77,6 +77,8 @@ pub const KIND_READ_STATE: u32 = 30078;
 pub const KIND_AUTH: u32 = 22242;
 /// BUD-01: Blossom upload auth (used in upload.rs, not stored).
 pub const KIND_BLOSSOM_AUTH: u32 = 24242;
+/// Buzz custom one-time identity binding proof (ephemeral, not stored).
+pub const KIND_NOSTR_IDENTITY_BINDING: u32 = 24243;
 /// NIP-98: HTTP auth event (used in nip98.rs, not stored).
 pub const KIND_HTTP_AUTH: u32 = 27235;
 
@@ -99,6 +101,13 @@ pub const KIND_AGENT_ENGRAM: u32 = 30174;
 /// author-only (see [`AUTHOR_ONLY_KINDS`]). See `docs/nips/NIP-ER.md`.
 pub const KIND_EVENT_REMINDER: u32 = 30300;
 
+/// NIP-PL: encrypted push lease (parameterized replaceable, author-only).
+///
+/// The source event contains endpoint-bearing NIP-44 ciphertext and is readable
+/// only by its authenticated author. Effective delivery state lives in the
+/// dedicated push lease tables.
+pub const KIND_PUSH_LEASE: u32 = 30350;
+
 /// Kinds whose stored events are readable only by their author.
 ///
 /// The relay must never reveal the existence, count, tags, content, schedule,
@@ -106,9 +115,9 @@ pub const KIND_EVENT_REMINDER: u32 = 30300;
 /// Shared across the ingest write path (NIP-ER `not_before` validation) and the
 /// read path (REQ/COUNT/subscription author-only filtering).
 ///
-/// Currently O(1) with a single entry. If this grows past ~4 kinds, convert to
-/// a compile-time bitset or sorted array with binary search for hot-path use.
-pub const AUTHOR_ONLY_KINDS: &[u32] = &[KIND_EVENT_REMINDER];
+/// Currently a tiny linear set. If this grows past ~4 kinds, convert to a
+/// compile-time bitset or sorted array with binary search for hot-path use.
+pub const AUTHOR_ONLY_KINDS: &[u32] = &[KIND_EVENT_REMINDER, KIND_PUSH_LEASE];
 
 /// Kinds that require a result-level read gate beyond the filter-layer
 /// `#p` check: even a reader who knows an event id MUST match the event's
@@ -173,6 +182,18 @@ pub const KIND_TEAM: u32 = 30176;
 /// since these events are world-readable on the relay.
 pub const KIND_MANAGED_AGENT: u32 = 30177;
 
+// NIP-56 reporting
+/// NIP-56: Report an event, pubkey, or blob to relay moderators (kind:1984).
+///
+/// Accepted at ingest, persisted to the tenant-scoped `moderation_reports`
+/// queue, and never fanned out publicly. Reports are signals, not triggers:
+/// the relay never auto-actions on them (NIP-56).
+pub const KIND_REPORT: u32 = 1984;
+
+/// Buzz product feedback submission. Accepted at ingest, sidecarred to the
+/// deployment feedback table, and never stored or fanned out as an event.
+pub const KIND_PRODUCT_FEEDBACK: u32 = 42000;
+
 // NIP-29 group admin events
 /// NIP-29: Add a user to a group.
 pub const KIND_NIP29_PUT_USER: u32 = 9000;
@@ -192,6 +213,40 @@ pub const KIND_NIP29_CREATE_INVITE: u32 = 9009;
 pub const KIND_NIP29_JOIN_REQUEST: u32 = 9021;
 /// NIP-29: Request to leave a group.
 pub const KIND_NIP29_LEAVE_REQUEST: u32 = 9022;
+
+// Buzz community moderation commands (mod-signed, processed like 9030-series:
+// validated + executed directly, never stored as regular events; every
+// accepted command writes a `moderation_actions` audit row).
+/// Moderation: ban a pubkey from the community (`p` tag target, optional
+/// `expiration` + `reason` tags).
+pub const KIND_MODERATION_BAN: u32 = 9040;
+/// Moderation: lift a community ban (`p` tag target).
+pub const KIND_MODERATION_UNBAN: u32 = 9041;
+/// Moderation: timeout (write-block) a pubkey until an `expiration` tag
+/// timestamp (`p` tag target, optional `reason`).
+pub const KIND_MODERATION_TIMEOUT: u32 = 9042;
+/// Moderation: clear a timeout early (`p` tag target).
+pub const KIND_MODERATION_UNTIMEOUT: u32 = 9043;
+/// Moderation: resolve a report (`report` tag = report event id hex,
+/// `status` tag = resolved|dismissed, `action` tag =
+/// delete|kick|ban|timeout|dismiss|escalate — see
+/// `handlers/moderation_commands.rs` for the pinned vocabulary).
+pub const KIND_MODERATION_RESOLVE_REPORT: u32 = 9044;
+
+/// Returns `true` for community moderation command kinds (9040–9044).
+///
+/// The canonical route check — use this instead of scattering
+/// `9040..=9044` matches across ingest/dispatch.
+pub const fn is_moderation_command_kind(kind: u32) -> bool {
+    matches!(
+        kind,
+        KIND_MODERATION_BAN
+            | KIND_MODERATION_UNBAN
+            | KIND_MODERATION_TIMEOUT
+            | KIND_MODERATION_UNTIMEOUT
+            | KIND_MODERATION_RESOLVE_REPORT
+    )
+}
 
 // NIP-43 relay membership admin commands
 /// NIP-43: Add a pubkey to the relay member list.
@@ -250,12 +305,6 @@ pub const KIND_WINDOW_BOUNDS: u32 = 39006;
 /// Workflow definition (parameterized replaceable, d=workflow_uuid).
 pub const KIND_WORKFLOW_DEF: u32 = 30620;
 
-/// Mesh-LLM relay status (relay-signed, parameterized replaceable, d=buzz-relay-mesh).
-///
-/// Published only by the relay. Carries a sanitized, member-readable projection
-/// of mesh status, including EndpointAddr dial pointers for serving nodes.
-pub const KIND_MESH_LLM_RELAY_STATUS: u32 = 30621;
-
 /// NIP-DV: per-viewer DM visibility snapshot (relay-signed, parameterized
 /// replaceable, d=viewer_pubkey). Carries one `h` tag per DM the viewer has
 /// hidden from their sidebar. Re-published by the relay on every hide/unhide so
@@ -285,23 +334,6 @@ pub const KIND_AGENT_OBSERVER_FRAME: u32 = 24200;
 /// Ephemeral: huddle emoji reaction burst. Channel-scoped to the ephemeral
 /// huddle channel with an `h` tag; never stored in the timeline.
 pub const KIND_HUDDLE_REACTION: u32 = 24810;
-/// Ephemeral: mesh status report (desktop → relay). A relay member reports its
-/// current mesh serve availability + EndpointAddr(s) so the relay can project a
-/// sanitized, relay-signed kind:30621 discovery note keyed per reporter. Tagged
-/// `["p", <self>]` optional; never stored — the durable record is the relay's
-/// 30621, not this transient input.
-pub const KIND_MESH_STATUS_REPORT: u32 = 24620;
-/// Ephemeral: mesh connect request (desktop → relay). A relay member asks the
-/// relay to coordinate a direct iroh hole-punch to a peer it discovered via
-/// kind:30621. Tagged `["p", <target_pubkey>]`. Never stored; the relay
-/// validates membership of both ends, then emits paired KIND_MESH_CALL_ME_NOW.
-pub const KIND_MESH_CONNECT_REQUEST: u32 = 24621;
-/// Ephemeral: mesh call-me-now signal (relay → desktop, relay-signed). The live
-/// dial trigger for a direct iroh hole-punch — carries the peer's EndpointAddr
-/// so both ends dial near-simultaneously. Tagged `["p", <recipient_pubkey>]`.
-/// Never stored; seconds expiry.
-pub const KIND_MESH_CALL_ME_NOW: u32 = 24622;
-
 // Stream messaging
 /// NIP-29 group chat message kind. V1 used kind:10001 (replaceable range — wrong), then 40001.
 ///
@@ -478,6 +510,8 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_PERSONA,
     KIND_TEAM,
     KIND_MANAGED_AGENT,
+    KIND_REPORT,
+    KIND_PRODUCT_FEEDBACK,
     KIND_NIP29_PUT_USER,
     KIND_NIP29_REMOVE_USER,
     KIND_NIP29_EDIT_METADATA,
@@ -487,6 +521,11 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_NIP29_CREATE_INVITE,
     KIND_NIP29_JOIN_REQUEST,
     KIND_NIP29_LEAVE_REQUEST,
+    KIND_MODERATION_BAN,
+    KIND_MODERATION_UNBAN,
+    KIND_MODERATION_TIMEOUT,
+    KIND_MODERATION_UNTIMEOUT,
+    KIND_MODERATION_RESOLVE_REPORT,
     RELAY_ADMIN_ADD_MEMBER,
     RELAY_ADMIN_REMOVE_MEMBER,
     RELAY_ADMIN_CHANGE_ROLE,
@@ -509,9 +548,6 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_PRESENCE_UPDATE,
     KIND_TYPING_INDICATOR,
     KIND_HUDDLE_REACTION,
-    KIND_MESH_STATUS_REPORT,
-    KIND_MESH_CONNECT_REQUEST,
-    KIND_MESH_CALL_ME_NOW,
     KIND_BLOSSOM_AUTH,
     KIND_PAIRING,
     KIND_AGENT_OBSERVER_FRAME,
@@ -528,7 +564,6 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_SYSTEM_MESSAGE,
     KIND_CHANNEL_SUMMARY,
     KIND_PRESENCE_SNAPSHOT,
-    KIND_MESH_LLM_RELAY_STATUS,
     KIND_DM_VISIBILITY,
     KIND_DM_OPEN,
     KIND_DM_ADD_MEMBER,
@@ -649,7 +684,6 @@ pub const fn is_relay_only_kind(kind: u32) -> bool {
         kind,
         KIND_CHANNEL_SUMMARY
             | KIND_PRESENCE_SNAPSHOT
-            | KIND_MESH_LLM_RELAY_STATUS
             | KIND_DM_VISIBILITY
             | KIND_THREAD_SUMMARY
             | KIND_WINDOW_BOUNDS
@@ -675,7 +709,6 @@ const _: () = assert!(is_parameterized_replaceable(KIND_TEAM)); // 30176 ∈ 300
 const _: () = assert!(is_parameterized_replaceable(KIND_MANAGED_AGENT)); // 30177 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_WORKFLOW_DEF)); // 30620 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_EVENT_REMINDER)); // 30300 ∈ 30000–39999
-const _: () = assert!(is_parameterized_replaceable(KIND_MESH_LLM_RELAY_STATUS)); // 30621 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_DM_VISIBILITY)); // 30622 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_THREAD_SUMMARY)); // 39005 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_WINDOW_BOUNDS)); // 39006 ∈ 30000–39999
@@ -700,6 +733,15 @@ const _: () = assert!(!is_ephemeral(KIND_AGENT_TURN_METRIC));
 const _: () = assert!(!is_replaceable(KIND_AGENT_TURN_METRIC));
 const _: () = assert!(!is_parameterized_replaceable(KIND_AGENT_TURN_METRIC));
 const _: () = assert!(KIND_AGENT_TURN_METRIC <= u16::MAX as u32);
+// Moderation kinds fit u16 and are neither replaceable nor ephemeral:
+// 1984 is a regular event (persisted to the queue, never fanned out);
+// 9040–9044 are direct commands (executed, never stored).
+const _: () = assert!(KIND_REPORT <= u16::MAX as u32);
+const _: () = assert!(KIND_MODERATION_RESOLVE_REPORT <= u16::MAX as u32);
+const _: () = assert!(!is_ephemeral(KIND_REPORT));
+const _: () = assert!(is_moderation_command_kind(KIND_MODERATION_BAN));
+const _: () = assert!(is_moderation_command_kind(KIND_MODERATION_RESOLVE_REPORT));
+const _: () = assert!(!is_moderation_command_kind(KIND_REPORT));
 
 #[cfg(test)]
 mod tests {

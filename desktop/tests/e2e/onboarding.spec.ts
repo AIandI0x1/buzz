@@ -3,6 +3,11 @@ import { expect, test, type Locator, type Page } from "@playwright/test";
 import { nsecEncode } from "nostr-tools/nip19";
 
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
+import {
+  E2E_IDENTITY_OVERRIDE_STORAGE_KEY,
+  seedActiveIdentity,
+  passThroughBackupStep,
+} from "../helpers/onboarding";
 
 type RelayConnectionState =
   | "connected"
@@ -58,7 +63,6 @@ async function setRelayConnectionState(
   }, state);
 }
 
-const E2E_IDENTITY_OVERRIDE_STORAGE_KEY = "buzz:e2e-identity-override.v1";
 const HOME_SEEN_STORAGE_KEY_PREFIX = "buzz-home-feed-seen.v1:";
 const DEFAULT_MOCK_PUBKEY = "deadbeef".repeat(8);
 const BLANK_TYLER_IDENTITY = {
@@ -79,24 +83,6 @@ const FIRST_RUN_ALICE = {
   ...TEST_IDENTITIES.alice,
   username: "",
 };
-
-type TestIdentity = {
-  privateKey: string;
-  pubkey: string;
-  username: string;
-};
-
-async function seedActiveIdentity(page: Page, identity: TestIdentity) {
-  await page.addInitScript(
-    ({ identity: nextIdentity, storageKey }) => {
-      window.localStorage.setItem(storageKey, JSON.stringify(nextIdentity));
-    },
-    {
-      identity,
-      storageKey: E2E_IDENTITY_OVERRIDE_STORAGE_KEY,
-    },
-  );
-}
 
 async function seedOnboardingCompletion(page: Page, pubkey: string) {
   await page.addInitScript(
@@ -160,10 +146,10 @@ async function expectWiderThanTall(locator: Locator) {
 
 async function expectIntroActionIconStackedAboveTitle(
   action: Locator,
-  testId: string,
+  title: string,
 ) {
-  const iconBox = await action.getByTestId(`${testId}-icon`).boundingBox();
-  const titleBox = await action.getByTestId(`${testId}-title`).boundingBox();
+  const iconBox = await action.locator("svg").first().boundingBox();
+  const titleBox = await action.getByText(title, { exact: true }).boundingBox();
   if (!iconBox || !titleBox) {
     throw new Error("Could not measure welcome intro action content");
   }
@@ -286,17 +272,13 @@ async function expectWelcomeView(page: Page) {
   );
   await expectIntroActionIconStackedAboveTitle(
     page.getByTestId("welcome-intro-action-create-channel"),
-    "welcome-intro-action-create-channel",
+    "Create a channel",
   );
   await expect(
-    page.getByTestId("welcome-intro-action-create-channel-title"),
-  ).toHaveText("Create a channel");
-  await expect(
-    page.getByTestId("welcome-intro-action-create-channel-title"),
+    page
+      .getByTestId("welcome-intro-action-create-channel")
+      .getByText("Create a channel", { exact: true }),
   ).toHaveCSS("white-space", "normal");
-  await expect(
-    page.getByTestId("welcome-intro-action-create-channel-description"),
-  ).toHaveCount(0);
   await expect(
     page.getByTestId("welcome-intro-action-create-agent"),
   ).toBeVisible();
@@ -305,14 +287,8 @@ async function expectWelcomeView(page: Page) {
   );
   await expectIntroActionIconStackedAboveTitle(
     page.getByTestId("welcome-intro-action-create-agent"),
-    "welcome-intro-action-create-agent",
+    "Create an agent",
   );
-  await expect(
-    page.getByTestId("welcome-intro-action-create-agent-title"),
-  ).toHaveText("Create a custom agent");
-  await expect(
-    page.getByTestId("welcome-intro-action-create-agent-description"),
-  ).toHaveCount(0);
   await expect(page.getByTestId("message-composer")).toBeVisible();
   await expect(page.getByTestId("welcome-composer-guide-banner")).toBeVisible();
   await expect(page.getByTestId("welcome-composer-guide-banner")).toContainText(
@@ -546,6 +522,7 @@ async function expectIncompleteOnboarding(page: Page) {
 
 async function continueToSetupPage(page: Page) {
   await page.getByTestId("onboarding-next").click();
+  await passThroughBackupStep(page);
   await expect(page.getByTestId("onboarding-page-avatar")).toBeVisible();
   await page
     .getByTestId("onboarding-avatar-url")
@@ -573,7 +550,7 @@ test("completed users skip the loading gate while profile is still settling", as
   await expectHomeView(page);
 });
 
-test("first-run default workspace handoff gives immediate stepper feedback", async ({
+test("first-run default community handoff gives immediate stepper feedback", async ({
   page,
 }) => {
   // Use a blank-username identity so the profile has no display name and
@@ -588,14 +565,14 @@ test("first-run default workspace handoff gives immediate stepper feedback", asy
     {
       relayWsUrl: "wss://default.example.com",
       skipOnboardingSeed: true,
-      skipWorkspaceSeed: true,
+      skipCommunitySeed: true,
     },
   );
   await page.goto("/");
 
   await expect(page.getByText("Welcome to Buzz")).toBeVisible();
   await page
-    .getByRole("button", { name: "Continue with Block Inc. workspace" })
+    .getByRole("button", { name: "Continue with default community" })
     .click();
 
   await page.waitForTimeout(80);
@@ -603,7 +580,7 @@ test("first-run default workspace handoff gives immediate stepper feedback", asy
     0,
   );
   await expect(
-    page.getByRole("button", { name: "Continue with Block Inc. workspace" }),
+    page.getByRole("button", { name: "Continue with default community" }),
   ).toBeVisible();
   await expect(page.getByRole("progressbar")).toHaveAttribute(
     "aria-valuenow",
@@ -630,7 +607,7 @@ test("welcome can continue using an existing Nostr key", async ({ page }) => {
   await installMockBridge(page, undefined, {
     relayWsUrl: "wss://default.example.com",
     skipOnboardingSeed: true,
-    skipWorkspaceSeed: true,
+    skipCommunitySeed: true,
   });
   await page.goto("/");
 
@@ -649,11 +626,11 @@ test("welcome can continue using an existing Nostr key", async ({ page }) => {
   await expect
     .poll(() =>
       page.evaluate(() => {
-        const rawWorkspaces = window.localStorage.getItem("buzz-workspaces");
-        const workspaces = rawWorkspaces
-          ? (JSON.parse(rawWorkspaces) as Array<{ pubkey?: string }>)
+        const rawCommunities = window.localStorage.getItem("buzz-communities");
+        const communities = rawCommunities
+          ? (JSON.parse(rawCommunities) as Array<{ pubkey?: string }>)
           : [];
-        return workspaces[0]?.pubkey ?? null;
+        return communities[0]?.pubkey ?? null;
       }),
     )
     .toBe(TEST_IDENTITIES.alice.pubkey);
@@ -661,25 +638,25 @@ test("welcome can continue using an existing Nostr key", async ({ page }) => {
   await expectHomeView(page);
 });
 
-test("welcome presents custom workspace setup as joining a workspace", async ({
+test("welcome presents custom community setup as joining a community", async ({
   page,
 }) => {
   await installMockBridge(page, undefined, {
     skipOnboardingSeed: true,
-    skipWorkspaceSeed: true,
+    skipCommunitySeed: true,
   });
   await page.goto("/");
 
   await expect(
-    page.getByRole("button", { name: "Continue with Block Inc. workspace" }),
+    page.getByRole("button", { name: "Continue with default community" }),
   ).toHaveCount(0);
-  await page.getByRole("button", { name: "Join a workspace" }).click();
+  await page.getByRole("button", { name: "Join a community" }).click();
 
   await expect(
-    page.getByRole("heading", { name: "Join a workspace" }),
+    page.getByRole("heading", { name: "Join a community" }),
   ).toBeVisible();
   await expect(
-    page.getByRole("button", { name: "Join a workspace" }),
+    page.getByRole("button", { name: "Join a community" }),
   ).toBeVisible();
 });
 
@@ -694,6 +671,88 @@ test("identity fallback text does not count as a real onboarding name", async ({
   await expect(page.getByTestId("onboarding-next")).toBeDisabled();
 });
 
+// Regression test for the H2 predicate fix (PR #1508).
+// A blank first-run identity (no kind:0 event on the relay) must see
+// onboarding even when the mock bridge returns display_name: "" — the gate
+// must depend on `hasProfileEvent`, not on `typeof displayName === "string"`.
+test("first-run blank identity with no profile event sees onboarding", async ({
+  page,
+}) => {
+  await seedActiveIdentity(page, BLANK_TYLER_IDENTITY);
+  // Do NOT seed searchProfiles for tyler's pubkey, so ensureMockProfile
+  // constructs a synthesised profile with has_profile_event: false.
+  await installMockBridge(page, undefined, { skipOnboardingSeed: true });
+  await page.goto("/");
+
+  await expectIncompleteOnboarding(page);
+});
+
+// Regression test for the H2 predicate fix (PR #1508).
+// A returning user who has a real kind:0 profile event with an empty
+// display_name must skip onboarding — they are already onboarded.
+test("returning user with blank display name and real profile event skips onboarding", async ({
+  page,
+}) => {
+  await seedActiveIdentity(page, BLANK_TYLER_IDENTITY);
+  // Seed tyler's pubkey into searchProfiles with an empty displayName.
+  // seedMockSearchProfiles stores this into mockProfiles with
+  // has_profile_event: true, simulating a real kind:0 event with no name.
+  await installMockBridge(
+    page,
+    {
+      searchProfiles: [
+        {
+          pubkey: TEST_IDENTITIES.tyler.pubkey,
+          displayName: "",
+        },
+      ],
+    },
+    { skipOnboardingSeed: true },
+  );
+  await page.goto("/");
+
+  // Profile event exists → onboarding is skipped, app renders.
+  await expect(page.getByTestId("onboarding-gate")).toHaveCount(0);
+  await expectHomeView(page);
+});
+
+// Regression test for the cache-seed defect (PR #1508 CRITICAL fix).
+// Sequence: no-event profile fetched and cached with hasProfileEvent absent →
+// reload with cache present → onboarding must still show. Previously the
+// initialData seed hardcoded hasProfileEvent: true for any updatedAt > 0
+// entry, reopening the original bug on the second app load.
+test("no-event profile cached then reloaded still sees onboarding", async ({
+  page,
+}) => {
+  await seedActiveIdentity(page, BLANK_TYLER_IDENTITY);
+  // Seed a stale v1 cache entry WITHOUT hasProfileEvent (simulating a cache
+  // written by the old code path or a no-event fallback). updatedAt > 0 so
+  // the seed is eligible, but hasProfileEvent is absent → conservative false.
+  const SELF_PROFILE_CACHE_KEY = `buzz-self-profile.v1:ws://localhost:3000:${TEST_IDENTITIES.tyler.pubkey}`;
+  await page.addInitScript(
+    ({ key, cache }) => {
+      window.localStorage.setItem(key, JSON.stringify(cache));
+    },
+    {
+      key: SELF_PROFILE_CACHE_KEY,
+      cache: {
+        version: 1,
+        displayName: null,
+        avatarUrl: null,
+        avatarDataUrl: null,
+        updatedAt: 1_700_000_000_000,
+        // hasProfileEvent deliberately absent — legacy/no-event entry.
+      },
+    },
+  );
+  // No profile event on the relay either — ensureMockProfile uses false.
+  await installMockBridge(page, undefined, { skipOnboardingSeed: true });
+  await page.goto("/");
+
+  // Cache seed must NOT promote hasProfileEvent to true. Onboarding shows.
+  await expectIncompleteOnboarding(page);
+});
+
 test("avatar step uses an add-image placeholder before an avatar is chosen", async ({
   page,
 }) => {
@@ -703,6 +762,7 @@ test("avatar step uses an add-image placeholder before an avatar is chosen", asy
 
   await page.getByTestId("onboarding-display-name").fill("Morty QA");
   await page.getByTestId("onboarding-next").click();
+  await passThroughBackupStep(page);
 
   await expect(page.getByTestId("onboarding-page-avatar")).toBeVisible();
   const preview = page.getByTestId("onboarding-avatar-preview");
@@ -720,6 +780,7 @@ test("avatar step reveals preset backgrounds after the first emoji pick", async 
 
   await page.getByTestId("onboarding-display-name").fill("Morty QA");
   await page.getByTestId("onboarding-next").click();
+  await passThroughBackupStep(page);
   await expect(page.getByTestId("onboarding-page-avatar")).toBeVisible();
 
   await page.getByRole("tab", { name: "Emoji" }).click();
@@ -746,6 +807,7 @@ test("avatar step accepts an avatar URL before theme selection", async ({
 
   await page.getByTestId("onboarding-display-name").fill("Morty QA");
   await page.getByTestId("onboarding-next").click();
+  await passThroughBackupStep(page);
   await expect(page.getByTestId("onboarding-page-avatar")).toBeVisible();
   await page
     .getByTestId("onboarding-avatar-url")
@@ -777,6 +839,7 @@ test("failed avatar saves can continue without saving the avatar", async ({
 
   await page.getByTestId("onboarding-display-name").fill("Morty QA");
   await page.getByTestId("onboarding-next").click();
+  await passThroughBackupStep(page);
   await expect(page.getByTestId("onboarding-page-avatar")).toBeVisible();
   await page
     .getByTestId("onboarding-avatar-url")
@@ -809,6 +872,7 @@ test("theme step offers skip instead of going back", async ({ page }) => {
 
   await page.getByTestId("onboarding-display-name").fill("Morty QA");
   await page.getByTestId("onboarding-next").click();
+  await passThroughBackupStep(page);
   await expect(page.getByTestId("onboarding-page-avatar")).toBeVisible();
   await page
     .getByTestId("onboarding-avatar-url")
@@ -890,6 +954,7 @@ test("avatar upload rejects a file whose server-detected MIME is not an image", 
 
   await page.getByTestId("onboarding-display-name").fill("Morty QA");
   await page.getByTestId("onboarding-next").click();
+  await passThroughBackupStep(page);
   await expect(page.getByTestId("onboarding-page-avatar")).toBeVisible();
   await page.getByTestId("onboarding-avatar-input").setInputFiles({
     name: "looks-like.png",
@@ -927,6 +992,7 @@ test("avatar upload accepts a file whose server-detected MIME is an image", asyn
 
   await page.getByTestId("onboarding-display-name").fill("Morty QA");
   await page.getByTestId("onboarding-next").click();
+  await passThroughBackupStep(page);
   await expect(page.getByTestId("onboarding-page-avatar")).toBeVisible();
   await page.getByTestId("onboarding-avatar-input").setInputFiles({
     name: "avatar.png",
@@ -966,13 +1032,150 @@ test("first-run onboarding keeps the shell hidden through setup and lands on Wel
   await expectWelcomeGuideIntro(page);
 });
 
+function retryToast(page: Page, title: string) {
+  return page
+    .locator("[data-sonner-toast][data-removed='false']")
+    .filter({ hasText: title });
+}
+
+async function retryToastAction(
+  page: Page,
+  { command, title }: { command: string; title: string },
+) {
+  const activeToast = retryToast(page, title);
+  await expect(activeToast).toBeVisible();
+  await expect(
+    activeToast.getByRole("button", { name: "Retry" }),
+  ).toBeVisible();
+
+  const commandCountBeforeRetry = await page.evaluate(
+    (retryCommand) =>
+      (
+        window as Window & {
+          __BUZZ_E2E_COMMANDS__?: string[];
+        }
+      ).__BUZZ_E2E_COMMANDS__?.filter((entry) => entry === retryCommand)
+        .length ?? 0,
+    command,
+  );
+  await activeToast
+    .getByRole("button", { name: "Retry" })
+    .evaluate((button) => (button as HTMLButtonElement).click());
+
+  await expect
+    .poll(() =>
+      page.evaluate(
+        ({ retryCommand }) =>
+          (
+            window as Window & {
+              __BUZZ_E2E_COMMANDS__?: string[];
+            }
+          ).__BUZZ_E2E_COMMANDS__?.filter((entry) => entry === retryCommand)
+            .length ?? 0,
+        { retryCommand: command, minimum: commandCountBeforeRetry + 1 },
+      ),
+    )
+    .toBeGreaterThanOrEqual(commandCountBeforeRetry + 1);
+}
+
+async function expectRetryFailureRecreatesActionableToast(
+  page: Page,
+  { command, error, title }: { command: string; error: string; title: string },
+) {
+  const activeToast = retryToast(page, title);
+  await expect(activeToast).toContainText(error);
+
+  await retryToastAction(page, { command, title });
+
+  await expect(activeToast).toHaveCount(1);
+  await expect(activeToast).toContainText(error);
+  await expect(
+    activeToast.getByRole("button", { name: "Retry" }),
+  ).toBeVisible();
+}
+
+async function expectRetrySuccessDismissesToast(
+  page: Page,
+  { command, title }: { command: string; title: string },
+) {
+  const activeToast = retryToast(page, title);
+
+  await retryToastAction(page, { command, title });
+
+  await expect(activeToast).toHaveCount(0);
+}
+
+test("failed Welcome and general retries recreate actionable toasts", async ({
+  page,
+}) => {
+  const welcomeError = "Mock Welcome create failed.";
+  const generalError = "Mock general join failed.";
+  await seedActiveIdentity(page, BLANK_TYLER_IDENTITY);
+  await installMockBridge(
+    page,
+    {
+      createChannelErrors: [welcomeError, welcomeError],
+      joinChannelErrors: [generalError, generalError],
+    },
+    { skipOnboardingSeed: true },
+  );
+  await page.goto("/");
+
+  await page.getByTestId("onboarding-display-name").fill("Morty QA");
+  await continueToSetupPage(page);
+  await page.getByTestId("onboarding-finish").click();
+
+  await expectRetryFailureRecreatesActionableToast(page, {
+    command: "create_channel",
+    error: welcomeError,
+    title: "Couldn't set up the Welcome channel",
+  });
+  await expectRetryFailureRecreatesActionableToast(page, {
+    command: "join_channel",
+    error: generalError,
+    title: "Couldn't join #general",
+  });
+});
+
+test("successful Welcome and general retries clear their actionable toasts", async ({
+  page,
+}) => {
+  const welcomeError = "Mock Welcome create failed.";
+  const generalError = "Mock general join failed.";
+  await seedActiveIdentity(page, BLANK_TYLER_IDENTITY);
+  await installMockBridge(
+    page,
+    {
+      createChannelErrors: [welcomeError],
+      joinChannelErrors: [generalError],
+    },
+    { skipOnboardingSeed: true },
+  );
+  await page.goto("/");
+
+  await page.getByTestId("onboarding-display-name").fill("Morty QA");
+  await continueToSetupPage(page);
+  await page.getByTestId("onboarding-finish").click();
+
+  await expectRetrySuccessDismissesToast(page, {
+    command: "create_channel",
+    title: "Couldn't set up the Welcome channel",
+  });
+  await expectRetrySuccessDismissesToast(page, {
+    command: "join_channel",
+    title: "Couldn't join #general",
+  });
+  await expectWelcomeView(page);
+  await expect(page.getByTestId("channel-general")).toBeVisible();
+});
+
 test("first-run onboarding shows setup loading until Welcome bootstrap completes", async ({
   page,
 }) => {
   await seedActiveIdentity(page, BLANK_TYLER_IDENTITY);
   await installMockBridge(
     page,
-    { createManagedAgentDelayMs: 5_000 },
+    { createManagedAgentDelayMs: 9_000 },
     { skipOnboardingSeed: true },
   );
   await page.goto("/");
@@ -984,48 +1187,60 @@ test("first-run onboarding shows setup loading until Welcome bootstrap completes
   const loadingGate = page.getByTestId("app-loading-gate");
   await expect(page.getByTestId("onboarding-gate")).toHaveCount(0);
   await expect(loadingGate).toBeVisible();
-  await expect(loadingGate).toContainText("Setting up your workspace...");
+  await expect(loadingGate).toContainText("Setting up your community...");
+
+  // The boot gate is the theme-adaptive grainient with the flapping Buzz bee
+  // as its hero. The mark must paint complete on the FIRST frame — a blank
+  // gate reads as "nothing is loading" — so nothing about it may depend on
+  // SMIL/scripted animation (<animate> count stays 0); the wing flap is pure
+  // CSS on HTML-level wing layers so it keeps running on the compositor even
+  // while boot work hogs the main thread.
   await expect(
     loadingGate.getByTestId("setup-grainient-background"),
   ).toBeVisible();
-  await expect(
-    loadingGate.getByTestId("setup-grainient-background").locator("canvas"),
-  ).toHaveCount(0);
-  await expect
-    .poll(async () =>
-      loadingGate.evaluate((element) => {
-        const wash = element.querySelector(".buzz-setup-grainient__wash");
-        if (!(wash instanceof HTMLElement)) {
-          return null;
-        }
-
-        const shellStyles = window.getComputedStyle(element);
-        const washStyles = window.getComputedStyle(wash);
-        const loadingText = element.querySelector(".buzz-setup-loading-text");
-        const textStyles =
-          loadingText instanceof HTMLElement
-            ? window.getComputedStyle(loadingText)
-            : null;
-        return {
-          animationName: washStyles.animationName,
-          backgroundMatchesTheme:
-            shellStyles.backgroundColor === washStyles.backgroundColor,
-          textAvoidsHardcodedWhite: textStyles?.color !== "rgb(255, 255, 255)",
-          usesRadialGradients:
-            washStyles.backgroundImage.includes("radial-gradient"),
-        };
-      }),
-    )
-    .toEqual({
-      animationName: "buzz-grainient-orbit",
-      backgroundMatchesTheme: true,
-      textAvoidsHardcodedWhite: true,
-      usesRadialGradients: true,
-    });
+  const mark = loadingGate.locator(".buzz-mark");
+  await expect(mark).toBeVisible();
+  const gateTreatment = await loadingGate.evaluate((element) => {
+    const markElement = element.querySelector(".buzz-mark");
+    const markSvgs = markElement
+      ? Array.from(markElement.querySelectorAll("svg"))
+      : [];
+    const wing = element.querySelector(".bee-wing");
+    const wingStyles =
+      wing instanceof SVGElement ? window.getComputedStyle(wing) : null;
+    const wash = element.querySelector(".buzz-setup-grainient__wash");
+    const washStyles =
+      wash instanceof HTMLElement ? window.getComputedStyle(wash) : null;
+    return {
+      animateElementCount: element.querySelectorAll("animate").length,
+      // The document itself must not flash white before the gate mounts
+      // (inline <style> in index.html; black fallback when no cached theme).
+      documentBackgroundColor: window.getComputedStyle(document.documentElement)
+        .backgroundColor,
+      grainientAnimation: washStyles?.animationName,
+      grainientUsesRadialGradients:
+        washStyles?.backgroundImage.includes("radial-gradient"),
+      markSvgsUseCurrentColor:
+        markSvgs.length > 0 &&
+        markSvgs.every((svg) => svg.getAttribute("fill") === "currentColor"),
+      wingFlapAnimation: wingStyles?.animationName,
+      wingFlapRunning: wingStyles?.animationPlayState,
+    };
+  });
+  expect(gateTreatment).toEqual({
+    animateElementCount: 0,
+    documentBackgroundColor: "rgb(0, 0, 0)",
+    grainientAnimation: "buzz-grainient-orbit",
+    grainientUsesRadialGradients: true,
+    markSvgsUseCurrentColor: true,
+    wingFlapAnimation: "bee-wing-left-flap",
+    wingFlapRunning: "running",
+  });
   await expect(loadingGate).not.toHaveClass(/buzz-onboarding-neutral-theme/);
   await expectShellHidden(page);
   await page.waitForTimeout(250);
   await expect(loadingGate).toBeVisible();
+  await expect(mark).toBeVisible();
 
   await expectWelcomeView(page);
   await expectPrivateWelcomeChannel(page);
@@ -1037,18 +1252,31 @@ test("existing relay profile with display name auto-skips onboarding without loc
 }) => {
   // A user whose relay profile already has a display name should skip
   // onboarding even without the localStorage completion flag.
+  // Seed alice's pubkey into searchProfiles so seedMockSearchProfiles writes
+  // has_profile_event: true into mockProfiles — the harness-intended mechanism
+  // for simulating a returning user with a real kind:0 event. Do NOT use the
+  // static mockProfiles seed (removed in PR #1508); that path collides with
+  // FIRST_RUN_ALICE (same pubkey) and breaks the first-run onboarding specs.
   await seedActiveIdentity(page, TEST_IDENTITIES.alice);
-  await installMockBridge(page, undefined, { skipOnboardingSeed: true });
+  await installMockBridge(
+    page,
+    {
+      searchProfiles: [
+        { pubkey: TEST_IDENTITIES.alice.pubkey, displayName: "alice" },
+      ],
+    },
+    { skipOnboardingSeed: true },
+  );
   await page.goto("/");
 
   await expect(page.getByTestId("onboarding-gate")).toHaveCount(0);
   await expectHomeView(page);
 });
 
-test("onboarding can import an existing key when the workspace is already set up", async ({
+test("onboarding can import an existing key when the community is already set up", async ({
   page,
 }) => {
-  // Workspace exists (default seed), but this identity has no profile yet,
+  // Community exists (default seed), but this identity has no profile yet,
   // so the app lands on the onboarding name step — Tyler's moved-laptop /
   // fresh-dev-instance case.
   await seedActiveIdentity(page, BLANK_TYLER_IDENTITY);
@@ -1220,7 +1448,7 @@ test("custom relay proxy sign-in failures use the generic reconnect card", async
   ).toContainText("Can't reach the relay");
 });
 
-test("relay access failures use the generic reconnect card", async ({
+test("community access failures use the generic reconnect card", async ({
   page,
 }) => {
   await seedActiveIdentity(page, BLANK_TYLER_IDENTITY);
@@ -1280,8 +1508,21 @@ test("existing relay profile with display name auto-completes onboarding", async
   // A user whose relay profile already has a display name should skip
   // onboarding entirely — they've already set up their identity previously
   // (possibly on another machine or app data directory).
+  // Seed alice's pubkey into searchProfiles so seedMockSearchProfiles writes
+  // has_profile_event: true into mockProfiles — the harness-intended mechanism
+  // for simulating a returning user with a real kind:0 event. Do NOT use the
+  // static mockProfiles seed (removed in PR #1508); that path collides with
+  // FIRST_RUN_ALICE (same pubkey) and breaks the first-run onboarding specs.
   await seedActiveIdentity(page, TEST_IDENTITIES.alice);
-  await installMockBridge(page, undefined, { skipOnboardingSeed: true });
+  await installMockBridge(
+    page,
+    {
+      searchProfiles: [
+        { pubkey: TEST_IDENTITIES.alice.pubkey, displayName: "alice" },
+      ],
+    },
+    { skipOnboardingSeed: true },
+  );
   await page.goto("/");
 
   await expect(page.getByTestId("onboarding-gate")).toHaveCount(0);
@@ -1432,4 +1673,187 @@ test("onboarding relay reconnect — connected without a prior click does not sh
   await expect(card).toBeVisible();
   await expect(card).toContainText("Can't reach the relay");
   await expect(card).not.toContainText("Connected");
+});
+
+test("membership denied shows all four affordances and change-community edits non-destructively", async ({
+  page,
+}) => {
+  await seedActiveIdentity(page, BLANK_TYLER_IDENTITY);
+  await installMockBridge(
+    page,
+    {
+      relayRole: null,
+    },
+    { skipOnboardingSeed: true },
+  );
+  await page.goto("/");
+
+  // Fill the display name and advance — membership check triggers denial.
+  await page.getByTestId("onboarding-display-name").fill("Morty QA");
+  await page.getByTestId("onboarding-next").click();
+
+  // Membership-denied screen renders with all four affordances.
+  const denied = page.getByTestId("membership-denied");
+  await expect(denied).toBeVisible();
+  await expect(denied.getByRole("button", { name: "Try again" })).toBeVisible();
+  await expect(denied.getByRole("button", { name: "Back" })).toBeVisible();
+  await expect(
+    denied.getByRole("button", { name: "Change community" }),
+  ).toBeVisible();
+  await expect(page.getByTestId("membership-denied-change-key")).toBeVisible();
+  await expect(
+    page.getByTestId("membership-denied-redeem-invite"),
+  ).toBeVisible();
+
+  // Click "Change community" → the overlay opens.
+  await denied.getByRole("button", { name: "Change community" }).click();
+  const overlay = page.getByTestId("community-change-overlay");
+  await expect(overlay).toBeVisible();
+
+  // Change the relay URL to a new one. The probe will time out for a fake URL
+  // so we wait for the "Use anyway" button.
+  await overlay
+    .locator("#community-edit-url")
+    .fill("wss://new-relay.example.com");
+  await overlay.getByRole("button", { name: "Save changes" }).click();
+
+  // The fields are frozen while the probe is pending, so the saved URL and
+  // any warning cannot get out of sync with a subsequent edit.
+  await expect(overlay.locator("#community-edit-url")).toBeDisabled();
+  await expect(overlay.locator("#community-edit-name")).toBeDisabled();
+  await expect(
+    overlay.getByRole("button", { name: "Use anyway" }),
+  ).toBeVisible();
+  await overlay.getByRole("button", { name: "Use anyway" }).click();
+
+  // The community update triggers a remount (reinitKey bump). The persisted
+  // community should now point to the new relay URL.
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const raw = window.localStorage.getItem("buzz-communities");
+        const communities = raw
+          ? (JSON.parse(raw) as Array<{ relayUrl?: string }>)
+          : [];
+        return communities[0]?.relayUrl ?? null;
+      }),
+    )
+    .toBe("wss://new-relay.example.com");
+
+  // Identity was NOT wiped — the override storage key is still intact.
+  await expect
+    .poll(() =>
+      page.evaluate((storageKey) => {
+        return window.localStorage.getItem(storageKey) !== null;
+      }, E2E_IDENTITY_OVERRIDE_STORAGE_KEY),
+    )
+    .toBe(true);
+});
+
+test("cancel from profile Back preserves drafts and denied Back returns to interrupted page", async ({
+  page,
+}) => {
+  await seedActiveIdentity(page, BLANK_TYLER_IDENTITY);
+  await installMockBridge(
+    page,
+    {
+      relayRole: null,
+    },
+    { skipOnboardingSeed: true },
+  );
+  await page.goto("/");
+
+  // --- Profile step: Back opens community-change overlay ---
+  const nameInput = page.getByTestId("onboarding-display-name");
+  await nameInput.fill("Morty QA");
+  await page.getByTestId("onboarding-back").click();
+
+  // The community change overlay should open.
+  const overlay = page.getByTestId("community-change-overlay");
+  await expect(overlay).toBeVisible();
+
+  // Cancel the overlay — profile should still be visible with the name intact.
+  await overlay.getByRole("button", { name: "Cancel" }).click();
+  await expect(overlay).toHaveCount(0);
+  await expect(page.getByTestId("onboarding-page-1")).toBeVisible();
+  await expect(nameInput).toHaveValue("Morty QA");
+
+  // --- Profile → membership denied → Back returns to profile ---
+  // Advance triggers membership check → denied (relayRole is null).
+  await page.getByTestId("onboarding-next").click();
+  await expect(page.getByTestId("membership-denied")).toBeVisible();
+
+  // Press Back on the denied screen — should return to the profile page
+  // (deniedFromPage = "profile") with the name draft intact.
+  await page
+    .getByTestId("membership-denied")
+    .getByRole("button", { name: "Back" })
+    .click();
+  await expect(page.getByTestId("onboarding-page-1")).toBeVisible();
+  await expect(nameInput).toHaveValue("Morty QA");
+});
+
+test("denied on relay A then paste relay B invite URL switches community to B", async ({
+  page,
+}) => {
+  await seedActiveIdentity(page, BLANK_TYLER_IDENTITY);
+  await installMockBridge(
+    page,
+    {
+      relayRole: null,
+    },
+    { skipOnboardingSeed: true },
+  );
+  await page.goto("/");
+
+  // Record the initial relay URL (relay A).
+  const initialRelayUrl = await page.evaluate(() => {
+    const raw = window.localStorage.getItem("buzz-communities");
+    const communities = raw
+      ? (JSON.parse(raw) as Array<{ relayUrl?: string }>)
+      : [];
+    return communities[0]?.relayUrl ?? null;
+  });
+  expect(initialRelayUrl).not.toBeNull();
+
+  // Fill name, advance → denied on relay A.
+  await page.getByTestId("onboarding-display-name").fill("Morty QA");
+  await page.getByTestId("onboarding-next").click();
+  await expect(page.getByTestId("membership-denied")).toBeVisible();
+
+  // Intercept the claimInvite POST to relay B so it succeeds.
+  const relayBUrl = "wss://relay-b.example.com";
+  const relayBHttpUrl = "https://relay-b.example.com";
+  await page.route(`${relayBHttpUrl}/api/invites/claim`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        status: "joined",
+        community_id: "mock-community",
+        host: "relay-b.example.com",
+        role: "member",
+      }),
+    });
+  });
+
+  // Click "Have an invite?" and enter an HTTPS invite URL for relay B.
+  await page.getByTestId("membership-denied-redeem-invite").click();
+  await page
+    .getByTestId("invite-redeem-input")
+    .fill(`${relayBHttpUrl}/invite/test-invite-code`);
+  await page.getByTestId("invite-redeem-submit").click();
+
+  // After successful claim, the community should switch to relay B's URL.
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const raw = window.localStorage.getItem("buzz-communities");
+        const communities = raw
+          ? (JSON.parse(raw) as Array<{ relayUrl?: string }>)
+          : [];
+        return communities[0]?.relayUrl ?? null;
+      }),
+    )
+    .toBe(relayBUrl);
 });

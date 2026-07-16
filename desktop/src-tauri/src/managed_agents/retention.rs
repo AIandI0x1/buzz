@@ -6,6 +6,7 @@
 //! `created_at` for NIP-33 latest-wins semantics.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -29,10 +30,9 @@ pub struct RetainedEvent {
 pub fn open_retention_db(path: &Path) -> Result<Connection, String> {
     let conn = Connection::open(path).map_err(|e| format!("failed to open retention db: {e}"))?;
 
-    conn.pragma_update(None, "journal_mode", "WAL")
-        .map_err(|e| format!("failed to set WAL mode: {e}"))?;
     conn.pragma_update(None, "busy_timeout", 5000)
         .map_err(|e| format!("failed to set busy_timeout: {e}"))?;
+    set_wal_mode(&conn)?;
 
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS persona_events (
@@ -51,6 +51,30 @@ pub fn open_retention_db(path: &Path) -> Result<Connection, String> {
     Ok(conn)
 }
 
+fn set_wal_mode(conn: &Connection) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Ok(()) => return Ok(()),
+            Err(error) if sqlite_is_busy(&error) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => return Err(format!("failed to set WAL mode: {error}")),
+        }
+    }
+}
+
+fn sqlite_is_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(inner, _)
+            if matches!(
+                inner.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
 /// Build the retention `d_tag` column value for a kind:5 tombstone row.
 ///
 /// Tombstones for all target kinds share `kind = 5` in the retention table, so
@@ -62,6 +86,26 @@ pub fn open_retention_db(path: &Path) -> Result<Connection, String> {
 /// carries the plain `a`-tag coordinate.
 pub fn tombstone_retention_d_tag(target_kind: u32, d_tag: &str) -> String {
     format!("{target_kind}:{d_tag}")
+}
+
+/// Whether a pending row must be deferred to the next sweep because a kind:5
+/// tombstone covering its coordinate failed to publish earlier in the same
+/// sweep.
+///
+/// `get_pending_sync` orders tombstones first so a deletion always reaches the
+/// relay before the replacement that supersedes it — but the flush is
+/// best-effort per row, so a tombstone that fails mid-sweep would otherwise be
+/// leapfrogged by its own replacement and then wipe it on the next sweep.
+/// Deferring the replacement restores the ordering guarantee: next sweep the
+/// `ORDER BY` puts the tombstone first again. Kind:5 rows are never deferred.
+pub fn deferred_behind_failed_tombstone(
+    kind: u32,
+    pubkey: &str,
+    d_tag: &str,
+    failed_tombstones: &std::collections::HashSet<(String, String)>,
+) -> bool {
+    kind != 5
+        && failed_tombstones.contains(&(pubkey.to_string(), tombstone_retention_d_tag(kind, d_tag)))
 }
 
 /// Upsert a persona event into the retention store.
@@ -198,12 +242,20 @@ pub fn get_retained_personas(
 }
 
 /// Get all events marked as pending sync (not yet confirmed on relay).
+///
+/// Tombstones (kind:5) sort FIRST: a delete retained in one session and its
+/// coordinate's replacement retained in a later one (B5 backfill resurrecting
+/// a deleted definition) must publish in that order — the relay's a-tag
+/// deletion soft-deletes every live row at the coordinate with no timestamp
+/// comparison, so a tombstone published AFTER the replacement would wipe it.
+/// Within each group, oldest first for the same reason.
 pub fn get_pending_sync(conn: &Connection) -> Result<Vec<RetainedEvent>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT kind, pubkey, d_tag, content, created_at, raw_event, pending_sync
              FROM persona_events
-             WHERE pending_sync = 1",
+             WHERE pending_sync = 1
+             ORDER BY (kind != 5), created_at ASC",
         )
         .map_err(|e| format!("failed to prepare pending sync query: {e}"))?;
 
@@ -315,6 +367,21 @@ pub fn get_retained_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_open_waits_for_initialization_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retention.db");
+        let first = open_retention_db(&path).unwrap();
+        first.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+        let second_path = path.clone();
+        let second = std::thread::spawn(move || open_retention_db(&second_path));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        first.execute_batch("COMMIT").unwrap();
+
+        assert!(second.join().unwrap().is_ok());
+    }
 
     fn test_db() -> Connection {
         open_retention_db(Path::new(":memory:")).unwrap()
@@ -629,5 +696,85 @@ mod tests {
             .unwrap();
         assert_eq!(row.created_at, 2000);
         assert!(!row.content.contains("Stale"));
+    }
+
+    #[test]
+    fn pending_sync_publishes_tombstones_before_replacements() {
+        // B5 resurrection race: a kind:5 retained in session N and the same
+        // coordinate's replacement 30175 retained on the next boot can sit
+        // pending together. The relay's a-tag deletion ignores timestamps,
+        // so the tombstone MUST publish first or it wipes the replacement.
+        let conn = test_db();
+        let replacement = RetainedEvent {
+            kind: 30175,
+            created_at: 2000,
+            pending_sync: true,
+            ..sample_event()
+        };
+        retain_event(&conn, &replacement).unwrap();
+        let tombstone = RetainedEvent {
+            kind: 5,
+            d_tag: tombstone_retention_d_tag(30175, "test-persona"),
+            content: String::new(),
+            created_at: 1000,
+            pending_sync: true,
+            ..sample_event()
+        };
+        retain_event(&conn, &tombstone).unwrap();
+
+        let pending = get_pending_sync(&conn).unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].kind, 5, "tombstone first");
+        assert_eq!(pending[1].kind, 30175, "replacement second");
+    }
+
+    #[test]
+    fn deferral_predicate_is_kind_and_pubkey_qualified() {
+        // Mid-sweep barrier semantics: a failed tombstone defers ONLY the
+        // replacement at its exact coordinate — same target kind, same pubkey.
+        use std::collections::HashSet;
+
+        let failed: HashSet<(String, String)> = HashSet::from([(
+            "abc123".to_string(),
+            tombstone_retention_d_tag(30175, "test-persona"),
+        )]);
+
+        // The covered replacement defers.
+        assert!(deferred_behind_failed_tombstone(
+            30175,
+            "abc123",
+            "test-persona",
+            &failed
+        ));
+        // Kind-qualified: a coinciding slug under a DIFFERENT kind is a
+        // distinct coordinate (the cross-kind collision the retention d-tag
+        // encoding exists to prevent) — never deferred.
+        assert!(!deferred_behind_failed_tombstone(
+            30177,
+            "abc123",
+            "test-persona",
+            &failed
+        ));
+        // Never crosses pubkeys.
+        assert!(!deferred_behind_failed_tombstone(
+            30175,
+            "other-key",
+            "test-persona",
+            &failed
+        ));
+        // Never defers kind:5 rows, even at a "matching" retention key.
+        assert!(!deferred_behind_failed_tombstone(
+            5,
+            "abc123",
+            "test-persona",
+            &failed
+        ));
+        // Unrelated d-tags publish normally.
+        assert!(!deferred_behind_failed_tombstone(
+            30175,
+            "abc123",
+            "other-persona",
+            &failed
+        ));
     }
 }

@@ -8,7 +8,7 @@ use tracing::{debug, error, info, warn};
 use buzz_core::event::StoredEvent;
 use buzz_core::kind::{
     event_kind_u32, is_ephemeral, AUTHOR_ONLY_KINDS, KIND_AGENT_OBSERVER_FRAME, KIND_GIFT_WRAP,
-    KIND_MESH_CONNECT_REQUEST, KIND_MESH_STATUS_REPORT, KIND_PRESENCE_UPDATE,
+    KIND_PRESENCE_UPDATE,
 };
 use buzz_core::observer::{
     content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -43,6 +43,7 @@ fn bounded_kind_label(kind: u32) -> String {
         41001 | 41010..=41012 => kind.to_string(),
         43001..=43006 => kind.to_string(),
         44100..=44101 => kind.to_string(),
+        44200 => kind.to_string(),
         45001..=45003 => kind.to_string(),
         46001..=46012 | 46020 | 46030..=46031 => kind.to_string(),
         48001 | 48100..=48103 | 48106 => kind.to_string(),
@@ -509,6 +510,7 @@ async fn dispatch_persistent_event_inner(
         let workflow_engine = Arc::clone(&state.workflow_engine);
         let workflow_event = stored_event.clone();
         let trigger_kind = kind_u32.to_string();
+        let workflow_community_host = tenant.host().to_owned();
         // The event was stored under `tenant.community()`; `StoredEvent` does
         // not carry the community, so pass it explicitly. The same channel UUID
         // can exist in another community — scoping the workflow lookup to this
@@ -522,8 +524,12 @@ async fn dispatch_persistent_event_inner(
             {
                 tracing::error!(event_id = ?workflow_event.event.id, "Workflow trigger failed: {e}");
             } else {
-                metrics::counter!("buzz_workflow_runs_total", "trigger" => trigger_kind)
-                    .increment(1);
+                metrics::counter!(
+                    "buzz_workflow_runs_total",
+                    "trigger" => trigger_kind,
+                    "community" => workflow_community_host
+                )
+                .increment(1);
             }
         });
     }
@@ -585,7 +591,19 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
         .record("kind", kind_u32);
 
     debug!(event_id = %event_id_hex, kind = kind_u32, "EVENT");
+    // Fleet-wide received counter: kind-only, no community tag.
+    // Rationale: bounded_kind_label passes through all 10k values in
+    // 20000..=29999 (client-controlled ephemeral range). Crossing kind ×
+    // community would produce up to millions of series. Keep kind fleet-wide.
     metrics::counter!("buzz_events_received_total", "kind" => kind_str.clone()).increment(1);
+    // Per-community volume counter: community-only, no kind tag.
+    // Use this for per-community throughput graphs; the fleet counter above
+    // for per-kind breakdowns.
+    metrics::counter!(
+        "buzz_community_events_received_total",
+        "community" => conn.tenant.host().to_owned()
+    )
+    .increment(1);
 
     let (conn_id, pubkey_bytes, auth_pubkey, scopes, channel_ids) = {
         let auth = conn.auth_state.read().await;
@@ -684,6 +702,8 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
     match super::ingest::ingest_event(&state, &conn.tenant, event, ingest_auth).await {
         Ok(result) => {
             if result.accepted {
+                // Fleet-wide stored counter: kind-only, no community tag.
+                // Same cardinality rationale as buzz_events_received_total above.
                 metrics::counter!("buzz_events_stored_total", "kind" => kind_str).increment(1);
                 info!(
                     event_id = %result.event_id,
@@ -782,66 +802,6 @@ async fn handle_ephemeral_event(
         // publish/fan-out path below so other relay nodes receive the live delta.
     }
 
-    // Mesh status report (kind:24620). An authenticated relay member reports its
-    // current mesh serve availability; the relay projects it into a relay-signed,
-    // per-reporter kind:30621 discovery note. The report is ephemeral input; the
-    // 30621 is the durable, relay-owned record.
-    if event_kind_u32(&event) == KIND_MESH_STATUS_REPORT {
-        let reporter_hex = auth_pubkey.to_hex();
-        match super::mesh_signaling::handle_status_report(
-            &state,
-            &conn.tenant,
-            &reporter_hex,
-            &event,
-        )
-        .await
-        {
-            Ok(()) => {
-                conn.send(RelayMessage::ok(event_id_hex, true, ""));
-            }
-            Err(reason) => {
-                conn.send(RelayMessage::ok(event_id_hex, false, &reason));
-            }
-        }
-        return;
-    }
-
-    // Mesh hole-punch signaling (kind:24621). An authenticated relay member
-    // asks the relay to coordinate a direct iroh hole-punch to a peer it found
-    // via kind:30621. The relay validates the target is also a member, then
-    // emits the paired call-me-now (kind:24622). This is the relay's ONLY role
-    // in the v1 direct-iroh mesh — validate membership + pair + fan out. It
-    // never carries iroh traffic and stores no endpoint state.
-    if event_kind_u32(&event) == KIND_MESH_CONNECT_REQUEST {
-        // Per-requester rate limit shared with the HTTP door — see
-        // `mesh_signaling::connect_request_rate_limited` for rationale.
-        if super::mesh_signaling::connect_request_rate_limited(&state, &auth_pubkey) {
-            conn.send(RelayMessage::ok(
-                event_id_hex,
-                false,
-                "rate-limited: mesh connect request rate exceeded (20/sec)",
-            ));
-            return;
-        }
-        let requester_hex = auth_pubkey.to_hex();
-        match super::mesh_signaling::handle_connect_request(
-            &state,
-            &conn.tenant,
-            &requester_hex,
-            &event,
-        )
-        .await
-        {
-            Ok(()) => {
-                conn.send(RelayMessage::ok(event_id_hex, true, ""));
-            }
-            Err(reason) => {
-                conn.send(RelayMessage::ok(event_id_hex, false, &reason));
-            }
-        }
-        return;
-    }
-
     // Check channel membership before publishing other ephemeral events.
     if let Some(ch_id) = super::ingest::extract_channel_id(&event) {
         if let Err(msg) = super::ingest::check_channel_membership(
@@ -922,6 +882,32 @@ struct AgentObserverRoute {
     agent: PublicKey,
     owner: PublicKey,
     direction: AgentObserverDirection,
+}
+
+/// Check + bump the per-agent observer telemetry limit (100/sec window).
+///
+/// Observer frames are ephemeral, but the rejection is visible to the sender.
+/// Scope the counter by community so an agent key active in one tenant does not
+/// consume another tenant's logical rate budget.
+fn observer_frame_rate_limited(
+    state: &AppState,
+    community_id: CommunityId,
+    agent_key: [u8; 32],
+) -> bool {
+    let now = std::time::Instant::now();
+    let mut entry = state
+        .observer_rate_limiter
+        .entry((community_id, agent_key))
+        .or_insert((0, now));
+    let (count, window_start) = entry.value_mut();
+    if now.duration_since(*window_start).as_secs() >= 1 {
+        *count = 1;
+        *window_start = now;
+        false
+    } else {
+        *count += 1;
+        *count > 100
+    }
 }
 
 /// Handle encrypted agent observer frames (kind 24200).
@@ -1041,25 +1027,13 @@ async fn handle_agent_observer_event(
     // be starved by bursty telemetry from the agent.
     if matches!(route.direction, AgentObserverDirection::Telemetry) {
         let agent_key: [u8; 32] = agent_bytes.as_slice().try_into().unwrap_or([0u8; 32]);
-        let now = std::time::Instant::now();
-        let mut entry = state
-            .observer_rate_limiter
-            .entry(agent_key)
-            .or_insert((0, now));
-        let (count, window_start) = entry.value_mut();
-        if now.duration_since(*window_start).as_secs() >= 1 {
-            *count = 1;
-            *window_start = now;
-        } else {
-            *count += 1;
-            if *count > 100 {
-                conn.send(RelayMessage::ok(
-                    event_id_hex,
-                    false,
-                    "rate-limited: observer frame rate exceeded (100/sec per agent)",
-                ));
-                return;
-            }
+        if observer_frame_rate_limited(&state, conn.tenant.community(), agent_key) {
+            conn.send(RelayMessage::ok(
+                event_id_hex,
+                false,
+                "rate-limited: observer frame rate exceeded (100/sec per agent)",
+            ));
+            return;
         }
     }
 
@@ -1304,6 +1278,31 @@ mod tests {
         assert!(err.contains("NIP-44"));
     }
 
+    #[tokio::test]
+    async fn observer_frame_rate_limiter_is_scoped_by_community() {
+        let state = fanout_access::test_state().await;
+        let agent_key = Keys::generate().public_key().to_bytes();
+        let community_a = buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::from_u128(0xAAAA));
+        let community_b = buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::from_u128(0xBBBB));
+
+        for _ in 0..100 {
+            assert!(!super::observer_frame_rate_limited(
+                &state,
+                community_a,
+                agent_key
+            ));
+        }
+        assert!(super::observer_frame_rate_limited(
+            &state,
+            community_a,
+            agent_key
+        ));
+        assert!(
+            !super::observer_frame_rate_limited(&state, community_b, agent_key),
+            "A's exhausted budget must not rate-limit the same agent key in B"
+        );
+    }
+
     mod pubsub_fanout {
         use std::collections::HashMap;
         use std::sync::atomic::AtomicU8;
@@ -1332,9 +1331,11 @@ mod tests {
         ) -> (Uuid, mpsc::Receiver<Message>) {
             let conn_id = Uuid::new_v4();
             let (tx, rx) = mpsc::channel(10);
+            let (ctrl_tx, _ctrl_rx) = mpsc::channel(10);
             state.conn_manager.register(
                 conn_id,
                 tx,
+                ctrl_tx,
                 CancellationToken::new(),
                 buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
                 Arc::new(AtomicU8::new(0)),
@@ -1969,9 +1970,11 @@ mod tests {
         fn register_conn(state: &AppState, pubkey: Option<Vec<u8>>) -> Uuid {
             let conn_id = Uuid::new_v4();
             let (tx, _rx) = mpsc::channel(1);
+            let (ctrl_tx, _ctrl_rx) = mpsc::channel(1);
             state.conn_manager.register(
                 conn_id,
                 tx,
+                ctrl_tx,
                 CancellationToken::new(),
                 buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
                 Arc::new(AtomicU8::new(0)),
@@ -2292,9 +2295,11 @@ mod tests {
         ) -> Uuid {
             let conn_id = Uuid::new_v4();
             let (tx, _rx) = mpsc::channel(1);
+            let (ctrl_tx, _ctrl_rx) = mpsc::channel(1);
             state.conn_manager.register(
                 conn_id,
                 tx,
+                ctrl_tx,
                 CancellationToken::new(),
                 community_id,
                 Arc::new(AtomicU8::new(0)),

@@ -4,6 +4,7 @@ import {
   useManagedAgentsQuery,
   usePersonasQuery,
   useRelayAgentsQuery,
+  useTeamsQuery,
 } from "@/features/agents/hooks";
 import {
   useChannelMembersQuery,
@@ -16,6 +17,7 @@ import {
   coalesceAutocompleteCandidatesByKey,
   getMentionableAgentPubkeys,
   getSharedChannelIds,
+  shouldHideAgentFromMentions,
 } from "@/features/agents/lib/agentAutocompleteEligibility";
 import {
   useInfiniteUserSearchQuery,
@@ -26,7 +28,6 @@ import type { AutocompleteEdit } from "./useRichTextEditor";
 import type {
   AgentPersona,
   ChannelMember,
-  ChannelRole,
   ChannelType,
   UserSearchResult,
 } from "@/shared/api/types";
@@ -34,49 +35,20 @@ import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { detectPrefixQuery } from "@/shared/lib/detectPrefixQuery";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { trimMapToSize } from "@/shared/lib/trimMapToSize";
+import { flushMentionDebounce } from "./flushMentionDebounce";
 import { hasMention } from "./hasMention";
 import { rankMentionCandidates } from "./mentionRanking";
+import { mapMentionCandidateToSuggestion } from "./mentionSuggestionMapping";
+import {
+  buildTeamMentionCandidates,
+  formatTeamMention,
+  globalSearchIdentityKey,
+  type MentionCandidate,
+  mentionCandidateLabel,
+} from "./mentionCandidates";
 
 const MENTION_DEBOUNCE_MS = 120;
 const MENTION_SUGGESTION_LIMIT = 50;
-
-type MentionCandidate = {
-  kind: "identity" | "persona";
-  pubkey?: string;
-  personaId?: string;
-  displayName: string | null;
-  avatarUrl?: string | null;
-  isMember: boolean;
-  role?: ChannelRole | null;
-  personaName?: string | null;
-  secondaryLabel?: string | null;
-  ownerPubkey?: string | null;
-  isAgent: boolean;
-  isManagedAgent?: boolean;
-  isGlobalSearchResult?: boolean;
-};
-
-function mentionCandidateLabel(candidate: MentionCandidate) {
-  return candidate.displayName ?? candidate.pubkey?.slice(0, 8) ?? "persona";
-}
-
-function globalSearchIdentityKey(candidate: MentionCandidate) {
-  if (
-    !candidate.isGlobalSearchResult ||
-    candidate.isMember ||
-    candidate.isAgent
-  ) {
-    return null;
-  }
-
-  const label = candidate.displayName?.trim().toLowerCase();
-  if (!label) {
-    return null;
-  }
-
-  const secondaryLabel = candidate.secondaryLabel?.trim().toLowerCase() ?? "";
-  return `global-person:${label}:${secondaryLabel}`;
-}
 
 export type PersonaMentionTarget = {
   displayName: string;
@@ -100,31 +72,6 @@ function formatSearchUserSecondaryLabel(user: UserSearchResult) {
   }
 
   return null;
-}
-
-function formatOwnerLabel(
-  ownerPubkey: string | null | undefined,
-  currentPubkey: string | null | undefined,
-  ownerProfiles?: UserProfileLookup,
-) {
-  if (!ownerPubkey) {
-    return null;
-  }
-
-  const normalizedOwnerPubkey = normalizePubkey(ownerPubkey);
-  if (
-    currentPubkey &&
-    normalizedOwnerPubkey === normalizePubkey(currentPubkey)
-  ) {
-    return "you";
-  }
-
-  const owner = ownerProfiles?.[normalizedOwnerPubkey];
-  return (
-    owner?.displayName?.trim() ||
-    owner?.nip05Handle?.trim() ||
-    `${ownerPubkey.slice(0, 8)}…`
-  );
 }
 
 export function useMentions(
@@ -159,6 +106,7 @@ export function useMentions(
   const relayAgentsQuery = useRelayAgentsQuery();
   const channelsQuery = useChannelsQuery();
   const personasQuery = usePersonasQuery();
+  const teamsQuery = useTeamsQuery();
   const managedAgentDirectoryReady =
     managedAgentsQuery.data !== undefined ||
     !managedAgentsQuery.isLoading ||
@@ -230,6 +178,15 @@ export function useMentions(
       ),
     [relayAgentsQuery.data],
   );
+  const directoryAgentPubkeys = React.useMemo(
+    () =>
+      new Set(
+        (relayAgentsQuery.data ?? []).map((agent) =>
+          normalizePubkey(agent.pubkey),
+        ),
+      ),
+    [relayAgentsQuery.data],
+  );
   const sharedChannelIds = React.useMemo(
     () => getSharedChannelIds(channelsQuery.data),
     [channelsQuery.data],
@@ -290,9 +247,13 @@ export function useMentions(
         return;
       }
       if (
-        candidate.isAgent &&
-        !candidate.isMember &&
-        !mentionableAgentPubkeys.has(pubkey)
+        shouldHideAgentFromMentions({
+          isAgent: candidate.isAgent === true,
+          isMember: candidate.isMember === true,
+          pubkey,
+          mentionableAgentPubkeys,
+          directoryAgentPubkeys,
+        })
       ) {
         return;
       }
@@ -332,6 +293,9 @@ export function useMentions(
 
     for (const member of members ?? []) {
       const pubkey = normalizePubkey(member.pubkey);
+      const linkedPersonaId = activePersonaById.has(pubkey)
+        ? pubkey
+        : undefined;
       const agentName =
         managedAgentNamesByPubkey.get(pubkey) ??
         relayAgentNamesByPubkey.get(pubkey) ??
@@ -348,7 +312,8 @@ export function useMentions(
           null,
         avatarUrl: profile?.avatarUrl ?? null,
         isMember: true,
-        personaId: managedAgentPersonaIdsByPubkey.get(pubkey),
+        personaId:
+          managedAgentPersonaIdsByPubkey.get(pubkey) ?? linkedPersonaId,
         isAgent:
           member.isAgent === true ||
           profile?.isAgent === true ||
@@ -366,11 +331,15 @@ export function useMentions(
     }
 
     for (const agent of relayAgentsQuery.data ?? []) {
+      const pubkey = normalizePubkey(agent.pubkey);
       addCandidate({
         kind: "identity",
-        pubkey: agent.pubkey,
+        pubkey,
         displayName: agent.name,
         isMember: false,
+        personaId:
+          managedAgentPersonaIdsByPubkey.get(pubkey) ??
+          (activePersonaById.has(pubkey) ? pubkey : undefined),
         ownerPubkey: null,
         isAgent: true,
       });
@@ -393,27 +362,25 @@ export function useMentions(
 
     if (canSearchGlobalUsers) {
       for (const user of userSearchResults) {
+        const pubkey = normalizePubkey(user.pubkey);
         addCandidate({
           kind: "identity",
-          pubkey: user.pubkey,
+          pubkey,
           displayName: formatSearchUserDisplayName(user),
           avatarUrl: user.avatarUrl ?? null,
-          personaId: managedAgentPersonaIdsByPubkey.get(
-            normalizePubkey(user.pubkey),
-          ),
+          personaId:
+            managedAgentPersonaIdsByPubkey.get(pubkey) ??
+            (activePersonaById.has(pubkey) ? pubkey : undefined),
           isMember: false,
           isAgent:
             user.isAgent ||
-            managedAgentNamesByPubkey.has(normalizePubkey(user.pubkey)) ||
-            relayAgentNamesByPubkey.has(normalizePubkey(user.pubkey)),
-          personaName:
-            personaNameByPubkey.get(normalizePubkey(user.pubkey)) ?? null,
+            managedAgentNamesByPubkey.has(pubkey) ||
+            relayAgentNamesByPubkey.has(pubkey),
+          personaName: personaNameByPubkey.get(pubkey) ?? null,
           secondaryLabel: formatSearchUserSecondaryLabel(user),
           ownerPubkey: user.ownerPubkey ?? null,
           isGlobalSearchResult: true,
-          isManagedAgent: managedAgentNamesByPubkey.has(
-            normalizePubkey(user.pubkey),
-          ),
+          isManagedAgent: managedAgentNamesByPubkey.has(pubkey),
         });
       }
     }
@@ -442,10 +409,12 @@ export function useMentions(
       },
     );
   }, [
+    activePersonaById,
     activePersonas,
     userSearchResults,
     canSearchGlobalUsers,
     currentPubkey,
+    directoryAgentPubkeys,
     isArchivedDiscovery,
     managedAgentNamesByPubkey,
     managedAgentPersonaIds,
@@ -459,6 +428,18 @@ export function useMentions(
     relayAgentNamesByPubkey,
     relayAgentsQuery.data,
   ]);
+
+  const mentionCandidatesWithTeams = React.useMemo(
+    () => [
+      ...mentionCandidates,
+      ...buildTeamMentionCandidates(
+        teamsQuery.data ?? [],
+        personasQuery.data ?? [],
+        mentionCandidates,
+      ),
+    ],
+    [mentionCandidates, personasQuery.data, teamsQuery.data],
+  );
 
   const ownerPubkeys = React.useMemo(
     () => [
@@ -478,7 +459,7 @@ export function useMentions(
     const names: string[] = [];
     const seen = new Set<string>();
 
-    for (const candidate of mentionCandidates) {
+    for (const candidate of mentionCandidatesWithTeams) {
       for (const name of [
         candidate.displayName,
         candidate.personaName,
@@ -493,7 +474,7 @@ export function useMentions(
     }
 
     return names;
-  }, [mentionCandidates]);
+  }, [mentionCandidatesWithTeams]);
 
   const highlightNames = React.useMemo<string[]>(() => {
     const names: string[] = [];
@@ -537,6 +518,7 @@ export function useMentions(
   );
   const latestValueRef = React.useRef<string>("");
   const latestCursorRef = React.useRef<number>(0);
+  const flushedMentionStartIndexRef = React.useRef<number | null>(null);
   const searchableNamesLowerRef = React.useRef<string[]>(searchableNamesLower);
 
   // Keep the known-names ref in sync so the debounced callback never reads stale data.
@@ -559,44 +541,28 @@ export function useMentions(
     }
 
     return rankMentionCandidates(
-      mentionCandidates,
+      mentionCandidatesWithTeams,
       mentionQuery,
       activePersonaIds,
     )
-      .slice(0, Math.max(MENTION_SUGGESTION_LIMIT, mentionCandidates.length))
-      .map(({ candidate, label }) => {
-        const ownerLabel = candidate.isAgent
-          ? formatOwnerLabel(
-              candidate.ownerPubkey,
-              currentPubkey,
-              ownerProfilesQuery.data?.profiles,
-            )
-          : null;
-        const notInChannel =
-          options?.channelType !== "dm" && candidate.isMember === false;
-
-        return {
-          pubkey: candidate.pubkey,
-          personaId: candidate.personaId,
-          kind: candidate.kind,
-          displayName: label,
-          avatarUrl:
-            candidate.avatarUrl ??
-            (candidate.pubkey
-              ? profiles?.[normalizePubkey(candidate.pubkey)]?.avatarUrl
-              : null) ??
-            null,
-          isAgent: candidate.isAgent,
-          notInChannel,
-          ownerLabel,
-          role:
-            !candidate.isAgent && candidate.role === "admin" ? "admin" : null,
-        };
-      });
+      .slice(
+        0,
+        Math.max(MENTION_SUGGESTION_LIMIT, mentionCandidatesWithTeams.length),
+      )
+      .map(({ candidate, label }) =>
+        mapMentionCandidateToSuggestion({
+          candidate,
+          label,
+          channelType: options?.channelType,
+          currentPubkey,
+          ownerProfiles: ownerProfilesQuery.data?.profiles,
+          profiles,
+        }),
+      );
   }, [
     activePersonaIds,
     currentPubkey,
-    mentionCandidates,
+    mentionCandidatesWithTeams,
     mentionQuery,
     options?.channelType,
     ownerProfilesQuery.data?.profiles,
@@ -655,45 +621,49 @@ export function useMentions(
       }
 
       const displayName = suggestion.displayName;
-      const insertText = `@${displayName} `;
+      const teamMembers =
+        suggestion.kind === "team" ? suggestion.teamMembers : null;
+      const insertText = teamMembers
+        ? formatTeamMention(displayName, teamMembers)
+        : `@${displayName} `;
 
       const mentions = mentionMapRef.current;
       const personaMentions = personaMentionMapRef.current;
-      if (suggestion.kind === "persona" && suggestion.personaId) {
-        personaMentions.set(displayName, suggestion.personaId);
-        mentions.delete(displayName);
-      } else if (suggestion.pubkey) {
-        mentions.set(displayName, suggestion.pubkey);
-        personaMentions.delete(displayName);
+      const selectedMentions = teamMembers ?? [suggestion];
+      for (const selected of selectedMentions) {
+        if (selected.kind === "persona" && selected.personaId) {
+          personaMentions.set(selected.displayName, selected.personaId);
+          mentions.delete(selected.displayName);
+        } else if (selected.pubkey) {
+          mentions.set(selected.displayName, selected.pubkey);
+          personaMentions.delete(selected.displayName);
+        }
       }
       setSelectedMentionNames((current) => {
-        if (
-          current.some(
-            (name) => name.toLowerCase() === displayName.toLowerCase(),
-          )
-        ) {
-          return current;
-        }
-
-        return [...current, displayName];
+        const known = new Set(current.map((name) => name.toLowerCase()));
+        return [
+          ...current,
+          ...selectedMentions
+            .map((selected) => selected.displayName)
+            .filter((name) => !known.has(name.toLowerCase())),
+        ];
       });
       const isAgentMention =
         suggestion.kind === "persona" ||
+        suggestion.kind === "team" ||
         suggestion.isAgent === true ||
         (suggestion.pubkey
           ? knownAgentPubkeys.has(normalizePubkey(suggestion.pubkey))
           : false);
       if (isAgentMention) {
         setSelectedAgentMentionNames((current) => {
-          if (
-            current.some(
-              (name) => name.toLowerCase() === displayName.toLowerCase(),
-            )
-          ) {
-            return current;
-          }
-
-          return [...current, displayName];
+          const known = new Set(current.map((name) => name.toLowerCase()));
+          return [
+            ...current,
+            ...selectedMentions
+              .map((selected) => selected.displayName)
+              .filter((name) => !known.has(name.toLowerCase())),
+          ];
         });
       }
       trimMapToSize(mentions, 200);
@@ -701,8 +671,11 @@ export function useMentions(
       setMentionQuery(null);
       setMentionSelectedIndex(0);
 
+      const startIndex =
+        flushedMentionStartIndexRef.current ?? mentionStartIndex;
+      flushedMentionStartIndexRef.current = null;
       return {
-        replaceFromOffset: mentionStartIndex,
+        replaceFromOffset: startIndex,
         replaceToOffset: selectionEnd,
         insertText,
       };
@@ -923,6 +896,34 @@ export function useMentions(
           !event.shiftKey)
       ) {
         event.preventDefault();
+
+        // If a debounce is pending, the suggestions array reflects a stale query.
+        // Flush: re-detect synchronously and re-derive the correct suggestion.
+        if (debounceTimerRef.current !== null) {
+          const flushed = flushMentionDebounce({
+            debounceTimerRef,
+            latestValueRef,
+            latestCursorRef,
+            searchableNamesLowerRef,
+            candidates: mentionCandidatesWithTeams,
+            activePersonaIds,
+            channelType: options?.channelType,
+            currentPubkey,
+            ownerProfiles: ownerProfilesQuery.data?.profiles,
+            profiles,
+          });
+          if (flushed?.type === "match") {
+            flushedMentionStartIndexRef.current = flushed.startIndex;
+            setMentionQuery(null); // reset so dropdown closes
+            return { handled: true, suggestion: flushed.suggestion };
+          }
+          if (flushed?.type === "no-match") {
+            setMentionQuery(null);
+            return { handled: true };
+          }
+          // Plain `@` after flush intentionally falls through to existing suggestions.
+        }
+
         return { handled: true, suggestion: suggestions[mentionSelectedIndex] };
       }
 
@@ -934,7 +935,17 @@ export function useMentions(
 
       return { handled: false };
     },
-    [isMentionOpen, mentionSelectedIndex, suggestions],
+    [
+      activePersonaIds,
+      currentPubkey,
+      isMentionOpen,
+      mentionCandidatesWithTeams,
+      mentionSelectedIndex,
+      options?.channelType,
+      ownerProfilesQuery.data?.profiles,
+      profiles,
+      suggestions,
+    ],
   );
 
   return {

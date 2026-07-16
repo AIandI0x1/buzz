@@ -43,13 +43,20 @@ bootstrap:
 setup: bootstrap
     ./scripts/dev-setup.sh
 
-# Install git hooks via lefthook
+# Install git hooks via lefthook (dispatches from the shared .git/hooks dir so all
+# linked worktrees inherit the same hooks without a worktree-relative .hooks path)
 hooks:
-    git config --local core.hooksPath .hooks
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # --path-format=absolute guarantees an absolute path from every invocation context:
+    # without it, --git-common-dir returns ".git" from the main checkout and a
+    # relative hooksPath would break linked-worktree dispatch just like .hooks did.
+    HOOKS_DIR="$(git rev-parse --path-format=absolute --git-common-dir)/hooks"
+    git config --local core.hooksPath "$HOOKS_DIR"
     lefthook install --force
 
-# ⚠️  Wipe ALL data and recreate a clean environment
-[confirm("This will DELETE all local data. Continue? (y/N)")]
+# Wipe development state and recreate a clean environment. Installed Buzz is preserved.
+[confirm("This will DELETE all development data and preserve installed Buzz. Continue? (y/N)")]
 reset:
     ./scripts/dev-reset.sh --yes
 
@@ -244,6 +251,9 @@ test-unit:
         # replay — so it belongs in the unit job. Run all targets (lib + the
         # tests/replay_fixtures.rs integration test), not just --lib.
         cargo nextest run -p buzz-conformance
+        # Gateway unit and black-box HTTP tests are infra-free. Postgres-backed
+        # contract/race tests run in the dedicated CI job below.
+        cargo nextest run -p buzz-push-gateway
     else
         ./scripts/run-tests.sh unit
     fi
@@ -252,17 +262,54 @@ test-unit:
 test-integration:
     ./scripts/run-tests.sh integration
 
-# Mesh-compute e2e: the CI-safe layers (relay mesh signaling invariants + Playwright UI)
+# Buzz shared compute e2e: current desktop discovery/admission logic and
+# Playwright UI coverage.
 mesh-e2e:
-    cargo test -p buzz-relay mesh_signaling
-    cd {{desktop_dir}} && pnpm test:e2e:integration -- mesh-compute.spec.ts
+    cargo test --manifest-path {{desktop_dir}}/src-tauri/Cargo.toml --features mesh-llm mesh_llm --lib
+    cd {{desktop_dir}} && pnpm test:e2e:smoke -- mesh-compute.spec.ts
 
-# Mesh-compute Layer 1: REAL serve->client->inference on this machine (not CI)
+# Reset only development state, seed deterministic local channels, and launch
+# the mesh-enabled desktop with the repository's public Tyler test identity.
+# This is for local verification only; never point this identity at staging/prod.
+[confirm("This will reset development data, preserve installed Buzz, then launch a seeded mesh dev app. Continue? (y/N)")]
+mesh-dev-fresh:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ./scripts/dev-reset.sh --yes
+    ./scripts/setup-desktop-test-data.sh
+    export BUZZ_PRIVATE_KEY="3dbaebadb5dfd777ff25149ee230d907a15a9e1294b40b830661e65bb42f6c03"
+    export BUZZ_REQUIRE_RELAY_MEMBERSHIP=true
+    export BUZZ_ALLOW_NIP_OA_AUTH=true
+    export RELAY_OWNER_PUBKEY="e5ebc6cdb579be112e336cc319b5989b4bb6af11786ea90dbe52b5f08d741b34"
+    export BUZZ_RELAY_PRIVATE_KEY="0000000000000000000000000000000000000000000000000000000000000001"
+    export BUZZ_RECONCILE_CHANNELS=true
+    export BUZZ_RESET_WEBVIEW_STATE=1
+    exec just mesh=1 dev
+
+# Real serve->client->inference on this machine (not CI).
 mesh-e2e-hardware:
     #!/usr/bin/env bash
     set -euo pipefail
     export MESH_LLM_NATIVE_RUNTIME_CACHE_DIR="$(./scripts/ensure-mesh-native-runtime.sh)"
     cargo run -p buzz-relay --example mesh_serve_client_smoke
+
+# Three isolated node processes: trusted member joins and infers; stranger is rejected.
+# Uses temp homes and explicit mesh owner keystores. Never reads the Buzz Keychain.
+mesh-e2e-admission:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export MESH_LLM_NATIVE_RUNTIME_CACHE_DIR="$(./scripts/ensure-mesh-native-runtime.sh)"
+    cargo run -p buzz-relay --example mesh_admission_smoke
+
+# Full hardware confidence suite: routing, owner admission, and real agent inference.
+mesh-e2e-confidence:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export MESH_LLM_NATIVE_RUNTIME_CACHE_DIR="$(./scripts/ensure-mesh-native-runtime.sh)"
+    cargo build --release -p buzz-agent -p buzz-dev-mcp
+    cargo run -p buzz-relay --example mesh_serve_client_smoke
+    cargo run -p buzz-relay --example mesh_admission_smoke
+    cargo run -p buzz-relay --example mesh_agent_e2e
 
 # Take desktop screenshots using the mock bridge
 desktop-screenshot *ARGS:
@@ -321,19 +368,38 @@ dev *ARGS: bootstrap _ensure-sidecar-stubs _ensure-migrations
         done
     fi
     cargo build -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p buzz-cli -p git-credential-nostr -p buzz-relay
+    if [[ -n "{{mesh}}" ]]; then
+        export MESH_LLM_NATIVE_RUNTIME_CACHE_DIR="$(./scripts/ensure-mesh-native-runtime.sh)"
+    fi
+    # Docker Desktop's forwarded MinIO port can stall under the deployment
+    # probe's 32 concurrent writers. Keep the gate enabled in local dev, using
+    # the bounded profile already used by the relay test launcher.
+    export BUZZ_GIT_PROBE_WRITERS="${BUZZ_GIT_PROBE_WRITERS:-8}"
+    export BUZZ_GIT_PROBE_ROUNDS="${BUZZ_GIT_PROBE_ROUNDS:-2}"
     ./target/debug/buzz-relay &
     RELAY_PID=$!
-    sleep 1
-    if ! kill -0 "$RELAY_PID" 2>/dev/null; then
-        echo "Error: buzz-relay exited during startup; refusing to launch desktop against a stale relay." >&2
-        wait "$RELAY_PID" || true
-        exit 1
-    fi
     cleanup() {
         [[ -n "${INSTANCE_ID:-}" ]] && ../scripts/cleanup-instance-agents.sh "$INSTANCE_ID" || true
         kill "$RELAY_PID" 2>/dev/null || true
     }
     trap cleanup EXIT
+    relay_ready=false
+    for _ in $(seq 1 120); do
+        if ! kill -0 "$RELAY_PID" 2>/dev/null; then
+            echo "Error: buzz-relay exited during startup; refusing to launch desktop." >&2
+            wait "$RELAY_PID" || true
+            exit 1
+        fi
+        if curl --silent --fail --max-time 1 "http://127.0.0.1:${health_port}/_readiness" >/dev/null; then
+            relay_ready=true
+            break
+        fi
+        sleep 0.5
+    done
+    if [[ "$relay_ready" != true ]]; then
+        echo "Error: buzz-relay did not become healthy within 60 seconds; refusing to launch desktop." >&2
+        exit 1
+    fi
     cd {{desktop_dir}}
     [[ -d node_modules ]] || pnpm install
     source ../scripts/instance-env.sh
@@ -356,7 +422,8 @@ staging *ARGS: bootstrap _ensure-sidecar-stubs
     fi
     # Replace the 0-byte sidecar stub with the real CLI binary so tauri dev picks it up.
     TARGET=$(rustc -vV | sed -n 's|host: ||p')
-    cp target/release/buzz "desktop/src-tauri/binaries/buzz-${TARGET}"
+    TARGET_DIR=$(cargo metadata --format-version 1 --no-deps | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).target_directory")
+    cp "${TARGET_DIR}/release/buzz" "desktop/src-tauri/binaries/buzz-${TARGET}"
     chmod +x "desktop/src-tauri/binaries/buzz-${TARGET}"
     cd {{desktop_dir}}
     export BUZZ_RELAY_URL="wss://sprout-oss.stage.blox.sqprod.co"
@@ -435,6 +502,10 @@ mobile-check:
 # Run mobile tests
 mobile-test:
     unset GIT_DIR GIT_WORK_TREE; cd {{mobile_dir}} && flutter test
+
+# Compile an unsigned Android debug APK
+mobile-build-android:
+    unset GIT_DIR GIT_WORK_TREE; cd {{mobile_dir}} && flutter build apk --debug --no-pub
 
 # Run the mobile app on iOS simulator
 mobile-dev:
@@ -601,6 +672,7 @@ _release-pr lane version:
             TAG_PREFIX="v"
             CHANGELOG="CHANGELOG.md"
             ADD_FILES=(desktop/package.json desktop/src-tauri/tauri.conf.json desktop/src-tauri/Cargo.toml desktop/src-tauri/Cargo.lock pnpm-lock.yaml CHANGELOG.md)
+            LOG_PATHS=(desktop/ crates/buzz-core/ crates/buzz-persona/ crates/buzz-sdk/ crates/buzz-agent/)
             ARTIFACT="Buzz Desktop" ;;
         relay)
             BRANCH_PREFIX="relay-release"
@@ -610,6 +682,7 @@ _release-pr lane version:
             TAG_PREFIX="relay-v"
             CHANGELOG="crates/buzz-relay/CHANGELOG.md"
             ADD_FILES=(crates/buzz-relay/Cargo.toml Cargo.lock crates/buzz-relay/CHANGELOG.md)
+            LOG_PATHS=(crates/buzz-relay/ crates/buzz-core/ crates/buzz-db/ crates/buzz-auth/ crates/buzz-pubsub/ crates/buzz-search/ crates/buzz-audit/ crates/buzz-media/ crates/buzz-sdk/ crates/buzz-workflow/ crates/buzz-conformance/ migrations/)
             ARTIFACT="Buzz Relay" ;;
         mobile)
             BRANCH_PREFIX="mobile-release"
@@ -619,6 +692,7 @@ _release-pr lane version:
             TAG_PREFIX="mobile-v"
             CHANGELOG="mobile/CHANGELOG.md"
             ADD_FILES=(mobile/pubspec.yaml mobile/pubspec.lock mobile/CHANGELOG.md)
+            LOG_PATHS=(mobile/)
             ARTIFACT="Buzz Mobile" ;;
         *)
             echo "Error: unknown release lane '{{ lane }}'"
@@ -667,7 +741,7 @@ _release-pr lane version:
     REPO=$(git remote get-url origin | sed -E 's|.*github\.com[:/]||; s|\.git$||')
     format_log() {
         local range="$1"
-        git log "$range" --format="%h %H %s" --no-merges | while IFS=' ' read -r short full rest; do
+        git log "$range" --format="%h %H %s" --no-merges -- "${LOG_PATHS[@]}" | while IFS=' ' read -r short full rest; do
             local pr subject
             pr=$(printf '%s' "$rest" | grep -oE '\(#[0-9]+\)$' | grep -oE '[0-9]+' || true)
             if [[ -n "$pr" ]]; then
@@ -711,7 +785,17 @@ _release-pr lane version:
     PR_BODY="## ${ARTIFACT} release v${VERSION}"$'\n\n'
     if [[ -n "$LAST_TAG" ]]; then
         PR_BODY+="### Changes since ${LAST_TAG}:"$'\n\n'
-        PR_BODY+="$(format_log "${LAST_TAG}..HEAD~1")"$'\n\n'
+        CHANGELOG_BODY=$(format_log "${LAST_TAG}..HEAD~1")
+        MAX_LOG=62000
+        if (( ${#CHANGELOG_BODY} > MAX_LOG )); then
+            TRUNCATED=$(printf '%s' "$CHANGELOG_BODY" | awk -v max="$MAX_LOG" \
+                'BEGIN{n=0} {line_len=length($0)+1; if(n+line_len>max) exit; n+=line_len; print}')
+            SHOWN=$(printf '%s\n' "$TRUNCATED" | grep -c '^-' || true)
+            TOTAL=$(printf '%s\n' "$CHANGELOG_BODY" | grep -c '^-' || true)
+            SKIPPED=$(( TOTAL - SHOWN ))
+            CHANGELOG_BODY="${TRUNCATED}"$'\n'"_… and ${SKIPPED} more commits — [compare ${LAST_TAG}…${TAG_PREFIX}${VERSION}](https://github.com/${REPO}/compare/${LAST_TAG}...${TAG_PREFIX}${VERSION})_"
+        fi
+        PR_BODY+="${CHANGELOG_BODY}"$'\n\n'
     else
         PR_BODY+="Initial release."$'\n\n'
     fi
@@ -748,3 +832,17 @@ goose-bg relay="ws://localhost:3000" agents="1" heartbeat="0" prompt="" key="$BU
     source ./scripts/_goose-env.sh "{{relay}}" "{{key}}" "{{agents}}" "{{heartbeat}}" "{{prompt}}"
     screen -dmS goose-agent-{{agents}} bash -c "$(printf '%q ' env "${env_args[@]}") ./target/release/buzz-acp"
     echo "Agent running in screen session 'goose-agent-{{agents}}'. Attach with: screen -r goose-agent-{{agents}}"
+
+# ─── Benchmarking ─────────────────────────────────────────────────────────────
+
+# Run the Buzz orchestra benchmark — leaderboard-eligible by default (TB 2.1, k=5, Sonnet+Haiku). Stands up its own Docker stack; --gui opens a live spectator desktop app; other flags pass to benchmark.py (--dataset/--path, --include-task, --attempts, --manifest, --dry-run, ...)
+benchmark *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export PATH="{{justfile_directory()}}/bin:$PATH"
+    uv run --project benchmarks/harbor-buzz-orchestra/testbed \
+        benchmarks/harbor-buzz-orchestra/scripts/benchmark.py {{ARGS}}
+
+# Stop the benchmark Docker stack (state and channels are kept)
+benchmark-down:
+    docker compose --project-name buzz-benchmark down

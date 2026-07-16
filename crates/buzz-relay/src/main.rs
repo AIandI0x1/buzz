@@ -1,11 +1,14 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use uuid::Uuid;
 
 use buzz_audit::AuditService;
 use buzz_auth::AuthService;
+use buzz_core::CommunityId;
 use buzz_db::{Db, DbConfig};
 use buzz_pubsub::PubSubManager;
 use buzz_search::SearchService;
@@ -16,6 +19,7 @@ use buzz_relay::router::{build_health_router, build_router};
 use buzz_relay::state::AppState;
 use buzz_relay::telemetry;
 use buzz_workflow::WorkflowEngine;
+use tokio_util::sync::CancellationToken;
 
 fn buzz_auto_migrate_enabled(value: Option<&str>) -> bool {
     value.map(str::trim).is_some_and(|value| {
@@ -25,6 +29,54 @@ fn buzz_auto_migrate_enabled(value: Option<&str>) -> bool {
         )
     })
 }
+
+/// Controls how many per-community gauge series the usage poller emits.
+///
+/// Datadog cost is proportional to the number of unique time-series.  With ~25
+/// gauge label combinations per community, a relay hosting thousands of
+/// communities would incur five-figure monthly costs if every community always
+/// gets a full set of series.  This knob is the cost lever.
+///
+/// Fleet-wide totals (`buzz_total_*`) always emit regardless of mode.
+///
+/// Set via `BUZZ_USAGE_METRICS_PER_COMMUNITY`:
+///   - `all` — emit per-community series for every community (default)
+///   - `off` — suppress all per-community series; fleet totals only
+///
+/// A `top:<k>` mode (per-community series for the k most-active communities)
+/// is planned as a fast-follow once the series-lifecycle (gauge idle-timeout
+/// and stable tie-breaking across pods) is fully designed.
+#[derive(Debug, Clone)]
+enum EmissionScope {
+    All,
+    Off,
+}
+
+impl EmissionScope {
+    fn from_env() -> Self {
+        let raw = std::env::var("BUZZ_USAGE_METRICS_PER_COMMUNITY")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        match raw.as_str() {
+            "" | "all" => EmissionScope::All,
+            "off" => EmissionScope::Off,
+            other => {
+                warn!(
+                    value = other,
+                    "BUZZ_USAGE_METRICS_PER_COMMUNITY: unknown value — defaulting to all"
+                );
+                EmissionScope::All
+            }
+        }
+    }
+
+    fn allows(&self, _community_id: &Uuid) -> bool {
+        matches!(self, Self::All)
+    }
+}
+
+const USAGE_METRICS_LOCK_KEY: i64 = 0x4255_5A5A_4D45_5452;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -79,9 +131,12 @@ async fn main() -> anyhow::Result<()> {
         "Config loaded"
     );
 
-    relay_metrics::install(config.metrics_port);
+    let usage_interval_secs = usage_metrics_interval_secs();
+    let usage_idle_timeout_secs = usage_metrics_idle_timeout_secs(usage_interval_secs);
+    relay_metrics::install(config.metrics_port, usage_idle_timeout_secs);
     info!(
         port = config.metrics_port,
+        idle_timeout_secs = usage_idle_timeout_secs,
         "Prometheus metrics exporter started"
     );
 
@@ -273,6 +328,12 @@ async fn main() -> anyhow::Result<()> {
     let pubsub_for_cache = Arc::clone(&pubsub);
     tokio::spawn(async move { pubsub_for_cache.run_cache_invalidation_subscriber().await });
 
+    // Spawn Redis pub/sub subscriber for cross-pod connection-control commands.
+    // Bans recorded on other pods are received here and applied to any local
+    // sockets (via the consumer loop below), enforcing live disconnect fan-out.
+    let pubsub_for_conn_ctrl = Arc::clone(&pubsub);
+    tokio::spawn(async move { pubsub_for_conn_ctrl.run_conn_control_subscriber().await });
+
     let auth = AuthService::new(config.auth.clone());
 
     // Postgres FTS: the searchable row IS the persisted event row (its
@@ -334,6 +395,34 @@ async fn main() -> anyhow::Result<()> {
     );
     let state = Arc::new(app_state);
 
+    // Inter-relay mesh (BUZZ_MESH seam). `boot_mesh` returns None when the
+    // kill switch is off — nothing is bound, published, or spawned, so the
+    // relay behaves byte-identically to a build without the mesh. When
+    // enabled, a misconfigured mesh is fatal here (bind/Redis failure): an
+    // operator who asked for the mesh gets it or gets told why not.
+    if let Some(handle) = buzz_relay::mesh_boot::boot_mesh(
+        &state.config,
+        state.redis_pool.clone(),
+        &state.relay_keypair,
+        Arc::clone(&state.shutting_down),
+    )
+    .await?
+    {
+        let runtime_id = handle.local_runtime_id;
+        // Register the per-profile inbound consumers (huddle datagram fan-in,
+        // HuddleControl accept loop, reliable-stream accept + optional
+        // BUZZ_MESH_DEMO_ECHO) before peers can route traffic here.
+        handle.wire_consumers(
+            Arc::clone(&state.audio_rooms),
+            state.config.mesh_demo_echo,
+            Arc::clone(&state.shutting_down),
+        );
+        if state.mesh.set(handle).is_err() {
+            unreachable!("mesh handle is set exactly once, right here");
+        }
+        info!(runtime_id = %runtime_id, "Inter-relay mesh started");
+    }
+
     // Git-on-object-storage: admit the configured S3/MinIO backend against the
     // linearizable conditional-write axiom (A3) before serving git traffic.
     // Failure is fatal: a backend that cannot satisfy pointer CAS invalidates
@@ -375,38 +464,31 @@ async fn main() -> anyhow::Result<()> {
     // NIP-43: publish the initial membership list on startup so clients can
     // REQ kind:13534 immediately without waiting for the next membership change.
     if config.require_relay_membership {
-        let startup_state = Arc::clone(&state);
-        tokio::spawn(async move {
-            // Resolve the deployment's community from the configured relay URL
-            // host (single-community per deployment), failing closed if the host
-            // isn't mapped — the membership list is community-scoped now, so the
-            // relay-signed startup publish must carry a resolved tenant.
-            let tenant = match buzz_relay::tenant::bind_deployment_community(
-                &startup_state.db,
-                &startup_state.config.relay_url,
-            )
+        // Resolve the deployment's community from the configured relay URL
+        // host (single-community per deployment), failing closed if the host
+        // isn't mapped. Await publication before opening the listener so the
+        // first client query observes the roster.
+        match buzz_relay::tenant::bind_deployment_community(&state.db, &state.config.relay_url)
             .await
-            {
-                Ok(ctx) => ctx,
-                Err(e) => {
-                    tracing::warn!(
-                        error = ?e,
-                        "initial NIP-43 membership list skipped: relay host is not mapped to a community"
-                    );
-                    return;
+        {
+            Ok(tenant) => {
+                if let Err(e) = buzz_relay::handlers::side_effects::publish_nip43_membership_list(
+                    &tenant, &state,
+                )
+                .await
+                {
+                    tracing::warn!(error = %e, "failed to publish initial NIP-43 membership list on startup");
+                } else {
+                    tracing::info!("NIP-43 membership list published on startup");
                 }
-            };
-            if let Err(e) = buzz_relay::handlers::side_effects::publish_nip43_membership_list(
-                &tenant,
-                &startup_state,
-            )
-            .await
-            {
-                tracing::warn!(error = %e, "failed to publish initial NIP-43 membership list on startup");
-            } else {
-                tracing::info!("NIP-43 membership list published on startup");
             }
-        });
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    "initial NIP-43 membership list skipped: relay host is not mapped to a community"
+                );
+            }
+        }
     }
 
     // Emit kind:39000/39002 discovery events for channels that exist in the DB
@@ -545,6 +627,17 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         });
+    }
+
+    // NIP-PL matcher and worker are enabled as one unit. Lease acceptance is
+    // already disabled without the exact gateway URL, so discovery and runtime
+    // cannot advertise or accumulate work for an undeliverable configuration.
+    if state.config.push_gateway_delivery_url.is_some() {
+        tokio::spawn(buzz_relay::push_runtime::run_matcher(Arc::clone(&state)));
+        tokio::spawn(buzz_relay::push_runtime::run_delivery_worker(Arc::clone(
+            &state,
+        )));
+        info!("NIP-PL push matcher and delivery worker started");
     }
 
     // NIP-ER reminder scheduler — polls for due reminders and publishes them
@@ -710,10 +803,10 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 match rx.recv().await {
                     Ok(scoped) => {
-                        // The local moka caches key on globally-unique UUIDs /
-                        // pubkeys, so applying the tenant-local op by key is
-                        // correct regardless of community; the `community_id`
-                        // scope rides the Redis topic, not the moka key.
+                        // The Redis topic carries the originating community,
+                        // and the local moka keys carry that same label. Apply
+                        // only the matching tenant-local drop; a mutation in A
+                        // must not flush B's derived state.
                         state_for_cache
                             .apply_cache_invalidation(scoped.community_id, scoped.invalidation);
                     }
@@ -723,6 +816,68 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         tracing::error!("Cache-invalidation broadcast channel closed");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    // Durable lifecycle backstop: Redis pub/sub cannot deliver to a pod that was
+    // offline. Periodically revalidate only communities with local live sockets
+    // so missed archive commands still converge without a global DB scan.
+    {
+        let lifecycle_state = Arc::clone(&state);
+        let interval_secs = std::env::var("BUZZ_COMMUNITY_REVALIDATE_INTERVAL_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(30)
+            .clamp(1, 300);
+        let cancel = lifecycle_state.community_revalidator_cancel.clone();
+        tokio::spawn(run_community_revalidator(
+            lifecycle_state,
+            std::time::Duration::from_secs(interval_secs),
+            cancel,
+        ));
+    }
+
+    // Cross-pod connection-control consumer: receive disconnect commands from
+    // Redis pub/sub (published by the pod that recorded a ban) and close any
+    // matching local sockets. A member's live connections may land on any pod,
+    // so this is how a ban reaches sockets the banning pod does not hold. The DB
+    // ban row is the durable backstop; even a dropped command still refuses the
+    // banned member's next auth attempt at the auth seam.
+    {
+        let state_for_conn_ctrl = Arc::clone(&state);
+        let mut rx = state_for_conn_ctrl.pubsub.subscribe_conn_control();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(scoped) => match scoped.command {
+                        buzz_pubsub::conn_control::ConnControl::DisconnectCommunity => {
+                            state_for_conn_ctrl
+                                .community_connections
+                                .disconnect_community(scoped.community_id);
+                        }
+                        buzz_pubsub::conn_control::ConnControl::DisconnectPubkey {
+                            pubkey,
+                            event_id,
+                            reason,
+                        } => {
+                            state_for_conn_ctrl.conn_manager.disconnect_pubkey(
+                                scoped.community_id,
+                                &pubkey,
+                                &event_id,
+                                &reason,
+                            );
+                        }
+                    },
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        metrics::counter!("buzz_conn_control_lag_total").increment(n);
+                        tracing::warn!("Connection-control consumer lagged by {n} messages");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::error!("Connection-control broadcast channel closed");
                         break;
                     }
                 }
@@ -761,7 +916,59 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Usage metrics: periodic background task polling per-community stats.
+    //
+    // DB-derived gauges (users, channels, messages, members, workflows, git
+    // repos, active users/channels) are SET from GROUP BY queries — one per
+    // tick. In-memory gauges (ws_connections, subscriptions, users_online)
+    // are snapshotted from live in-memory state. Both avoid inc/dec drift.
+    //
+    // Multi-pod semantics:
+    //   DB-derived: all pods export the same value → dashboard uses max()
+    //   In-memory:  each pod exports its partition → dashboard uses sum()
+    {
+        let usage_state = Arc::clone(&state);
+        let emission_scope = EmissionScope::from_env();
+        let interval_secs = usage_interval_secs;
+        let mut leader = None;
+        let mut emitted_in_memory = HashSet::new();
+        tokio::spawn(async move {
+            // Jitter the first tick by a random fraction of the interval so
+            // that a rolling deploy with N pods doesn't hammer the DB
+            // simultaneously at boot. Each pod picks a start delay in
+            // [0, interval_secs) using true per-process randomness (PID-derived
+            // seeds are unsafe in containers where the relay is typically PID 1
+            // in every pod, which would make all pods compute the same delay).
+            let jitter_secs = rand::random::<u64>() % interval_secs;
+            tokio::time::sleep(std::time::Duration::from_secs(jitter_secs)).await;
+
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            // Skip a tick rather than scheduling a burst of catch-up ticks if
+            // the system falls behind (e.g. the previous tick took > interval).
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if let Err(e) = run_usage_metrics_tick(
+                    &usage_state,
+                    &emission_scope,
+                    &mut leader,
+                    &mut emitted_in_memory,
+                )
+                .await
+                {
+                    error!(error = %e, "Usage metrics tick failed — skipping");
+                }
+                metrics::gauge!("buzz_usage_poller_is_leader").set(if leader.is_some() {
+                    1.0
+                } else {
+                    0.0
+                });
+            }
+        });
+    }
+
     serve(router, health_router, Arc::clone(&state)).await?;
+    state.community_revalidator_cancel.cancel();
 
     // Signal the audit worker to stop accepting, flush buffered entries, and
     // exit. Uses a CancellationToken so it works regardless of how many
@@ -778,6 +985,42 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+async fn run_community_revalidator(
+    state: Arc<AppState>,
+    period: std::time::Duration,
+    cancel: CancellationToken,
+) {
+    run_periodic_until_cancelled(period, cancel, || async {
+        let closed = state.revalidate_live_communities().await;
+        if closed > 0 {
+            tracing::info!(
+                closed,
+                "closed sockets for inactive communities during lifecycle revalidation"
+            );
+        }
+    })
+    .await;
+}
+
+async fn run_periodic_until_cancelled<Tick, TickFuture>(
+    period: std::time::Duration,
+    cancel: CancellationToken,
+    mut tick: Tick,
+) where
+    Tick: FnMut() -> TickFuture,
+    TickFuture: std::future::Future<Output = ()>,
+{
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            _ = interval.tick() => tick().await,
+        }
+    }
 }
 
 /// Bind all listeners and run with graceful shutdown.
@@ -926,9 +1169,556 @@ fn reminder_to_event(reminder: &buzz_db::event::DueReminder) -> nostr::Event {
     serde_json::from_value(event_json).expect("valid event JSON from DB row")
 }
 
+/// Return the usage poll interval, with a floor that prevents a busy loop.
+fn usage_metrics_interval_secs() -> u64 {
+    std::env::var("BUZZ_USAGE_METRICS_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(300)
+        .max(5)
+}
+
+/// Return a gauge lifetime that always outlives several usage-poller ticks.
+fn usage_metrics_idle_timeout_secs(interval_secs: u64) -> u64 {
+    let configured = std::env::var("BUZZ_USAGE_METRICS_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok());
+    idle_timeout_secs(configured, interval_secs)
+}
+
+fn idle_timeout_secs(configured: Option<u64>, interval_secs: u64) -> u64 {
+    configured
+        .unwrap_or(900)
+        .max(interval_secs.saturating_mul(3))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum InMemoryMetricKey {
+    WsConnections(String),
+    UsersOnline(String),
+    Subscriptions(String),
+}
+
+impl InMemoryMetricKey {
+    fn set(&self, value: f64) {
+        match self {
+            Self::WsConnections(community) => {
+                metrics::gauge!("buzz_community_ws_connections", "community" => community.clone())
+                    .set(value);
+            }
+            Self::UsersOnline(community) => {
+                metrics::gauge!("buzz_community_users_online_pod", "community" => community.clone())
+                    .set(value);
+            }
+            Self::Subscriptions(community) => {
+                metrics::gauge!("buzz_community_subscriptions", "community" => community.clone())
+                    .set(value);
+            }
+        }
+    }
+}
+
+/// Refresh the exporter recency for legacy event-driven gauges without changing
+/// their values.
+///
+/// `metrics-util` 0.20.4 increments the Prometheus recorder's generation on
+/// every gauge operation, including `increment(0.0)`. The recency policy uses
+/// that generation, so this retains a steady gauge without a snapshot `set()`
+/// racing the lifecycle-relative increments and decrements.
+fn refresh_legacy_active_gauge_recency() {
+    metrics::gauge!("buzz_ws_connections_active").increment(0.0);
+    metrics::gauge!("buzz_subscriptions_active").increment(0.0);
+}
+
+/// Emit pod-local gauges and zero only label keys that disappeared since the
+/// preceding tick. The key stores the resolved host label so a removed or
+/// renamed community can still receive its final zero.
+fn emit_in_memory_usage_metrics(
+    state: &AppState,
+    emission_scope: &EmissionScope,
+    host_map: Option<&HashMap<Uuid, String>>,
+    previously_emitted: &mut HashSet<InMemoryMetricKey>,
+) {
+    let connections = state.conn_manager.per_community_ws_connections();
+    let users_online = state.conn_manager.per_community_users_online();
+    let subscriptions = state.sub_registry.per_community_subscriptions();
+    let total_connections = connections.values().sum::<u64>();
+    let total_subscriptions = subscriptions.values().sum::<u64>();
+
+    metrics::gauge!("buzz_total_ws_connections").set(total_connections as f64);
+    metrics::gauge!("buzz_total_users_online_pod").set(users_online.values().sum::<u64>() as f64);
+    metrics::gauge!("buzz_total_subscriptions").set(total_subscriptions as f64);
+    refresh_legacy_active_gauge_recency();
+
+    let Some(host_map) = host_map else {
+        return;
+    };
+
+    let mut current = HashSet::new();
+    for (id, host) in host_map {
+        if !emission_scope.allows(id) {
+            continue;
+        }
+        let community_id = CommunityId::from_uuid(*id);
+        let keys_and_values = [
+            (
+                InMemoryMetricKey::WsConnections(host.clone()),
+                connections.get(&community_id).copied(),
+            ),
+            (
+                InMemoryMetricKey::UsersOnline(host.clone()),
+                users_online.get(&community_id).copied(),
+            ),
+            (
+                InMemoryMetricKey::Subscriptions(host.clone()),
+                subscriptions.get(&community_id).copied(),
+            ),
+        ];
+        for (key, value) in keys_and_values {
+            if let Some(value) = value {
+                key.set(value as f64);
+                current.insert(key);
+            }
+        }
+    }
+
+    for key in dropped_in_memory_keys(previously_emitted, &current) {
+        key.set(0.0);
+    }
+    *previously_emitted = current;
+}
+
+fn dropped_in_memory_keys(
+    previously_emitted: &HashSet<InMemoryMetricKey>,
+    current: &HashSet<InMemoryMetricKey>,
+) -> Vec<InMemoryMetricKey> {
+    previously_emitted.difference(current).cloned().collect()
+}
+
+/// Run one usage-metrics tick. Every pod emits its own in-memory gauges, while
+/// one leader owns the heavier database-derived snapshot.
+async fn run_usage_metrics_tick(
+    state: &AppState,
+    emission_scope: &EmissionScope,
+    leader: &mut Option<buzz_db::UsageMetricsLeader>,
+    emitted_in_memory: &mut HashSet<InMemoryMetricKey>,
+) -> anyhow::Result<()> {
+    let host_map: HashMap<Uuid, String> = match state.db.usage_community_hosts().await {
+        Ok(hosts) => hosts
+            .into_iter()
+            .map(|community| (community.id, community.host))
+            .collect(),
+        Err(error) => {
+            if leader.is_some() {
+                warn!("Usage metrics leader demoting: host map collection failed");
+                *leader = None;
+            }
+            emit_in_memory_usage_metrics(state, emission_scope, None, emitted_in_memory);
+            return Err(error.into());
+        }
+    };
+    emit_in_memory_usage_metrics(state, emission_scope, Some(&host_map), emitted_in_memory);
+
+    let mut demoted = false;
+    if let Some(leader_guard) = leader.as_mut() {
+        if !leader_guard.is_live().await {
+            warn!("Usage metrics leader lock connection failed liveness check; demoting");
+            *leader = None;
+            demoted = true;
+        }
+    }
+    if leader.is_none() && !demoted {
+        *leader = state
+            .db
+            .try_lock_usage_metrics(USAGE_METRICS_LOCK_KEY)
+            .await?;
+        if leader.is_some() {
+            info!("Acquired usage metrics leader lock");
+        }
+    }
+    if leader.is_some() {
+        if let Err(error) = emit_db_usage_metrics(state, emission_scope, &host_map).await {
+            warn!("Usage metrics leader demoting: DB collection failed");
+            *leader = None;
+            return Err(error);
+        }
+    }
+
+    Ok(())
+}
+
+/// Emit the database-derived usage snapshot from the stable leader only.
+async fn emit_db_usage_metrics(
+    state: &AppState,
+    emission_scope: &EmissionScope,
+    host_map: &HashMap<Uuid, String>,
+) -> anyhow::Result<()> {
+    // --- Collect all DB results before emitting any metrics (C4) ---
+    //
+    // All `.await?` calls happen here. If any query fails the function returns
+    // early — no metrics are emitted for this tick — preventing a mixed
+    // fresh/stale snapshot where later gauges retain their last value while
+    // earlier ones are updated.
+
+    let community_total = state.db.usage_community_count().await?;
+    let user_rows = state.db.usage_user_counts().await?;
+    let channel_rows = state.db.usage_channel_counts().await?;
+    let message_rows = state.db.usage_message_counts().await?;
+    let relay_member_rows = state.db.usage_relay_member_counts().await?;
+    let workflow_rows = state.db.usage_workflow_counts().await?;
+    let git_repo_rows = state.db.usage_git_repo_counts().await?;
+    let active_users_1d = state.db.usage_active_user_counts("1 day").await?;
+    let active_users_7d = state.db.usage_active_user_counts("7 days").await?;
+    let active_users_30d = state.db.usage_active_user_counts("30 days").await?;
+    let active_channels_1d = state.db.usage_active_channel_counts("1 day").await?;
+    let active_channels_7d = state.db.usage_active_channel_counts("7 days").await?;
+
+    // --- Determine which community IDs receive per-community series (K1) ---
+    //
+    // `active_set` is the subset of host_map IDs that get per-community gauges
+    // this tick. Fleet-wide totals (buzz_total_*) always emit regardless.
+    let active_set: HashSet<Uuid> = host_map
+        .keys()
+        .filter(|id| emission_scope.allows(id))
+        .copied()
+        .collect();
+
+    // --- Publish phase: emit all metrics now that every query succeeded ---
+
+    // --- A. Adoption stocks (DB-polled) ---
+
+    // buzz_communities_total (no tag — fleet-wide count)
+    metrics::gauge!("buzz_communities_total").set(community_total as f64);
+
+    // buzz_community_users{community, type:human|agent}
+    // Emit from host_map so communities that have zero users still get a 0
+    // rather than keeping the last nonzero value until process restart.
+    {
+        let rows: HashMap<Uuid, _> = user_rows.into_iter().map(|r| (r.community_id, r)).collect();
+        // Fleet totals (always emitted).
+        let (total_human, total_agent): (i64, i64) = rows
+            .values()
+            .fold((0, 0), |(h, a), r| (h + r.human, a + r.agent));
+        metrics::gauge!("buzz_total_users", "type" => "human").set(total_human as f64);
+        metrics::gauge!("buzz_total_users", "type" => "agent").set(total_agent as f64);
+        // Per-community series (gated by active_set).
+        for (&id, community) in host_map {
+            if !active_set.contains(&id) {
+                continue;
+            }
+            let (human, agent) = rows.get(&id).map(|r| (r.human, r.agent)).unwrap_or((0, 0));
+            metrics::gauge!("buzz_community_users", "community" => community.clone(), "type" => "human")
+                .set(human as f64);
+            metrics::gauge!("buzz_community_users", "community" => community.clone(), "type" => "agent")
+                .set(agent as f64);
+        }
+    }
+
+    // buzz_community_channels{community, type}
+    // Zero-fill across all (community, channel_type) pairs so a type that
+    // drops to zero emits 0 rather than retaining its last nonzero value.
+    {
+        const CHANNEL_TYPES: &[&str] = &["stream", "forum", "dm", "workflow"];
+        let rows: HashMap<(Uuid, &str), i64> = channel_rows
+            .into_iter()
+            .filter_map(|r| {
+                let matched = CHANNEL_TYPES
+                    .iter()
+                    .find(|&&t| t == r.channel_type.as_str())
+                    .map(|&t| ((r.community_id, t), r.count));
+                if matched.is_none() {
+                    warn!(
+                        channel_type = %r.channel_type,
+                        "usage_channel_counts: unrecognised channel_type — row skipped"
+                    );
+                }
+                matched
+            })
+            .collect();
+        // Fleet totals (always emitted).
+        for &ct in CHANNEL_TYPES {
+            let total: i64 = host_map
+                .keys()
+                .map(|id| rows.get(&(*id, ct)).copied().unwrap_or(0))
+                .sum();
+            metrics::gauge!("buzz_total_channels", "type" => ct).set(total as f64);
+        }
+        // Per-community series (gated by active_set).
+        for (&id, community) in host_map {
+            if !active_set.contains(&id) {
+                continue;
+            }
+            for &ct in CHANNEL_TYPES {
+                let count = rows.get(&(id, ct)).copied().unwrap_or(0);
+                metrics::gauge!(
+                    "buzz_community_channels",
+                    "community" => community.clone(),
+                    "type" => ct
+                )
+                .set(count as f64);
+            }
+        }
+    }
+
+    // buzz_community_messages{community}
+    // Emit 0 for communities with no messages so dashboards don't stale-read.
+    {
+        let rows: HashMap<Uuid, i64> = message_rows
+            .into_iter()
+            .map(|r| (r.community_id, r.count))
+            .collect();
+        // Fleet total (always emitted).
+        let total: i64 = rows.values().sum();
+        metrics::gauge!("buzz_total_messages").set(total as f64);
+        // Per-community series (gated by active_set).
+        for (&id, community) in host_map {
+            if !active_set.contains(&id) {
+                continue;
+            }
+            let count = rows.get(&id).copied().unwrap_or(0);
+            metrics::gauge!("buzz_community_messages", "community" => community.clone())
+                .set(count as f64);
+        }
+    }
+
+    // buzz_community_relay_members{community, role}
+    // Zero-fill across all (community, role) pairs; relay_members.role is a
+    // CHECK constraint over {'owner', 'admin', 'member'}.
+    {
+        const RELAY_ROLES: &[&str] = &["owner", "admin", "member"];
+        let rows: HashMap<(Uuid, &str), i64> = relay_member_rows
+            .into_iter()
+            .filter_map(|r| {
+                let matched = RELAY_ROLES
+                    .iter()
+                    .find(|&&role| role == r.role.as_str())
+                    .map(|&role| ((r.community_id, role), r.count));
+                if matched.is_none() {
+                    warn!(
+                        role = %r.role,
+                        "usage_relay_member_counts: unrecognised role — row skipped"
+                    );
+                }
+                matched
+            })
+            .collect();
+        // Fleet totals (always emitted).
+        for &role in RELAY_ROLES {
+            let total: i64 = host_map
+                .keys()
+                .map(|id| rows.get(&(*id, role)).copied().unwrap_or(0))
+                .sum();
+            metrics::gauge!("buzz_total_relay_members", "role" => role).set(total as f64);
+        }
+        // Per-community series (gated by active_set).
+        for (&id, community) in host_map {
+            if !active_set.contains(&id) {
+                continue;
+            }
+            for &role in RELAY_ROLES {
+                let count = rows.get(&(id, role)).copied().unwrap_or(0);
+                metrics::gauge!(
+                    "buzz_community_relay_members",
+                    "community" => community.clone(),
+                    "role" => role
+                )
+                .set(count as f64);
+            }
+        }
+    }
+
+    // buzz_community_workflows{community, status}
+    // Zero-fill across all (community, status) pairs; workflow_status is a
+    // DB enum: {'active', 'disabled', 'archived'}.
+    {
+        const WORKFLOW_STATUSES: &[&str] = &["active", "disabled", "archived"];
+        let rows: HashMap<(Uuid, &str), i64> = workflow_rows
+            .into_iter()
+            .filter_map(|r| {
+                let matched = WORKFLOW_STATUSES
+                    .iter()
+                    .find(|&&s| s == r.status.as_str())
+                    .map(|&s| ((r.community_id, s), r.count));
+                if matched.is_none() {
+                    warn!(
+                        status = %r.status,
+                        "usage_workflow_counts: unrecognised workflow status — row skipped"
+                    );
+                }
+                matched
+            })
+            .collect();
+        // Fleet totals (always emitted).
+        for &status in WORKFLOW_STATUSES {
+            let total: i64 = host_map
+                .keys()
+                .map(|id| rows.get(&(*id, status)).copied().unwrap_or(0))
+                .sum();
+            metrics::gauge!("buzz_total_workflows", "status" => status).set(total as f64);
+        }
+        // Per-community series (gated by active_set).
+        for (&id, community) in host_map {
+            if !active_set.contains(&id) {
+                continue;
+            }
+            for &status in WORKFLOW_STATUSES {
+                let count = rows.get(&(id, status)).copied().unwrap_or(0);
+                metrics::gauge!(
+                    "buzz_community_workflows",
+                    "community" => community.clone(),
+                    "status" => status
+                )
+                .set(count as f64);
+            }
+        }
+    }
+
+    // buzz_community_git_repos{community}
+    // Emit 0 for communities with no repos.
+    {
+        let rows: HashMap<Uuid, i64> = git_repo_rows
+            .into_iter()
+            .map(|r| (r.community_id, r.count))
+            .collect();
+        // Fleet total (always emitted).
+        let total: i64 = rows.values().sum();
+        metrics::gauge!("buzz_total_git_repos").set(total as f64);
+        // Per-community series (gated by active_set).
+        for (&id, community) in host_map {
+            if !active_set.contains(&id) {
+                continue;
+            }
+            let count = rows.get(&id).copied().unwrap_or(0);
+            metrics::gauge!("buzz_community_git_repos", "community" => community.clone())
+                .set(count as f64);
+        }
+    }
+
+    // --- C. Engagement — windowed DAU/WAU/MAU + active channels ---
+    // Emit 0 for window/type/community combos that had no activity; this
+    // ensures a community that was active last tick but quiet this tick reads
+    // 0 rather than retaining its last nonzero value.
+
+    for (data, label) in [
+        (active_users_1d, "1d"),
+        (active_users_7d, "7d"),
+        (active_users_30d, "30d"),
+    ] {
+        let rows: HashMap<Uuid, _> = data.into_iter().map(|r| (r.community_id, r)).collect();
+        // Fleet totals (always emitted).
+        let (total_human, total_agent, total_unknown): (i64, i64, i64) =
+            rows.values().fold((0, 0, 0), |(h, a, u), r| {
+                (h + r.human, a + r.agent, u + r.unknown)
+            });
+        metrics::gauge!("buzz_total_active_users", "window" => label, "type" => "human")
+            .set(total_human as f64);
+        metrics::gauge!("buzz_total_active_users", "window" => label, "type" => "agent")
+            .set(total_agent as f64);
+        metrics::gauge!("buzz_total_active_users", "window" => label, "type" => "unknown")
+            .set(total_unknown as f64);
+        // Per-community series (gated by active_set).
+        for (&id, community) in host_map {
+            if !active_set.contains(&id) {
+                continue;
+            }
+            let (human, agent, unknown) = rows
+                .get(&id)
+                .map(|r| (r.human, r.agent, r.unknown))
+                .unwrap_or((0, 0, 0));
+            metrics::gauge!(
+                "buzz_community_active_users",
+                "community" => community.clone(),
+                "window" => label,
+                "type" => "human"
+            )
+            .set(human as f64);
+            metrics::gauge!(
+                "buzz_community_active_users",
+                "community" => community.clone(),
+                "window" => label,
+                "type" => "agent"
+            )
+            .set(agent as f64);
+            metrics::gauge!(
+                "buzz_community_active_users",
+                "community" => community.clone(),
+                "window" => label,
+                "type" => "unknown"
+            )
+            .set(unknown as f64);
+        }
+    }
+
+    for (data, label) in [(active_channels_1d, "1d"), (active_channels_7d, "7d")] {
+        let rows: HashMap<Uuid, i64> = data
+            .into_iter()
+            .map(|r| (r.community_id, r.count))
+            .collect();
+        // Fleet total (always emitted).
+        let total: i64 = rows.values().sum();
+        metrics::gauge!("buzz_total_active_channels", "window" => label).set(total as f64);
+        // Per-community series (gated by active_set).
+        for (&id, community) in host_map {
+            if !active_set.contains(&id) {
+                continue;
+            }
+            let count = rows.get(&id).copied().unwrap_or(0);
+            metrics::gauge!(
+                "buzz_community_active_channels",
+                "community" => community.clone(),
+                "window" => label
+            )
+            .set(count as f64);
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::buzz_auto_migrate_enabled;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
+
+    use super::{
+        buzz_auto_migrate_enabled, dropped_in_memory_keys, idle_timeout_secs,
+        refresh_legacy_active_gauge_recency, run_periodic_until_cancelled, EmissionScope,
+        InMemoryMetricKey,
+    };
+    use metrics::GaugeFn;
+    use metrics_util::{
+        debugging::DebugValue,
+        registry::{GenerationalAtomicStorage, Registry},
+    };
+
+    #[tokio::test(start_paused = true)]
+    async fn periodic_loop_exits_immediately_on_cancellation() {
+        let cancel = CancellationToken::new();
+        let tick_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count_for_tick = Arc::clone(&tick_count);
+        let task_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            run_periodic_until_cancelled(Duration::from_secs(300), task_cancel, move || {
+                let count = Arc::clone(&count_for_tick);
+                async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+            .await;
+        });
+
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_millis(1), task)
+            .await
+            .expect("loop must not wait for the next interval")
+            .expect("loop task");
+        assert!(tick_count.load(std::sync::atomic::Ordering::Relaxed) <= 1);
+    }
 
     #[test]
     fn buzz_auto_migrate_is_opt_in() {
@@ -943,5 +1733,78 @@ mod tests {
         assert!(buzz_auto_migrate_enabled(Some(" 1 ")));
         assert!(buzz_auto_migrate_enabled(Some("yes")));
         assert!(buzz_auto_migrate_enabled(Some("on")));
+    }
+
+    #[test]
+    fn test_emission_scope_off_disallows_every_community() {
+        assert!(EmissionScope::All.allows(&Uuid::new_v4()));
+        assert!(!EmissionScope::Off.allows(&Uuid::new_v4()));
+    }
+
+    #[test]
+    fn test_dropped_in_memory_keys_preserves_resolved_host_label() {
+        let previous = HashSet::from([
+            InMemoryMetricKey::WsConnections("removed.example".to_owned()),
+            InMemoryMetricKey::UsersOnline("live.example".to_owned()),
+        ]);
+        let current = HashSet::from([InMemoryMetricKey::UsersOnline("live.example".to_owned())]);
+
+        assert_eq!(
+            dropped_in_memory_keys(&previous, &current),
+            vec![InMemoryMetricKey::WsConnections(
+                "removed.example".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_legacy_gauge_recency_refresh_preserves_lifecycle_deltas() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            let connections = metrics::gauge!("buzz_ws_connections_active");
+            let subscriptions = metrics::gauge!("buzz_subscriptions_active");
+            connections.increment(1.0);
+            subscriptions.increment(1.0);
+
+            refresh_legacy_active_gauge_recency();
+
+            connections.decrement(1.0);
+            subscriptions.increment(1.0);
+        });
+
+        let values = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(key, _, _, value)| {
+                let DebugValue::Gauge(value) = value else {
+                    panic!("{} must be a gauge", key.key().name());
+                };
+                (key.key().name().to_owned(), value.into_inner())
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(values.get("buzz_ws_connections_active"), Some(&0.0));
+        assert_eq!(values.get("buzz_subscriptions_active"), Some(&2.0));
+    }
+
+    #[test]
+    fn test_legacy_gauge_recency_refresh_advances_generation() {
+        let registry = Registry::new(GenerationalAtomicStorage::atomic());
+        let key = metrics::Key::from_name("legacy");
+        let gauge = registry.get_or_create_gauge(&key, Clone::clone);
+        gauge.increment(1.0);
+        let generation_before = gauge.get_generation();
+        gauge.increment(0.0);
+
+        assert!(gauge.get_generation() > generation_before);
+    }
+
+    #[test]
+    fn test_idle_timeout_is_at_least_three_usage_intervals() {
+        assert_eq!(idle_timeout_secs(None, 300), 900);
+        assert_eq!(idle_timeout_secs(Some(10), 1_000), 3_000);
     }
 }

@@ -22,11 +22,8 @@ import {
 } from "@/features/agents/hooks";
 import { useIsManagedAgent } from "@/features/agent-memory/hooks";
 import { useIdentityQuery } from "@/shared/api/hooks";
-import { useActiveAgentTurns } from "@/features/agents/activeAgentTurnsStore";
-import {
-  ownsAuthorAgent,
-  truncatePubkey,
-} from "@/features/profile/lib/identity";
+import { useAgentWorking } from "@/features/agents/agentWorkingSignal";
+import { ownsAuthorAgent } from "@/features/profile/lib/identity";
 import { formatElapsed } from "@/features/agents/ui/agentSessionUtils";
 import { usePresenceQuery } from "@/features/presence/hooks";
 import { useUserStatusQuery } from "@/features/user-status/hooks";
@@ -37,13 +34,13 @@ import {
   mergeTimelineCacheMessages,
 } from "@/features/messages/hooks";
 import { buildWaveMessageContent } from "@/features/messages/lib/waveMessage";
-import { useAgentSession } from "@/shared/context/AgentSessionContext";
+import { useOpenAgentActivity } from "@/features/agents/useOpenAgentActivity";
 import { useProfilePanel } from "@/shared/context/ProfilePanelContext";
 import { sendChannelMessage } from "@/shared/api/tauri";
 import type { Channel, RelayEvent } from "@/shared/api/types";
 import { KIND_STREAM_MESSAGE } from "@/shared/constants/kinds";
 import { cn } from "@/shared/lib/cn";
-import { normalizePubkey } from "@/shared/lib/pubkey";
+import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
 
 import { Popover, PopoverAnchor, PopoverContent } from "@/shared/ui/popover";
 import { BotIdenticon } from "@/features/messages/ui/BotIdenticon";
@@ -200,7 +197,7 @@ export function UserProfilePopover({
   });
   const userStatusQuery = useUserStatusQuery(open ? [pubkey] : []);
 
-  const { onOpenAgentSession } = useAgentSession();
+  const { canOpenAgentActivity, openAgentActivity } = useOpenAgentActivity();
   const { openProfilePanel } = useProfilePanel();
   const canOpenProfilePanel = enableProfilePanel && Boolean(openProfilePanel);
   const relayAgent = relayAgentsQuery.data?.find((a) => a.pubkey === pubkey);
@@ -244,15 +241,20 @@ export function UserProfilePopover({
   const selfProfileQuery = useProfileQuery(open && showProfileActions);
   const isCurrentUserOwner = ownsAuthorAgent(profile, currentPubkey);
   const viewerIsOwner = isCurrentUserOwner || isOwner === true;
+  const showMessageAction =
+    showProfileActions &&
+    !isAgentClassificationPending &&
+    (!isBotProfile || viewerIsOwner);
+  const showAnyProfileActions = showHumanProfileActions || showMessageAction;
   const canViewActivity =
-    isBotProfile && viewerIsOwner && Boolean(onOpenAgentSession);
+    isBotProfile && viewerIsOwner && canOpenAgentActivity(pubkey);
   const presenceStatus = presenceQuery.data?.[pubkey.toLowerCase()];
   const userStatus = userStatusQuery.data?.[pubkey.toLowerCase()];
   const userStatusText = userStatus?.text.trim() ?? "";
   const hasUserStatus = Boolean(userStatusText || userStatus?.emoji);
   const profileDescription = profile?.about?.trim() ?? "";
   const profileSubheader = profileDescription || profile?.nip05Handle?.trim();
-  const activeTurns = useActiveAgentTurns(isBotProfile ? pubkey : null);
+  const activeTurns = useAgentWorking(isBotProfile ? pubkey : null).channels;
   const channelsQuery = useChannelsQuery();
   const channelIdToName = React.useMemo(() => {
     const map: Record<string, string> = {};
@@ -301,7 +303,7 @@ export function UserProfilePopover({
   );
 
   const handleMessage = React.useCallback(async () => {
-    if (!showProfileActions || pendingAction !== null) return;
+    if (!showMessageAction || pendingAction !== null) return;
 
     clearHoverTimer();
     setPendingAction("message");
@@ -329,7 +331,7 @@ export function UserProfilePopover({
     openDmMutation,
     pendingAction,
     pubkey,
-    showProfileActions,
+    showMessageAction,
   ]);
 
   const handleHuddle = React.useCallback(async () => {
@@ -609,7 +611,7 @@ export function UserProfilePopover({
               data-testid={`user-profile-view-activity-${pubkey}`}
               onClick={() => {
                 setOpen(false);
-                onOpenAgentSession?.(pubkey);
+                openAgentActivity(pubkey);
               }}
               type="button"
             >
@@ -618,7 +620,7 @@ export function UserProfilePopover({
             </button>
           ) : null}
 
-          {hasUserStatus || showProfileActions ? (
+          {hasUserStatus || showAnyProfileActions ? (
             <>
               <div
                 aria-hidden="true"
@@ -637,7 +639,7 @@ export function UserProfilePopover({
                   ) : null}
                 </StatusLine>
               ) : null}
-              {showProfileActions ? (
+              {showAnyProfileActions ? (
                 <div className="flex gap-2">
                   {showHumanProfileActions ? (
                     <Button
@@ -669,29 +671,31 @@ export function UserProfilePopover({
                       )}
                     </Button>
                   ) : null}
-                  <Button
-                    className="min-w-0 flex-1"
-                    data-testid={`user-profile-popover-message-${pubkey}`}
-                    disabled={
-                      pendingAction !== null || openDmMutation.isPending
-                    }
-                    onClick={() => {
-                      void handleMessage();
-                    }}
-                    size="sm"
-                    type="button"
-                    variant="outline"
-                  >
-                    {pendingAction === "message" ? (
-                      <Spinner
-                        aria-hidden="true"
-                        className="h-3.5 w-3.5 border-2"
-                      />
-                    ) : (
-                      <MessageSquare />
-                    )}
-                    Message
-                  </Button>
+                  {showMessageAction ? (
+                    <Button
+                      className="min-w-0 flex-1"
+                      data-testid={`user-profile-popover-message-${pubkey}`}
+                      disabled={
+                        pendingAction !== null || openDmMutation.isPending
+                      }
+                      onClick={() => {
+                        void handleMessage();
+                      }}
+                      size="sm"
+                      type="button"
+                      variant="outline"
+                    >
+                      {pendingAction === "message" ? (
+                        <Spinner
+                          aria-hidden="true"
+                          className="h-3.5 w-3.5 border-2"
+                        />
+                      ) : (
+                        <MessageSquare />
+                      )}
+                      Message
+                    </Button>
+                  ) : null}
                   {showHumanProfileActions ? (
                     <Button
                       className="min-w-0 flex-1"

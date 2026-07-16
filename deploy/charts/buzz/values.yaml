@@ -75,6 +75,10 @@ relay:
   sendBuffer: 1000
   requireAuthToken: true
   requireRelayMembership: true
+  # Staged rollout gate for authenticated media reads. When true, relay
+  # GET/HEAD /media/* requires Blossom kind 24242 t=get plus relay membership.
+  # Keep false until deployed desktop/mobile/CLI clients attach read auth.
+  requireMediaGetAuth: false
   allowNipOaAuth: true
   pubkeyAllowlist: false
   corsOrigins: []
@@ -84,6 +88,17 @@ relay:
   # accepts/owns the external multi-pod audio/SFU behavior.
   huddleAudioAvailable: null
   ephemeralTtlOverride: 0
+  # Per-upload-event records (`_uploads/` moderation side channel). Off by
+  # default. Operators hosting communities for other people may have legal
+  # obligations (e.g. NCMEC reporting for US-serving providers) that require
+  # recording the network address of an upload; Buzz never collects IPs unless
+  # uploadIpHeader is set. When set (e.g. "cf-connecting-ip"), the connecting
+  # address reported by YOUR trusted edge is stored in the per-event record
+  # only — never served to clients, never in event data. uploadRecords must be
+  # true for uploadIpHeader to be valid (startup-checked).
+  uploadRecords: false
+  uploadIpHeader: ""
+  uploadPortHeader: ""
 
   livenessProbe:
     httpGet:
@@ -139,6 +154,28 @@ relay:
   extraEnv: []
   extraEnvFrom: []
 
+# ── Device pairing relay ─────────────────────────────────────────────────────
+# Optional, stateless NIP-AB relay. When enabled, the main relay advertises
+# pairingRelay.url in NIP-11 and Buzz clients use it instead of the legacy
+# same-host /pair convention.
+pairingRelay:
+  enabled: false
+  url: ""
+  replicaCount: 1
+  service:
+    type: ClusterIP
+    port: 5000
+    annotations: {}
+  podAnnotations: {}
+  podLabels: {}
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "32Mi"
+    limits:
+      cpu: "250m"
+      memory: "128Mi"
+
 # ── Service ──────────────────────────────────────────────────────────────────
 service:
   type: ClusterIP
@@ -181,17 +218,18 @@ httproute:
 # enabled: true  → mount a PVC at mountPath (durable across pod restarts, but a
 #   single ReadWriteOnce PVC binds to one node, so it does NOT support multi-pod
 #   scheduling across nodes on a Deployment).
-# enabled: false → mount a per-pod emptyDir at mountPath (pure scratch). This is
-#   the correct choice for multi-replica HA: each pod gets its own local working
-#   space, nothing is shared, and there is no volume to multi-attach. Safe
-#   because the object store + Postgres are the sources of truth, not this disk.
+# enabled: false → mount a per-pod emptyDir at mountPath (pure scratch), bounded
+#   by size. This is the correct choice for multi-replica HA: each pod gets its
+#   own local working space, nothing is shared, and there is no volume to
+#   multi-attach. Safe because the object store + Postgres are the sources of
+#   truth, not this disk.
 persistence:
   git:
     enabled: true
     mountPath: /var/lib/buzz/git
     storageClass: ""
     accessMode: ReadWriteOnce
-    size: 10Gi
+    size: 10Gi                    # PVC capacity or emptyDir sizeLimit
     annotations: {}
     existingClaim: ""
 
@@ -211,7 +249,7 @@ postgresql:
     enabled: true
     size: 10Gi
 externalPostgresql:
-  url: ""                        # postgres://user:pass@host:5432/db
+  url: ""                        # postgres://user:pass@host:5432/db — placeholder example, sadscan:disable np.postgres.1
 
 # ── Redis ────────────────────────────────────────────────────────────────────
 # Eval-only CloudPirates subchart (standalone). REDIS_URL is composed in the

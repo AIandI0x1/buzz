@@ -53,6 +53,9 @@ type MockManagedAgentSeed = {
     | { type: "local" }
     | { type: "provider"; id: string; config: Record<string, unknown> };
   lastError?: string | null;
+  lastErrorCode?: number | null;
+  needsRestart?: boolean;
+  autoRestartOnConfigChange?: boolean;
   respondTo?: "owner-only" | "allowlist" | "anyone";
   respondToAllowlist?: string[];
 };
@@ -89,6 +92,13 @@ type MockPersonaSeed = {
   envVars?: Record<string, string>;
 };
 
+type MockTeamSeed = {
+  id?: string;
+  name: string;
+  description?: string | null;
+  personaIds: string[];
+};
+
 export type MockEngramEntry = {
   slug: string;
   body: string;
@@ -106,6 +116,35 @@ export type MockAgentMemoryListing = {
 
 type MockBridgeOptions = {
   acpRuntimesCatalog?: Record<string, unknown>[];
+  /** Override the result returned by the `install_acp_runtime` mock command.
+   *  Pass `{ success: false, steps: [...] }` to exercise error/Retry states. */
+  installAcpRuntimeResult?: {
+    success: boolean;
+    steps: {
+      step: string;
+      command: string;
+      success: boolean;
+      stdout: string;
+      stderr: string;
+      exit_code: number | null;
+      hint?: string;
+    }[];
+  };
+  /** Sequence of results for successive `install_acp_runtime` calls. Call N
+   *  returns results[N]; when exhausted the last entry repeats. Takes precedence
+   *  over `installAcpRuntimeResult`. Use for fail-then-succeed Retry tests. */
+  installAcpRuntimeResults?: Array<{
+    success: boolean;
+    steps: {
+      step: string;
+      command: string;
+      success: boolean;
+      stdout: string;
+      stderr: string;
+      exit_code: number | null;
+      hint?: string;
+    }[];
+  }>;
   activePersonaIds?: string[];
   /**
    * Listing returned by the mocked `get_agent_memory` command. Pass a single
@@ -118,17 +157,34 @@ type MockBridgeOptions = {
   };
   managedAgents?: MockManagedAgentSeed[];
   personas?: MockPersonaSeed[];
+  teams?: MockTeamSeed[];
   relayAgents?: MockRelayAgentSeed[];
   agentListDelayMs?: number;
   createManagedAgentDelayMs?: number;
   addChannelMembersDelayMs?: number;
+  /** Sequenced add-member failures. A string fails that call; null succeeds. */
+  addChannelMembersErrors?: (string | null)[];
+  channelMembersReadDelayMs?: number;
   channelsReadError?: string;
+  /** Reject successive mock `create_channel` calls, then resume. */
+  createChannelErrors?: string[];
+  /** Reject successive mock `join_channel` calls, then resume. */
+  joinChannelErrors?: string[];
+  /** Number of seeded rows in the deep-history fixture. Defaults to 600. */
+  deepHistoryMessageCount?: number;
   feedReadError?: string;
   canvasReadError?: string;
   /** Delay (ms) for `apply_workspace`; see e2eBridge mock config. */
-  applyWorkspaceDelayMs?: number;
+  applyCommunityDelayMs?: number;
   openDmDelayMs?: number;
   sendMessageDelayMs?: number;
+  /** Reject successive kind-9 sends with these messages, then resume. */
+  sendMessageErrors?: string[];
+  /** Reject successive managed-agent starts, then resume. */
+  startManagedAgentErrors?: string[];
+  /** Delay (ms) after snapshotting a thread-replies page so E2E tests can
+   * deliver live reply/aux events while an older response is in flight. */
+  threadRepliesDelayMs?: number;
   usersBatchDelayMs?: number;
   /** Delay (ms) for older-history fetches; see e2eBridge mock config. */
   channelWindowDelayMs?: number;
@@ -166,17 +222,35 @@ type MockBridgeOptions = {
    */
   relayRole?: "owner" | "admin" | "member" | null;
   /**
-   * Reporter pubkey injected into mocked mesh serve targets. Defaults to the
-   * active identity; specs can override to catch malformed/missing #p handling.
-   */
-  meshReporterPubkey?: string;
-  /**
    * Descriptors returned by the mocked `pick_and_upload_media` /
    * `upload_media_bytes` commands. When omitted, the bridge returns a single
    * generic PDF so the file-attachment flow can be exercised by default. An
    * explicit `[]` is honoured (models a picker cancel / no files selected).
    */
   uploadDelayMs?: number;
+  /** Delay (ms) applied to `encode_agent_snapshot_for_send` so E2E tests can
+   *  observe the "preparing" phase before the upload begins. 0/undefined = instant. */
+  encodeDelayMs?: number;
+  /** Delay (ms) applied to `get_relay_self` so E2E tests can prove the
+   *  fail-closed race: DMs are withheld while classification is unresolved. */
+  relaySelfDelayMs?: number;
+  /**
+   * Sequenced results for `confirm_team_snapshot_import`. String = throw
+   * with that message; null = succeed. Call N uses results[N]; last entry
+   * repeats when exhausted. Follows the `nsecErrors` precedent.
+   */
+  teamSnapshotConfirmErrors?: (string | null)[];
+  /**
+   * When true, `preview_team_snapshot_import` returns a preview with
+   * `hasSourceAllowlist: true` so the allowlist section renders in the
+   * import dialog.
+   */
+  teamSnapshotPreviewHasSourceAllowlist?: boolean;
+  /**
+   * When set to a non-empty string, `fetch_snapshot_bytes` throws with this
+   * message — lets specs prove malformed/hash/size-mismatch error paths.
+   */
+  snapshotFetchError?: string;
   uploadDescriptors?: {
     url: string;
     sha256: string;
@@ -190,6 +264,78 @@ type MockBridgeOptions = {
     image?: string;
     filename?: string;
   }[];
+  /**
+   * Seed rows returned by the mocked `list_save_subscriptions` command.
+   * Drives the LocalArchiveSettingsCard subscription list view in screenshot
+   * and UI tests without a real SQLite backend.
+   */
+  saveSubscriptions?: Array<{
+    scope_type: string;
+    scope_value: string;
+    kinds: string; // JSON-encoded integer array, e.g. "[9,40002]"
+  }>;
+  /**
+   * Event IDs that `get_event` should report as definitively not found.
+   * Causes `useDraftRootStatus` to map the draft to `deleted` state so specs
+   * can exercise the "Thread deleted" label / disabled-send path.
+   */
+  deletedEventIds?: string[];
+  /**
+   * When true, `get_identity` returns `lost: true` until `persist_current_identity`
+   * or `import_identity` is invoked. Drives the identity-lost recovery UX in tests.
+   */
+  identityLost?: boolean;
+  /**
+   * When true, `get_identity` returns `locked: true` until `import_identity` is
+   * invoked. Drives the keyring-locked screen in tests.
+   */
+  identityLocked?: boolean;
+  /**
+   * Global agent config returned by `get_global_agent_config`. Defaults to
+   * an empty config (no provider, model, or env vars) if not specified.
+   * Pass a config with a provider to test Inherit-from-global behavior.
+   */
+  globalAgentConfig?: {
+    env_vars: Record<string, string>;
+    provider: string | null;
+    model: string | null;
+  };
+  bakedBuildEnv?: Array<{
+    key: string;
+    masked: boolean;
+    value: string;
+  }>;
+  /** Delay (ms) for `set_global_agent_config` — hold saves open in tests.
+   *  Alias of `globalConfigSaveDelayMs` (kept for onboarding specs). */
+  setGlobalAgentConfigDelayMs?: number;
+  /**
+   * When set, `get_nsec` throws with this message. For a single always-fail
+   * scenario. Use `nsecErrors` for sequenced fail/succeed.
+   */
+  nsecError?: string;
+  /**
+   * Sequenced results for `get_nsec`. String = throw with that message;
+   * null = succeed. Call N uses results[N]; last entry repeats when exhausted.
+   */
+  nsecErrors?: (string | null)[];
+  /**
+   * The `restarted_count` returned by `set_global_agent_config`. Defaults to
+   * 0 (no agents restarted). Set to a positive integer to drive the
+   * "Saved. Restarted N agent(s)." status text in GlobalAgentConfigSettingsCard.
+   */
+  globalConfigRestartedCount?: number;
+  /**
+   * The `failed_restart_count` returned by `set_global_agent_config`. Defaults
+   * to 0. Set to a positive integer to drive the "failed to restart — check
+   * the Agents tab." status text in GlobalAgentConfigSettingsCard.
+   */
+  globalConfigFailedRestartCount?: number;
+  /**
+   * Milliseconds to delay the mocked `set_global_agent_config` response.
+   * Defaults to 0 (resolve immediately). Use to hold a save in flight so a
+   * test can interleave edits and exercise the mid-save race handling.
+   */
+  globalConfigSaveDelayMs?: number;
 };
 
 type BridgeOptions = {
@@ -198,7 +344,7 @@ type BridgeOptions = {
   relayHttpUrl?: string;
   relayWsUrl?: string;
   skipOnboardingSeed?: boolean;
-  skipWorkspaceSeed?: boolean;
+  skipCommunitySeed?: boolean;
   /**
    * When true (default), seed every preview feature in preview-features.json as
    * enabled in localStorage so E2E tests can interact with gated UI without
@@ -357,21 +503,21 @@ async function seedOnboardingCompletionForKnownIdentities(
   );
 }
 
-async function seedDefaultWorkspace(page: Page, relayWsUrl?: string) {
+async function seedDefaultCommunity(page: Page, relayWsUrl?: string) {
   await page.addInitScript(
     ({ relayUrl }) => {
-      const workspaceId = "e2e-default-workspace";
-      const workspace = {
-        id: workspaceId,
+      const communityId = "e2e-default-community";
+      const community = {
+        id: communityId,
         name: "E2E Test",
         relayUrl,
         addedAt: new Date().toISOString(),
       };
       window.localStorage.setItem(
-        "buzz-workspaces",
-        JSON.stringify([workspace]),
+        "buzz-communities",
+        JSON.stringify([community]),
       );
-      window.localStorage.setItem("buzz-active-workspace-id", workspaceId);
+      window.localStorage.setItem("buzz-active-community-id", communityId);
     },
     { relayUrl: relayWsUrl ?? DEFAULT_RELAY_WS_URL },
   );
@@ -394,10 +540,10 @@ export async function installBridge(page: Page, options: BridgeOptions) {
       ? TEST_IDENTITIES[options.user ?? "tyler"]
       : undefined;
 
-  // Most specs seed a workspace so useWorkspaceInit doesn't show WelcomeSetup.
+  // Most specs seed a community so useCommunityInit doesn't show WelcomeSetup.
   // skipOnboardingSeed only controls the onboarding-completion flag.
-  if (!options.skipWorkspaceSeed) {
-    await seedDefaultWorkspace(page, options.relayWsUrl);
+  if (!options.skipCommunitySeed) {
+    await seedDefaultCommunity(page, options.relayWsUrl);
   }
   if (!options.skipOnboardingSeed) {
     await seedOnboardingCompletionForKnownIdentities(page, options.relayWsUrl);
@@ -498,7 +644,7 @@ export async function installMockBridge(
   options?: {
     relayWsUrl?: string;
     skipOnboardingSeed?: boolean;
-    skipWorkspaceSeed?: boolean;
+    skipCommunitySeed?: boolean;
     seedPreviewFeatures?: boolean;
   },
 ) {
@@ -507,7 +653,7 @@ export async function installMockBridge(
     mock,
     relayWsUrl: options?.relayWsUrl,
     skipOnboardingSeed: options?.skipOnboardingSeed,
-    skipWorkspaceSeed: options?.skipWorkspaceSeed,
+    skipCommunitySeed: options?.skipCommunitySeed,
     seedPreviewFeatures: options?.seedPreviewFeatures,
   });
 }
@@ -548,4 +694,24 @@ export async function openChannelBrowser(page: Page) {
       }),
     );
   }, isMacBrowser);
+}
+
+// Section header actions (create channel, new DM, mark all read, sort) now
+// live inside a per-section "more actions" (⋮) menu instead of standalone
+// header icon buttons. These helpers open that menu and pick an item.
+async function openSectionMenu(page: Page, actionsTestId: string) {
+  const trigger = page.getByTestId(actionsTestId);
+  await trigger.scrollIntoViewIfNeeded();
+  await trigger.click();
+}
+
+export async function openCreateChannelDialog(page: Page) {
+  await openSectionMenu(page, "section-actions-channels");
+  await page.getByRole("menuitem", { name: "New channel" }).click();
+}
+
+export async function openNewMessagePage(page: Page) {
+  await openSectionMenu(page, "section-actions-dms");
+  await page.getByRole("menuitem", { name: "New message" }).click();
+  await page.getByTestId("new-message-page").waitFor({ state: "visible" });
 }

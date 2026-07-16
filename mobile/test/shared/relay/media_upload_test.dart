@@ -8,6 +8,7 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart' as http_testing;
 import 'package:image_picker/image_picker.dart';
 import 'package:nostr/nostr.dart' as nostr;
+import 'package:buzz/shared/relay/media_auth.dart';
 import 'package:buzz/shared/relay/media_upload.dart';
 
 final _pngBytes = Uint8List.fromList([
@@ -234,6 +235,92 @@ void main() {
     _setMockMediaUploadPlatformHandler(null);
   });
 
+  group('MediaGetAuthService', () {
+    test('signs relay media get requests with a server-scoped token', () {
+      final keychain = nostr.Keys.generate();
+      final service = MediaGetAuthService(
+        baseUrl: 'https://Relay.Example:443',
+        nsec: keychain.nsec,
+        now: () => DateTime.fromMillisecondsSinceEpoch(1700000000000),
+      );
+
+      final headers = service.headersFor(
+        'https://relay.example:443/media/${'a' * 64}.jpg',
+      );
+
+      final authHeader = headers['Authorization'];
+      expect(authHeader, startsWith('Nostr '));
+      final encoded = authHeader!.substring('Nostr '.length);
+      final decoded = utf8.decode(
+        base64Url.decode(base64Url.normalize(encoded)),
+      );
+      final authEvent = jsonDecode(decoded) as Map<String, dynamic>;
+      expect(authEvent['kind'], 24242);
+      expect(authEvent['pubkey'], keychain.public);
+      expect(authEvent['content'], 'Get buzz-media');
+      expect(authEvent['tags'], contains(equals(['t', 'get'])));
+      expect(authEvent['tags'], contains(equals(['server', 'relay.example'])));
+      expect(authEvent['tags'], contains(equals(['expiration', '1700000600'])));
+    });
+
+    test('does not sign non-relay or non-media URLs', () {
+      final service = MediaGetAuthService(
+        baseUrl: 'https://relay.example',
+        nsec: nostr.Keys.generate().nsec,
+      );
+
+      expect(
+        service.headersFor('https://evil.example/media/${'a' * 64}.jpg'),
+        isEmpty,
+      );
+      expect(service.headersFor('https://relay.example/avatar.png'), isEmpty);
+    });
+
+    test('normalizes default ports and rejects path-prefix lookalikes', () {
+      final service = MediaGetAuthService(
+        baseUrl: 'https://Relay.Example:443',
+        nsec: nostr.Keys.generate().nsec,
+      );
+
+      expect(
+        service.headersFor('https://relay.example/media/${'a' * 64}.jpg'),
+        isNotEmpty,
+      );
+      expect(
+        service.headersFor('https://relay.example/media-evil/${'a' * 64}.jpg'),
+        isEmpty,
+      );
+      expect(
+        service.headersFor('ftp://relay.example/media/${'a' * 64}.jpg'),
+        isEmpty,
+      );
+    });
+
+    test('does not sign without a key', () {
+      final service = MediaGetAuthService(
+        baseUrl: 'https://relay.example',
+        nsec: null,
+      );
+
+      expect(
+        service.headersFor('https://relay.example/media/${'a' * 64}.jpg'),
+        isEmpty,
+      );
+    });
+
+    test('does not throw or sign when the stored key is invalid', () {
+      final service = MediaGetAuthService(
+        baseUrl: 'https://relay.example',
+        nsec: 'not-an-nsec',
+      );
+
+      expect(
+        service.headersFor('https://relay.example/media/${'a' * 64}.jpg'),
+        isEmpty,
+      );
+    });
+  });
+
   group('MediaUploadService', () {
     test('signs Blossom auth and uploads gallery image bytes', () async {
       final keychain = nostr.Keys.generate();
@@ -304,6 +391,135 @@ void main() {
       expect(
         tags,
         anyElement(equals(<String>['server', 'relay.example:8443'])),
+      );
+    });
+
+    test(
+      'checks clipboard image availability through the platform channel',
+      () async {
+        final invokedMethods = <String>[];
+        _setMockMediaUploadPlatformHandler((call) async {
+          invokedMethods.add(call.method);
+          if (call.method == 'clipboardHasImage') return true;
+          return null;
+        });
+        addTearDown(() {
+          _setMockMediaUploadPlatformHandler((call) async {
+            switch (call.method) {
+              case 'sanitizeImageForUpload':
+                final arguments = call.arguments as Map<Object?, Object?>;
+                return arguments['bytes'] as Uint8List;
+              case 'transcodeImageToJpeg':
+                return _jpegBytes;
+              default:
+                return null;
+            }
+          });
+        });
+        final service = MediaUploadService(
+          baseUrl: 'https://relay.example',
+          nsec: null,
+          pickGalleryVideo: () async => null,
+          pickGalleryImage: () async => null,
+        );
+
+        expect(await service.clipboardHasImage(), isTrue);
+        expect(invokedMethods, ['clipboardHasImage']);
+      },
+    );
+
+    test('reads clipboard image through the platform channel', () async {
+      final invokedMethods = <String>[];
+      _setMockMediaUploadPlatformHandler((call) async {
+        invokedMethods.add(call.method);
+        if (call.method == 'readClipboardImage') return _pngBytes;
+        if (call.method == 'sanitizeImageForUpload') {
+          final arguments = call.arguments as Map<Object?, Object?>;
+          return arguments['bytes'] as Uint8List;
+        }
+        return null;
+      });
+      addTearDown(() {
+        _setMockMediaUploadPlatformHandler((call) async {
+          switch (call.method) {
+            case 'sanitizeImageForUpload':
+              final arguments = call.arguments as Map<Object?, Object?>;
+              return arguments['bytes'] as Uint8List;
+            case 'transcodeImageToJpeg':
+              return _jpegBytes;
+            default:
+              return null;
+          }
+        });
+      });
+      final service = MediaUploadService(
+        baseUrl: 'https://relay.example',
+        nsec: nostr.Keys.generate().nsec,
+        httpClient: http_testing.MockClient(
+          (request) async => http.Response(
+            jsonEncode({
+              'url': 'https://relay.example/media/clipboard.png',
+              'sha256':
+                  '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+              'size': 16,
+              'type': 'image/png',
+              'uploaded': 1,
+            }),
+            200,
+          ),
+        ),
+        pickGalleryVideo: () async => null,
+        pickGalleryImage: () async => null,
+      );
+
+      final descriptor = await service.readAndUploadClipboardImage();
+
+      expect(invokedMethods.first, 'readClipboardImage');
+      expect(descriptor.type, 'image/png');
+    });
+
+    test(
+      'rejects GIF clipboard bytes through the shared validation path',
+      () async {
+        final service = MediaUploadService(
+          baseUrl: 'https://relay.example',
+          nsec: null,
+          pickGalleryVideo: () async => null,
+          pickGalleryImage: () async => null,
+          readClipboardImage: () async => _gifBytes,
+        );
+
+        expect(
+          service.readAndUploadClipboardImage,
+          throwsA(
+            isA<Exception>().having(
+              (error) => error.toString(),
+              'message',
+              contains('GIF uploads are not supported on mobile yet'),
+            ),
+          ),
+        );
+      },
+    );
+
+    test('rejects empty clipboard image bytes', () async {
+      final service = MediaUploadService(
+        baseUrl: 'https://relay.example',
+        nsec: null,
+        pickGalleryVideo: () async => null,
+        pickGalleryImage: () async => null,
+        readClipboardImage: () async => Uint8List(0),
+      );
+
+      expect(
+        service.readAndUploadClipboardImage,
+        throwsA(
+          isA<Exception>().having(
+            (error) => error.toString(),
+            'message',
+            contains('Unable to read pasted image'),
+          ),
+        ),
       );
     });
 

@@ -19,6 +19,20 @@ export type ChannelPaneProps = {
   agentPubkeys?: ReadonlySet<string>;
   agentPubkeysPending?: boolean;
   agentSessionAgents: ChannelAgentSessionAgent[];
+  /**
+   * When non-null, the main composer fires `submitMessage` once after loading
+   * the draft identified by this key — i.e. the user clicked "Send message"
+   * in the Drafts panel and confirmed. Cleared by the composer after firing so
+   * back-navigation cannot re-trigger.
+   */
+  autoSendDraftKey?: string | null;
+  /**
+   * Called after the auto-submit guard fires to surgically clear `?autoSend`
+   * from the URL while preserving `?thread` and all other panel search state.
+   * If omitted, ChannelPane falls back to a full goChannel() re-navigation
+   * (safe for the main-composer path, which carries no URL-backed thread).
+   */
+  onAutoSendComplete?: (() => void) | null;
   botTypingEntries: TypingIndicatorEntry[];
   channelFind: ReturnType<typeof useChannelFind>;
   channelManagementOpen?: boolean;
@@ -32,6 +46,8 @@ export type ChannelPaneProps = {
   fetchOlder?: () => Promise<void>;
   header?: React.ReactNode;
   hasOlderMessages?: boolean;
+  /** True when the loaded window provably starts at the channel's beginning. */
+  historyExhausted?: boolean;
   isFetchingOlder?: boolean;
   isJoining?: boolean;
   isSinglePanelView?: boolean;
@@ -54,7 +70,7 @@ export type ChannelPaneProps = {
   onCloseChannelManagement?: () => void;
   onChannelManagementDeleted?: () => void;
   onCloseProfilePanel: () => void;
-  onAddAgent?: () => void;
+  onAddAgent?: (options?: { beforeSend?: () => void }) => void;
   onCreateChannel?: () => void;
   onCloseThread: () => void;
   onDelete?: (message: TimelineMessage) => void;
@@ -123,6 +139,7 @@ export type ChannelPaneProps = {
   profilePanelView: ProfilePanelView;
   threadHeadMessage: TimelineMessage | null;
   threadMessages: MainTimelineEntry[];
+  threadMessagesPending?: boolean;
   threadPanelWidthPx: number;
   threadTypingPubkeys: string[];
   threadReplyTargetMessage: TimelineMessage | null;

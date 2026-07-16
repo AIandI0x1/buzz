@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod channels;
 pub mod dms;
 pub mod emoji;
@@ -5,6 +6,7 @@ pub mod feed;
 pub mod issues;
 pub mod mem;
 pub mod messages;
+pub mod moderation;
 pub mod notes;
 pub mod pack;
 pub mod patches;

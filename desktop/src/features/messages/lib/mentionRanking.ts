@@ -1,10 +1,10 @@
-import { normalizePubkey } from "@/shared/lib/pubkey";
+import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
 
 export type MentionCandidateForRanking = {
   displayName: string | null;
   isAgent: boolean;
   isMember: boolean;
-  kind: "identity" | "persona";
+  kind: "identity" | "persona" | "team";
   personaId?: string | null;
   personaName?: string | null;
   pubkey?: string;
@@ -26,6 +26,7 @@ function getMentionCandidateGroupRank(
   if (candidate.isMember) return 0;
 
   const isRunnablePersona =
+    candidate.kind === "team" ||
     candidate.kind === "persona" ||
     (candidate.personaId ? activePersonaIds.has(candidate.personaId) : false);
   if (isRunnablePersona) return 1;
@@ -63,7 +64,8 @@ export function rankMentionCandidates<T extends MentionCandidateForRanking>(
         ? normalizePubkey(candidate.pubkey)
         : "";
       const label =
-        candidate.displayName ?? candidate.pubkey?.slice(0, 8) ?? "persona";
+        candidate.displayName ??
+        (candidate.pubkey ? truncatePubkey(candidate.pubkey) : "agent");
       const groupRank = getMentionCandidateGroupRank(
         candidate,
         activePersonaIds,

@@ -101,7 +101,7 @@ export function ChannelTemplatesSettingsCard() {
   return (
     <section className="min-w-0" data-testid="settings-channel-templates">
       <SettingsSectionHeader
-        title="Channel Templates"
+        title="Channel templates"
         description={
           <>
             Save reusable channel configurations and apply them when creating
@@ -234,7 +234,7 @@ function TemplateRow({
         </div>
       </div>
 
-      <DropdownMenu>
+      <DropdownMenu modal={false}>
         <DropdownMenuTrigger asChild>
           <Button
             className="h-7 w-7 shrink-0 opacity-0 group-hover:opacity-100"

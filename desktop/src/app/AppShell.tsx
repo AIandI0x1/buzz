@@ -38,7 +38,11 @@ import { setDesktopAppBadge } from "@/features/notifications/lib/desktop";
 import { PreventSleepProvider } from "@/features/agents/usePreventSleep";
 import { requestOpenCreateAgent } from "@/features/agents/openCreateAgentEvent";
 import { useAgentsDataRefresh } from "@/features/agents/lib/useAgentsDataRefresh";
+import { useAutoRestartPolicy } from "@/features/agents/lib/useAutoRestartPolicy";
 import { usePersonaSync } from "@/features/agents/lib/usePersonaSync";
+import { useAgentObserverIngestion } from "@/features/agents/useAgentObserverIngestion";
+import { AgentManagementDialogs } from "@/features/agents/ui/AgentManagementDialogs";
+import { RequestedAgentCreateDialogs } from "@/features/agents/ui/RequestedAgentCreateDialogs";
 import {
   usePresenceSession,
   usePresenceSubscription,
@@ -48,8 +52,12 @@ import {
   useUserStatusQuery,
   useUserStatusSubscription,
 } from "@/features/user-status/hooks";
-import { useWorkspaceEmojiLiveUpdates } from "@/features/custom-emoji/hooks";
+import { useCommunityEmojiLiveUpdates } from "@/features/custom-emoji/hooks";
+import { useArchiveSync } from "@/features/local-archive/archiveSyncManager";
+import { useObserverArchiveSeed } from "@/features/local-archive/useObserverArchiveSeed";
+import { useAgentMetricArchiveSeed } from "@/features/local-archive/useAgentMetricArchiveSeed";
 import { useProfileQuery } from "@/features/profile/hooks";
+import { SendFeedbackController } from "@/features/settings/ui/SendFeedbackController";
 import {
   DEFAULT_SETTINGS_SECTION,
   type SettingsSection,
@@ -60,10 +68,10 @@ import { useDueReminderBadgeCount } from "@/features/reminders/hooks";
 import { RemindMeLaterProvider } from "@/features/reminders/ui/RemindMeLaterProvider";
 import { useReminderNotifications } from "@/features/reminders/useReminderNotifications";
 import { AppSidebar } from "@/features/sidebar/ui/AppSidebar";
-import { WorkspaceRail } from "@/features/sidebar/ui/WorkspaceRail";
+import { CommunityRail } from "@/features/sidebar/ui/CommunityRail";
 import { useChannelMutes } from "@/features/sidebar/lib/useChannelMutes";
 import { useChannelStars } from "@/features/sidebar/lib/useChannelStars";
-import { useWorkspaces } from "@/features/workspaces/useWorkspaces";
+import { useCommunities } from "@/features/communities/useCommunities";
 import { useApplyTemplate } from "@/features/channel-templates/useApplyTemplate";
 import { relayClient } from "@/shared/api/relayClient";
 import { useFeatureEnabled } from "@/shared/features";
@@ -93,9 +101,9 @@ export function AppShell() {
   useTauriWindowDrag();
   useWebviewScrollBoundaryLock();
 
-  const workspacesHook = useWorkspaces();
-  const workspaceRailEnabled = useFeatureEnabled("workspaceRail");
-  const [isAddWorkspaceOpen, setIsAddWorkspaceOpen] = React.useState(false);
+  const communitiesHook = useCommunities();
+  const communityRailEnabled = useFeatureEnabled("workspaceRail");
+  const [isAddCommunityOpen, setIsAddCommunityOpen] = React.useState(false);
   const [isChannelManagementOpen, setIsChannelManagementOpen] =
     React.useState(false);
   const [managedChannelId, setManagedChannelId] = React.useState<string | null>(
@@ -104,8 +112,8 @@ export function AppShell() {
   const [searchFocusRequest, setSearchFocusRequest] = React.useState(0);
   const [browseDialogType, setBrowseDialogType] =
     React.useState<BrowseDialogType>(null);
-  const [isNewDmOpen, setIsNewDmOpen] = React.useState(false);
   const [isCreateChannelOpen, setIsCreateChannelOpen] = React.useState(false);
+  const [isSendFeedbackOpen, setIsSendFeedbackOpen] = React.useState(false);
   const [isHuddleDrawerOpen, setIsHuddleDrawerOpen] = React.useState(false);
   const mainInsetRef = React.useRef<HTMLElement>(null);
   const location = useLocation();
@@ -114,6 +122,7 @@ export function AppShell() {
     goAgents,
     goChannel,
     goHome,
+    goNewMessage,
     goProjects,
     goPulse,
     goSettings,
@@ -123,6 +132,26 @@ export function AppShell() {
   } = useAppNavigation();
   const { canGoBack, canGoForward, goBack, goForward } =
     useBackForwardControls();
+  // Navigate home before switching communities so the outgoing channel URL is
+  // cleared. Without this, ChannelScreen's read effect continues firing
+  // markChannelRead({ topLevelOnly: true }) for the previous community's
+  // channel, advancing its NIP-RS markers and causing the rail badge to vanish
+  // on the next 30s poll (A→B→A→B disappearance bug).
+  // Guard: skip goHome() when re-selecting the already-active community so
+  // the current channel is not unexpectedly cleared.
+  const handleSwitchCommunity = React.useCallback(
+    (id: string) => {
+      if (id !== communitiesHook.activeCommunity?.id) {
+        void goHome();
+      }
+      communitiesHook.switchCommunity(id);
+    },
+    [
+      goHome,
+      communitiesHook.activeCommunity?.id,
+      communitiesHook.switchCommunity,
+    ],
+  );
   const { selectedChannelId, selectedView } = React.useMemo(
     () => deriveShellRoute(location.pathname),
     [location.pathname],
@@ -147,12 +176,31 @@ export function AppShell() {
   );
   usePersonaSync(identityQuery.data?.pubkey);
   useAgentsDataRefresh();
-  const profileQuery = useProfileQuery();
+  // Chunk F: auto-restart drifted idle agents (per-agent opt-out, default ON).
+  useAutoRestartPolicy();
+  // Owner-global observer ingestion: receives + decrypts agent observer
+  // frames and keeps derived active-turn liveness in sync app-wide, so no
+  // individual screen/panel has to mount its own bridge for ingestion.
+  // Intentionally mounted without a `startupReady`/identity guard: before
+  // `currentPubkey` resolves the hook ingests managed agents only, and
+  // relay-owned agents join automatically once identity arrives. Adding a
+  // guard here would drop managed-agent coverage during startup.
+  useAgentObserverIngestion();
+  useArchiveSync();
+  // Defer the archive *seeds* until startup is idle: they're first-run catch-up
+  // config (a one-shot mergeSaveSubscriptionKinds), not live-ingest — that's
+  // useArchiveSync's job, which stays eager above. Passing deferredPubkey makes
+  // each seed hook wait on its own `if (!pubkey) return` guard until the shell
+  // is interactive, so their IPC + sqlite archive open doesn't compete with
+  // first paint. The explicit-choice guard inside each hook is unchanged.
   const deferredPubkey = startupReady ? identityQuery.data?.pubkey : undefined;
+  useObserverArchiveSeed(deferredPubkey);
+  useAgentMetricArchiveSeed(deferredPubkey);
+  const profileQuery = useProfileQuery();
   useRelayAutoHeal();
   usePresenceSubscription();
   useUserStatusSubscription();
-  useWorkspaceEmojiLiveUpdates();
+  useCommunityEmojiLiveUpdates();
   useMembershipNotifications(identityQuery.data?.pubkey);
   const presenceSession = usePresenceSession(deferredPubkey);
   const selfStatusQuery = useUserStatusQuery(
@@ -183,7 +231,7 @@ export function AppShell() {
       : undefined;
   const relayConnectionCard = useSidebarRelayConnectionCard(
     channelsErrorMessage,
-    workspacesHook.activeWorkspace?.relayUrl,
+    communitiesHook.activeCommunity?.relayUrl,
   );
   const memberChannels = React.useMemo(
     () => channels.filter((channel) => channel.isMember),
@@ -249,6 +297,7 @@ export function AppShell() {
   } = useUnreadChannels(sidebarChannels, activeChannel, {
     pubkey: identityQuery.data?.pubkey,
     relayClient,
+    relayUrl: communitiesHook.activeCommunity?.relayUrl,
     currentPubkey: identityQuery.data?.pubkey,
     mutedChannelIds,
     notifyForActiveChannel: notificationSettings.settings.notifyWhileViewing,
@@ -502,7 +551,10 @@ export function AppShell() {
   // Dispatch `buzz://message` deep links into the router.
   useMessageDeepLinks();
 
-  const handleOpenNewDm = React.useCallback(() => setIsNewDmOpen(true), []);
+  const handleOpenNewDm = React.useCallback(
+    () => void goNewMessage(),
+    [goNewMessage],
+  );
   const handleOpenCreateChannel = React.useCallback(
     () => setIsCreateChannelOpen(true),
     [],
@@ -513,7 +565,16 @@ export function AppShell() {
     }
 
     function handleKeyDown(event: KeyboardEvent) {
-      if (!hasPrimaryShortcutModifier(event) || event.altKey) {
+      if (!hasPrimaryShortcutModifier(event) || event.altKey || event.repeat) {
+        return;
+      }
+
+      // A focused surface may claim the shortcut first — e.g. the composer
+      // consumes ⌘K to open the link editor when text is selected. Its
+      // element-level handler runs before this window-level bubble listener
+      // and calls `preventDefault()`; respect that instead of also opening
+      // the global dialog.
+      if (event.defaultPrevented) {
         return;
       }
 
@@ -604,6 +665,7 @@ export function AppShell() {
             threadActivityItems,
             threadActivityFeedItems,
             feedItemState,
+            onOpenSettings: handleOpenSettings,
           }}
         >
           <HuddleProvider>
@@ -618,14 +680,16 @@ export function AppShell() {
                     isHuddleDrawerOpen && "buzz-huddle-app-surface-open",
                   )}
                 >
-                  {workspaceRailEnabled ? (
-                    <WorkspaceRail
-                      activeWorkspaceId={
-                        workspacesHook.activeWorkspace?.id ?? null
+                  {communityRailEnabled ? (
+                    <CommunityRail
+                      activeCommunityId={
+                        communitiesHook.activeCommunity?.id ?? null
                       }
-                      onAddWorkspace={() => setIsAddWorkspaceOpen(true)}
-                      onSwitchWorkspace={workspacesHook.switchWorkspace}
-                      workspaces={workspacesHook.workspaces}
+                      onAddCommunity={() => setIsAddCommunityOpen(true)}
+                      onRemoveCommunity={communitiesHook.removeCommunity}
+                      onSwitchCommunity={handleSwitchCommunity}
+                      onUpdateCommunity={communitiesHook.updateCommunity}
+                      communities={communitiesHook.communities}
                     />
                   ) : null}
                   <SidebarProvider className="min-h-0 flex-1 flex-col overflow-hidden">
@@ -633,9 +697,9 @@ export function AppShell() {
                       <AppTopChrome
                         canGoBack={canGoBack}
                         canGoForward={canGoForward}
-                        hasWorkspaceRail={
-                          workspaceRailEnabled &&
-                          workspacesHook.workspaces.length > 1
+                        hasCommunityRail={
+                          communityRailEnabled &&
+                          communitiesHook.communities.length > 1
                         }
                         onGoBack={goBack}
                         onGoForward={goForward}
@@ -686,37 +750,34 @@ export function AppShell() {
                     ) : (
                       <div className="flex min-h-0 flex-1 overflow-hidden">
                         <AppSidebar
-                          activeWorkspace={workspacesHook.activeWorkspace}
+                          activeCommunity={communitiesHook.activeCommunity}
                           channels={sidebarChannels}
                           currentPubkey={identityQuery.data?.pubkey}
                           errorMessage={channelsErrorMessage}
                           fallbackDisplayName={identityQuery.data?.displayName}
                           homeBadgeCount={homeBadgeCount + dueReminderBadge}
-                          isAddWorkspaceOpen={isAddWorkspaceOpen}
+                          isAddCommunityOpen={isAddCommunityOpen}
                           relayConnectionCard={relayConnectionCard}
                           isCreatingChannel={createChannelMutation.isPending}
                           isCreatingForum={createForumMutation.isPending}
                           isLoading={channelsQuery.isLoading}
-                          isOpeningDm={openDmMutation.isPending}
-                          isNewDmOpen={isNewDmOpen}
                           isCreateChannelOpen={isCreateChannelOpen}
                           isPresencePending={presenceSession.isPending}
-                          onAddWorkspace={(workspace) => {
-                            const id = workspacesHook.addWorkspace(workspace);
-                            workspacesHook.switchWorkspace(id);
+                          onAddCommunity={(community) => {
+                            const id = communitiesHook.addCommunity(community);
+                            handleSwitchCommunity(id);
                           }}
-                          onAddWorkspaceOpenChange={setIsAddWorkspaceOpen}
-                          onNewDmOpenChange={setIsNewDmOpen}
+                          onAddCommunityOpenChange={setIsAddCommunityOpen}
+                          onNewMessage={handleOpenNewDm}
                           onCreateChannelOpenChange={setIsCreateChannelOpen}
-                          onOpenAddWorkspace={() => setIsAddWorkspaceOpen(true)}
-                          onUpdateWorkspace={workspacesHook.updateWorkspace}
-                          onRemoveWorkspace={workspacesHook.removeWorkspace}
-                          onSwitchWorkspace={workspacesHook.switchWorkspace}
-                          onCreateAgent={() =>
-                            void goAgents().then(requestOpenCreateAgent)
-                          }
+                          onOpenAddCommunity={() => setIsAddCommunityOpen(true)}
+                          onSendFeedback={() => setIsSendFeedbackOpen(true)}
+                          onUpdateCommunity={communitiesHook.updateCommunity}
+                          onRemoveCommunity={communitiesHook.removeCommunity}
+                          onSwitchCommunity={handleSwitchCommunity}
+                          onCreateAgent={() => requestOpenCreateAgent()}
                           selfPresenceStatus={presenceSession.currentStatus}
-                          workspaces={workspacesHook.workspaces}
+                          communities={communitiesHook.communities}
                           onCreateChannel={async ({
                             description,
                             name,
@@ -824,6 +885,7 @@ export function AppShell() {
                           <SidebarInset
                             ref={mainInsetRef}
                             className="isolate min-h-0 min-w-0 overflow-hidden bg-sidebar"
+                            data-buzz-glass-inset
                             style={chromeCssVarDefaults as React.CSSProperties}
                           >
                             <div className="relative z-10 mb-2 ml-px mr-2 mt-px flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl bg-background shadow-[-1px_-1px_0_0_hsl(var(--sidebar-border)/0.45)]">
@@ -834,14 +896,16 @@ export function AppShell() {
                         <RelayConnectionOverlay
                           card={relayConnectionCard}
                           errorMessage={channelsErrorMessage}
-                          hasWorkspaceRail={
-                            workspaceRailEnabled &&
-                            workspacesHook.workspaces.length > 1
+                          hasCommunityRail={
+                            communityRailEnabled &&
+                            communitiesHook.communities.length > 1
                           }
                           isHuddleDrawerOpen={isHuddleDrawerOpen}
                         />
                       </div>
                     )}
+                    <RequestedAgentCreateDialogs />
+                    <AgentManagementDialogs />
                     <AppShellOverlays
                       activeChannel={managedChannel}
                       browseDialogType={browseDialogType}
@@ -864,6 +928,10 @@ export function AppShell() {
                       onSelectChannel={(channelId) => {
                         void goChannel(channelId);
                       }}
+                    />
+                    <SendFeedbackController
+                      onOpenChange={setIsSendFeedbackOpen}
+                      open={isSendFeedbackOpen}
                     />
                   </SidebarProvider>
                 </div>

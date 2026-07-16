@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-import { installMockBridge } from "../helpers/bridge";
+import { installMockBridge, openCreateChannelDialog } from "../helpers/bridge";
 
 const DEFAULT_AGENT_ACTIVITY_PUBKEY =
   "db0b028cd36f4d3e36c8300cce87252c1f7fc9495ffecc53f393fcac341ffd36";
@@ -96,11 +96,25 @@ test("loads the app shell with mocked channels", async ({ page }) => {
   await expect(page.getByTestId("dm-list")).toContainText("alice-tyler");
 });
 
+async function chooseSharedComputeProvider(
+  page: import("@playwright/test").Page,
+) {
+  const provider = page.locator("#persona-llm-provider");
+  await expect(provider).toBeVisible({ timeout: 10_000 });
+  await provider.press("Enter");
+  await page
+    .getByRole("menuitemradio", {
+      exact: true,
+      name: "Buzz shared compute",
+    })
+    .click();
+}
+
 test("creates a new mocked stream", async ({ page }) => {
   const channelName = `release-notes-${Date.now()}`;
 
   await page.goto("/");
-  await page.getByRole("button", { name: "Create a channel" }).click();
+  await openCreateChannelDialog(page);
   await page.getByTestId("create-channel-name").fill(channelName);
   await page
     .getByTestId("create-channel-description")
@@ -111,6 +125,87 @@ test("creates a new mocked stream", async ({ page }) => {
   await expect(page.getByTestId("chat-title")).toContainText(channelName);
 });
 
+test("Buzz shared compute explains the empty state without blocking Default auto", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.evaluate(() => {
+    (
+      window as Window & {
+        __BUZZ_E2E_SET_MESH__?: (mesh: {
+          models?: Array<{ id: string; name: string | null }>;
+        }) => void;
+      }
+    ).__BUZZ_E2E_SET_MESH__?.({ models: [] });
+  });
+  await page.getByTestId("open-agents-view").click();
+  await page.getByTestId("new-agent-card").click();
+  await page.getByRole("menuitem", { name: /^New agent$/ }).click();
+  await chooseSharedComputeProvider(page);
+
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as Window & { __BUZZ_E2E_COMMANDS__?: string[] })
+            .__BUZZ_E2E_COMMANDS__ ?? [],
+      ),
+    )
+    .toContain("discover_agent_models");
+  await expect(page.locator("#persona-model")).toContainText("Default (auto)");
+  await expect(
+    page.getByTestId("persona-model-discovery-status"),
+  ).toContainText("No members are sharing compute right now");
+  await expect(
+    page.getByTestId("persona-model-discovery-status"),
+  ).toContainText("Settings > Compute");
+  await expect(page.locator("#persona-custom-model")).toHaveCount(0);
+});
+
+test("create agent persists Buzz shared compute with auto model", async ({
+  page,
+}) => {
+  const agentName = `Shared compute agent ${Date.now()}`;
+
+  await page.goto("/");
+  await page.getByTestId("open-agents-view").click();
+  await page.getByTestId("new-agent-card").click();
+  await page.getByRole("menuitem", { name: /^New agent$/ }).click();
+  await page.locator("#persona-display-name").fill(agentName);
+
+  await chooseSharedComputeProvider(page);
+
+  const model = page.locator("#persona-model");
+  await expect(model).toContainText("Default (auto)");
+  await page.getByTestId("persona-dialog-submit").click();
+  await expect(
+    page.getByRole("heading", { name: "Agent created" }),
+  ).toBeVisible({ timeout: 10_000 });
+
+  const createPayload = await page.evaluate((name) => {
+    const log = (
+      window as Window & {
+        __BUZZ_E2E_COMMAND_LOG__?: Array<{
+          command: string;
+          payload: unknown;
+        }>;
+      }
+    ).__BUZZ_E2E_COMMAND_LOG__;
+    return log
+      ?.filter((entry) => entry.command === "create_managed_agent")
+      .map((entry) => entry.payload as { input?: Record<string, unknown> })
+      .find((payload) => payload.input?.name === name)?.input;
+  }, agentName);
+
+  expect(createPayload).toMatchObject({
+    agentCommand: "buzz-agent",
+    model: "auto",
+    provider: "relay-mesh",
+    spawnAfterCreate: true,
+    startOnAppLaunch: true,
+  });
+});
+
 test("create agent supports parallelism and system prompt overrides", async ({
   page,
 }) => {
@@ -119,19 +214,49 @@ test("create agent supports parallelism and system prompt overrides", async ({
   await page.goto("/");
   await page.getByTestId("open-agents-view").click();
   await page.getByTestId("new-agent-card").click();
-  await page.getByText("Custom agent").click();
+  await page.getByRole("menuitem", { name: /^New agent$/ }).click();
 
-  await page.getByTestId("agent-name-input").fill(agentName);
-  await page.getByRole("button", { name: "Advanced setup" }).click();
-  await page.getByTestId("agent-parallelism-input").fill("3");
+  await page.locator("#persona-display-name").fill(agentName);
   await page
-    .getByTestId("agent-system-prompt-input")
+    .locator("#persona-system-prompt")
     .fill("You are concise and parallelize independent work.");
-  await page.getByTestId("create-agent-submit").click();
+
+  // The buzz-agent runtime auto-selects once the ACP runtime catalog loads;
+  // the LLM provider field renders after that.
+  const llmProvider = page.locator("#persona-llm-provider");
+  await expect(llmProvider).toBeVisible({ timeout: 10_000 });
+  await llmProvider.press("Enter");
+  await page
+    .getByRole("menuitemradio", { exact: true, name: "Anthropic" })
+    .click();
+  const model = page.locator("#persona-model");
+  await model.click();
+  await page
+    .getByRole("button", { name: "Custom model...", exact: true })
+    .click();
+  await page.getByLabel("Custom model ID").fill("claude-opus-4-5");
+  await page.getByLabel("Anthropic API Key").fill("sk-test-api-key-for-e2e");
+
+  const advancedToggle = page.getByRole("button", {
+    name: "Advanced",
+    exact: true,
+  });
+  await advancedToggle.click();
+  // Parallelism is above the env-vars editor in the Advanced section; filling
+  // the required API-key row may have scrolled the dialog past it. Scroll back.
+  await page
+    .locator("#persona-parallelism")
+    .evaluate((el) => el.scrollIntoView({ block: "nearest" }));
+  await expect(page.locator("#persona-parallelism")).toBeVisible();
+  await page.locator("#persona-parallelism").fill("3");
+
+  // Submitting mints a running instance whose behavioral quad resolves from
+  // the definition (agents always start after creation).
+  await page.getByTestId("persona-dialog-submit").click();
 
   await expect(
     page.getByRole("heading", { name: "Agent created" }),
-  ).toBeVisible();
+  ).toBeVisible({ timeout: 10_000 });
   await page.getByRole("button", { name: "Done" }).click();
 
   await expect(page.getByTestId("agents-library-personas")).toContainText(
@@ -194,7 +319,9 @@ test("inbox feed shows channel and agent activity sections", async ({
   );
 });
 
-test("inbox agent hover only exposes message action", async ({ page }) => {
+test("inbox agent hover hides actions without agent access", async ({
+  page,
+}) => {
   await page.goto("/");
 
   await selectHomeInboxFilter(page, "Agents");
@@ -212,7 +339,7 @@ test("inbox agent hover only exposes message action", async ({ page }) => {
     profilePopover.getByTestId(
       `user-profile-popover-message-${DEFAULT_AGENT_ACTIVITY_PUBKEY}`,
     ),
-  ).toBeVisible();
+  ).toHaveCount(0);
   await expect(
     profilePopover.getByTestId(
       `user-profile-popover-wave-${DEFAULT_AGENT_ACTIVITY_PUBKEY}`,
@@ -428,6 +555,23 @@ test("sends a mocked channel message", async ({ page }) => {
   await page.getByTestId("send-message").click();
 
   await expect(page.getByTestId("message-timeline")).toContainText(message);
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const row = Array.from(
+          document.querySelectorAll<HTMLElement>("[data-message-id]"),
+        ).at(-1);
+        const composer = document.querySelector<HTMLElement>(
+          '[data-testid="message-composer"]',
+        );
+        if (!row || !composer) return Number.NEGATIVE_INFINITY;
+        return (
+          composer.getBoundingClientRect().top -
+          row.getBoundingClientRect().bottom
+        );
+      }),
+    )
+    .toBeGreaterThanOrEqual(0);
 });
 
 test("supports multiline drafts with Ctrl+Enter and sends with Enter", async ({

@@ -1,6 +1,13 @@
 import * as React from "react";
 import type { LucideIcon } from "lucide-react";
-import { Activity, Archive, ChevronRight, Info, Wrench } from "lucide-react";
+import {
+  Activity,
+  Archive,
+  ChevronRight,
+  Info,
+  RefreshCw,
+  Wrench,
+} from "lucide-react";
 
 import type { ActiveTurnSummary } from "@/features/agents/activeAgentTurnsStore";
 import { ManagedAgentSessionPanel } from "@/features/agents/ui/ManagedAgentSessionPanel";
@@ -273,6 +280,7 @@ export function ProfileInfoTabContent({
   activeTurns,
   activityAgent,
   agentInfoFields,
+  callerChannelId,
   channelIdToName,
   isArchived,
   onOpenActivity,
@@ -282,6 +290,7 @@ export function ProfileInfoTabContent({
   activeTurns: ActiveTurnSummary[];
   activityAgent: ProfileActivityAgent | null;
   agentInfoFields: ProfileField[];
+  callerChannelId: string | null;
   channelIdToName: Record<string, string>;
   isArchived: boolean;
   onOpenActivity: (channelId?: string | null) => void;
@@ -316,6 +325,7 @@ export function ProfileInfoTabContent({
           <ProfileLiveActivityEmbed
             activeTurns={activeTurns}
             activityAgent={activityAgent}
+            callerChannelId={callerChannelId}
             channelIdToName={channelIdToName}
             feedScope={feedScope}
             onOpenActivity={onOpenActivity}
@@ -338,12 +348,14 @@ export function ProfileInfoTabContent({
 function ProfileLiveActivityEmbed({
   activeTurns,
   activityAgent,
+  callerChannelId,
   channelIdToName,
   feedScope,
   onOpenActivity,
 }: {
   activeTurns: ActiveTurnSummary[];
   activityAgent: ProfileActivityAgent;
+  callerChannelId: string | null;
   channelIdToName: Record<string, string>;
   feedScope: ProfileActivityFeedScope;
   onOpenActivity: (channelId?: string | null) => void;
@@ -366,7 +378,7 @@ function ProfileLiveActivityEmbed({
   const activeChannelId = resolveActivityChannelId(
     slides,
     selectedChannelId,
-    feedScope.preferredChannelId,
+    callerChannelId ?? feedScope.preferredChannelId,
   );
   const selectedIndex = activeChannelId ? slides.indexOf(activeChannelId) : 0;
 
@@ -467,7 +479,7 @@ function ProfileLiveActivityEmbed({
         <ManagedAgentSessionPanel
           agent={activityAgent}
           autoTail={true}
-          channelId={null}
+          channelId={callerChannelId}
           className="relative z-0 min-h-0 flex-1 border-0 bg-transparent px-4 text-xs shadow-none **:data-message-id:pointer-events-none"
           emptyDescription={emptyDescription}
           emptyState={emptyState}
@@ -721,8 +733,10 @@ function ArchiveStatusTooltip() {
 
 export function ProfileRuntimeTabContent({
   agentInstruction,
+  autoRestartEnabled = false,
   diagnosticsFields,
   diagnosticsSummary,
+  needsRestart = false,
   onOpenDiagnostics,
   onOpenInstructions,
   runtimeConfigurationFields,
@@ -731,8 +745,12 @@ export function ProfileRuntimeTabContent({
   showInstructionBlock,
 }: {
   agentInstruction: string | null;
+  /** Whether the per-agent auto-restart toggle is ON. */
+  autoRestartEnabled?: boolean;
   diagnosticsFields: ProfileField[];
   diagnosticsSummary: React.ReactNode;
+  /** True when the running agent's config has drifted from what it was spawned with. */
+  needsRestart?: boolean;
   onOpenDiagnostics: () => void;
   onOpenInstructions: () => void;
   runtimeConfigurationFields: ProfileField[];
@@ -761,6 +779,24 @@ export function ProfileRuntimeTabContent({
 
   return (
     <div className="space-y-2">
+      {needsRestart ? (
+        <div
+          className="flex items-start gap-3 rounded-2xl bg-amber-500/10 px-4 py-3"
+          data-testid="needs-restart-banner"
+        >
+          <RefreshCw className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+          <div className="min-w-0 text-sm">
+            <p className="font-medium text-amber-600 dark:text-amber-400">
+              Restart required
+            </p>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              {autoRestartEnabled
+                ? "Configuration changed since this agent started. Buzz can restart it automatically after ~3 minutes idle, or stop and respawn it to apply now."
+                : "Configuration changed since this agent started. Automatic restart is off for this agent \u2014 stop and respawn it to apply the changes."}
+            </p>
+          </div>
+        </div>
+      ) : null}
       {showInstructionBlock ? (
         <div className="overflow-hidden rounded-2xl bg-muted/20">
           <AgentInstructionRow
