@@ -6,6 +6,9 @@ use buzz_media::sanitize::{probe_media, sanitize, validate_toolchain, MediaClass
 use buzz_media::MediaConfig;
 use sha2::{Digest, Sha256};
 
+const ICC_CANONICAL_DESCRIPTION: &str = "Sanitized color profile";
+const ICC_CANONICAL_COPYRIGHT: &str = "Sanitized by Buzz";
+
 fn config() -> MediaConfig {
     MediaConfig {
         s3_endpoint: String::new(),
@@ -74,6 +77,79 @@ fn add_private_metadata(config: &MediaConfig, fixture: &Path) {
     );
 }
 
+fn icc_text(value: &str) -> Vec<u8> {
+    let mut data = Vec::with_capacity(9 + value.len());
+    data.extend_from_slice(b"text");
+    data.extend_from_slice(&[0; 4]);
+    data.extend_from_slice(value.as_bytes());
+    data.push(0);
+    data
+}
+
+fn icc_description(value: &str) -> Vec<u8> {
+    let mut data = Vec::with_capacity(91 + value.len());
+    data.extend_from_slice(b"desc");
+    data.extend_from_slice(&[0; 4]);
+    data.extend_from_slice(&((value.len() + 1) as u32).to_be_bytes());
+    data.extend_from_slice(value.as_bytes());
+    data.push(0);
+    data.extend_from_slice(&[0; 8]);
+    data.extend_from_slice(&[0; 2]);
+    data.push(0);
+    data.extend_from_slice(&[0; 67]);
+    data
+}
+
+fn descriptive_icc_profile() -> Vec<u8> {
+    let tags = [
+        (*b"desc", icc_description("Alice's iPhone color profile")),
+        (*b"cprt", icc_text("Copyright Alice")),
+        (*b"dmdd", icc_description("Alice's iPhone 17")),
+        (
+            *b"rXYZ",
+            Vec::from(&b"XYZ \0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"[..]),
+        ),
+    ];
+    let mut profile = vec![0_u8; 132 + tags.len() * 12];
+    profile[4..8].copy_from_slice(b"Buzz");
+    profile[8..12].copy_from_slice(&[4, 0x30, 0, 0]);
+    profile[12..16].copy_from_slice(b"mntr");
+    profile[16..20].copy_from_slice(b"RGB ");
+    profile[20..24].copy_from_slice(b"XYZ ");
+    profile[24..36].fill(1);
+    profile[36..40].copy_from_slice(b"acsp");
+    profile[40..44].copy_from_slice(b"APPL");
+    profile[48..52].copy_from_slice(b"APPL");
+    profile[52..56].copy_from_slice(b"iPhn");
+    profile[80..84].copy_from_slice(b"Buzz");
+    profile[84..100].fill(0x5a);
+    profile[128..132].copy_from_slice(&(tags.len() as u32).to_be_bytes());
+    for (index, (signature, data)) in tags.into_iter().enumerate() {
+        while !profile.len().is_multiple_of(4) {
+            profile.push(0);
+        }
+        let offset = profile.len();
+        profile.extend_from_slice(&data);
+        let entry = 132 + index * 12;
+        profile[entry..entry + 4].copy_from_slice(&signature);
+        profile[entry + 4..entry + 8].copy_from_slice(&(offset as u32).to_be_bytes());
+        profile[entry + 8..entry + 12].copy_from_slice(&(data.len() as u32).to_be_bytes());
+    }
+    let size = profile.len() as u32;
+    profile[0..4].copy_from_slice(&size.to_be_bytes());
+    profile
+}
+
+fn add_descriptive_icc(config: &MediaConfig, fixture: &Path) {
+    let profile = fixture.with_extension("icc");
+    std::fs::write(&profile, descriptive_icc_profile()).expect("write synthetic ICC profile");
+    let assignment = format!("-ICC_Profile<={}", path(&profile));
+    run(
+        &config.exiftool_path,
+        &["-overwrite_original", &assignment, path(fixture)],
+    );
+}
+
 fn forbidden_metadata(
     config: &MediaConfig,
     fixture: &Path,
@@ -91,6 +167,10 @@ fn forbidden_metadata(
             "-Comment",
             "-Title",
             "-UserDefinedText",
+            "-ProfileDescription",
+            "-ProfileCopyright",
+            "-DeviceMfgDesc",
+            "-DeviceModelDesc",
             path(fixture),
         ])
         .output()
@@ -98,7 +178,18 @@ fn forbidden_metadata(
     assert!(output.status.success(), "metadata oracle failed");
     let values: Vec<serde_json::Value> =
         serde_json::from_slice(&output.stdout).expect("ExifTool JSON");
-    values[0].as_object().expect("ExifTool object").clone()
+    let mut object = values[0].as_object().expect("ExifTool object").clone();
+    object.retain(|key, value| {
+        if key.ends_with("SourceFile") {
+            return true;
+        }
+        !matches!(
+            (key.rsplit(':').next(), value.as_str()),
+            (Some("ProfileDescription"), Some(ICC_CANONICAL_DESCRIPTION))
+                | (Some("ProfileCopyright"), Some(ICC_CANONICAL_COPYRIGHT))
+        )
+    });
+    object
 }
 
 fn source_hash(path: &Path) -> String {
@@ -267,6 +358,9 @@ async fn realistic_media_matrix_strips_location_and_descriptive_metadata() {
         ffmpeg(&config, &args);
         if ext != "bmp" {
             add_private_metadata(&config, &fixture);
+        }
+        if ext == "jpg" {
+            add_descriptive_icc(&config, &fixture);
         }
         assert_sanitized(&config, &fixture, MediaClass::Image, ext != "bmp").await;
     }

@@ -4,6 +4,7 @@
 //! the hash of the source bytes, while this module returns a new artifact whose
 //! hash becomes the public content-addressed identifier.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::OnceLock;
@@ -24,6 +25,23 @@ const MAX_ANIMATION_PIXELS: u64 = 250_000_000;
 const MAX_VIDEO_DURATION_SECS: f64 = 600.0;
 const MAX_VIDEO_WIDTH: u32 = 3_840;
 const MAX_VIDEO_HEIGHT: u32 = 2_160;
+const ICC_CANONICAL_DESCRIPTION: &str = "Sanitized color profile";
+const ICC_CANONICAL_COPYRIGHT: &str = "Sanitized by Buzz";
+const MAX_ICC_TAGS: usize = 4_096;
+
+const ICC_REMOVED_TAGS: &[[u8; 4]] = &[
+    *b"B2D0", *b"B2D1", *b"B2D2", *b"B2D3", *b"D2B0", *b"D2B1", *b"D2B2", *b"D2B3", *b"calt",
+    *b"targ", *b"dmnd", *b"dmdd", *b"devs", *b"pseq", *b"psid", *b"scrd", *b"vued", *b"mmod",
+    *b"dscm", *b"meta", *b"clrt", *b"clot", *b"cloo", *b"meas", *b"resp", *b"rig0", *b"rig2",
+    *b"view", *b"tech", *b"ncl2", *b"ncol", *b"aarg", *b"aabg", *b"aagg", *b"vcgt", *b"ndin",
+    *b"vcgp",
+];
+
+const ICC_RENDERING_TAGS: [[u8; 4]; 24] = [
+    *b"A2B0", *b"A2B1", *b"A2B2", *b"B2A0", *b"B2A1", *b"B2A2", *b"bTRC", *b"bXYZ", *b"bkpt",
+    *b"chad", *b"chrm", *b"cicp", *b"clro", *b"gamt", *b"gTRC", *b"gXYZ", *b"kTRC", *b"lumi",
+    *b"pre0", *b"pre1", *b"pre2", *b"rTRC", *b"rXYZ", *b"wtpt",
+];
 
 static TOOL_VERSIONS: OnceLock<ToolVersions> = OnceLock::new();
 
@@ -362,6 +380,7 @@ pub async fn sanitize(
     };
 
     verify_forbidden_metadata(file.path(), config).await?;
+    verify_embedded_icc(file.path(), expected_class, config).await?;
     let sniff = read_sniff(file.path()).await?;
     let output_probe = probe_media(file.path(), &sniff, config)
         .await?
@@ -448,6 +467,7 @@ async fn sanitize_image(
             Duration::from_secs(config.image_process_timeout_secs),
         )
         .await?;
+        scrub_embedded_icc(output.path(), config).await?;
         return Ok(output);
     }
 
@@ -473,7 +493,482 @@ async fn sanitize_image(
         Duration::from_secs(config.image_process_timeout_secs),
     )
     .await?;
+    scrub_embedded_icc(output.path(), config).await?;
     Ok(output)
+}
+
+async fn scrub_embedded_icc(path: &Path, config: &MediaConfig) -> Result<(), MediaError> {
+    let path_arg = path_string(path);
+    let output = run_tool(
+        &config.exiftool_path,
+        &["-b", "-ICC_Profile", &path_arg],
+        Duration::from_secs(config.image_process_timeout_secs),
+    )
+    .await?;
+    if !output.status.success() {
+        return Err(MediaError::SanitizationFailed);
+    }
+    if output.stdout.is_empty() {
+        return Ok(());
+    }
+
+    let scrubbed = scrub_icc_profile(&output.stdout)?;
+    let profile = temp_with_suffix(".icc")?;
+    tokio::fs::write(profile.path(), scrubbed)
+        .await
+        .map_err(|error| MediaError::Io(error.to_string()))?;
+    let assignment = format!("-ICC_Profile<={}", path_string(profile.path()));
+    let args = [
+        "-overwrite_original".to_string(),
+        assignment,
+        path_string(path),
+    ];
+    require_success(
+        &config.exiftool_path,
+        &args,
+        Duration::from_secs(config.image_process_timeout_secs),
+    )
+    .await
+}
+
+fn scrub_icc_profile(profile: &[u8]) -> Result<Vec<u8>, MediaError> {
+    const HEADER_SIZE: usize = 128;
+    const TAG_TABLE_START: usize = HEADER_SIZE + 4;
+
+    if profile.len() < TAG_TABLE_START || profile.get(36..40) != Some(b"acsp") {
+        return Err(MediaError::SanitizationFailed);
+    }
+    let declared_size = read_icc_u32(profile, 0)?;
+    let declared_size =
+        usize::try_from(declared_size).map_err(|_| MediaError::SanitizationFailed)?;
+    if declared_size < TAG_TABLE_START || declared_size > profile.len() {
+        return Err(MediaError::SanitizationFailed);
+    }
+    let profile = &profile[..declared_size];
+    let tag_count = usize::try_from(read_icc_u32(profile, HEADER_SIZE)?)
+        .map_err(|_| MediaError::SanitizationFailed)?;
+    if tag_count > MAX_ICC_TAGS {
+        return Err(MediaError::SanitizationFailed);
+    }
+    let table_size = tag_count
+        .checked_mul(12)
+        .and_then(|size| TAG_TABLE_START.checked_add(size))
+        .ok_or(MediaError::SanitizationFailed)?;
+    if table_size > profile.len() {
+        return Err(MediaError::SanitizationFailed);
+    }
+
+    let mut tags = Vec::with_capacity(tag_count);
+    let mut seen_signatures = HashSet::with_capacity(tag_count);
+    let mut retained_input_bytes = 0_usize;
+    for index in 0..tag_count {
+        let entry = TAG_TABLE_START + index * 12;
+        let signature: [u8; 4] = profile[entry..entry + 4]
+            .try_into()
+            .map_err(|_| MediaError::SanitizationFailed)?;
+        if !seen_signatures.insert(signature) {
+            return Err(MediaError::SanitizationFailed);
+        }
+        let offset = usize::try_from(read_icc_u32(profile, entry + 4)?)
+            .map_err(|_| MediaError::SanitizationFailed)?;
+        let size = usize::try_from(read_icc_u32(profile, entry + 8)?)
+            .map_err(|_| MediaError::SanitizationFailed)?;
+        let end = offset
+            .checked_add(size)
+            .ok_or(MediaError::SanitizationFailed)?;
+        if offset < table_size || end > profile.len() {
+            return Err(MediaError::SanitizationFailed);
+        }
+        if ICC_REMOVED_TAGS.contains(&signature) {
+            continue;
+        }
+        retained_input_bytes = retained_input_bytes
+            .checked_add(size)
+            .ok_or(MediaError::SanitizationFailed)?;
+        if retained_input_bytes > MAX_TOOL_OUTPUT {
+            return Err(MediaError::SanitizationFailed);
+        }
+        let original = profile
+            .get(offset..end)
+            .ok_or(MediaError::SanitizationFailed)?;
+        let data = match &signature {
+            b"desc" => canonical_icc_text(&signature, original, ICC_CANONICAL_DESCRIPTION)?,
+            b"cprt" => canonical_icc_text(&signature, original, ICC_CANONICAL_COPYRIGHT)?,
+            _ => canonical_icc_rendering_tag(&signature, original)?,
+        };
+        tags.push((signature, data));
+    }
+    // Tag-table order has no color-rendering semantics. Canonicalize it so a
+    // source profile cannot retain a device fingerprint or covert payload in
+    // the permutation of otherwise permitted tags.
+    tags.sort_unstable_by_key(|(signature, _)| *signature);
+
+    let new_table_end = TAG_TABLE_START
+        .checked_add(
+            tags.len()
+                .checked_mul(12)
+                .ok_or(MediaError::SanitizationFailed)?,
+        )
+        .ok_or(MediaError::SanitizationFailed)?;
+    let mut scrubbed = canonical_icc_header(profile)?.to_vec();
+    scrubbed.extend_from_slice(
+        &u32::try_from(tags.len())
+            .map_err(|_| MediaError::SanitizationFailed)?
+            .to_be_bytes(),
+    );
+    scrubbed.resize(new_table_end, 0);
+
+    for (index, (signature, data)) in tags.into_iter().enumerate() {
+        while !scrubbed.len().is_multiple_of(4) {
+            scrubbed.push(0);
+        }
+        let offset = scrubbed.len();
+        scrubbed.extend_from_slice(&data);
+        let entry = TAG_TABLE_START + index * 12;
+        scrubbed[entry..entry + 4].copy_from_slice(&signature);
+        scrubbed[entry + 4..entry + 8].copy_from_slice(
+            &u32::try_from(offset)
+                .map_err(|_| MediaError::SanitizationFailed)?
+                .to_be_bytes(),
+        );
+        scrubbed[entry + 8..entry + 12].copy_from_slice(
+            &u32::try_from(data.len())
+                .map_err(|_| MediaError::SanitizationFailed)?
+                .to_be_bytes(),
+        );
+    }
+    while !scrubbed.len().is_multiple_of(4) {
+        scrubbed.push(0);
+    }
+    let scrubbed_size =
+        u32::try_from(scrubbed.len()).map_err(|_| MediaError::SanitizationFailed)?;
+    scrubbed[0..4].copy_from_slice(&scrubbed_size.to_be_bytes());
+    Ok(scrubbed)
+}
+
+fn canonical_icc_header(profile: &[u8]) -> Result<[u8; 128], MediaError> {
+    let version_major = *profile.get(8).ok_or(MediaError::SanitizationFailed)?;
+    let version_minor_bugfix = *profile.get(9).ok_or(MediaError::SanitizationFailed)?;
+    if !matches!(version_major, 2 | 4) {
+        return Err(MediaError::SanitizationFailed);
+    }
+    let profile_class = icc_signature(profile, 12)?;
+    if !matches!(
+        &profile_class,
+        b"scnr" | b"mntr" | b"prtr" | b"link" | b"spac" | b"abst" | b"nmcl"
+    ) {
+        return Err(MediaError::SanitizationFailed);
+    }
+    let color_space = icc_signature(profile, 16)?;
+    if !valid_icc_color_space(&color_space) {
+        return Err(MediaError::SanitizationFailed);
+    }
+    let connection_space = icc_signature(profile, 20)?;
+    if !matches!(&connection_space, b"XYZ " | b"Lab ") {
+        return Err(MediaError::SanitizationFailed);
+    }
+    let rendering_intent = read_icc_u32(profile, 64)?;
+    if rendering_intent > 3 {
+        return Err(MediaError::SanitizationFailed);
+    }
+
+    let mut header = [0_u8; 128];
+    header[8] = version_major;
+    header[9] = version_minor_bugfix;
+    header[12..16].copy_from_slice(&profile_class);
+    header[16..20].copy_from_slice(&color_space);
+    header[20..24].copy_from_slice(&connection_space);
+    header[36..40].copy_from_slice(b"acsp");
+    // Profile flags and device attributes are deliberately canonicalized to
+    // zero; their reserved bits are an otherwise opaque data channel and they
+    // are not part of the color transform.
+    header[64..68].copy_from_slice(&rendering_intent.to_be_bytes());
+    // ICC.1 v2/v4 mandates the D50 PCS illuminant. Rebuilding the fixed value
+    // prevents this header field from becoming an opaque metadata channel.
+    header[68..80].copy_from_slice(&[
+        0x00, 0x00, 0xf6, 0xd6, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0xd3, 0x2d,
+    ]);
+    Ok(header)
+}
+
+fn icc_signature(profile: &[u8], offset: usize) -> Result<[u8; 4], MediaError> {
+    profile
+        .get(offset..offset + 4)
+        .and_then(|value| value.try_into().ok())
+        .ok_or(MediaError::SanitizationFailed)
+}
+
+fn valid_icc_color_space(signature: &[u8; 4]) -> bool {
+    matches!(
+        signature,
+        b"XYZ "
+            | b"Lab "
+            | b"Luv "
+            | b"YCbr"
+            | b"Yxy "
+            | b"RGB "
+            | b"GRAY"
+            | b"HSV "
+            | b"HLS "
+            | b"CMYK"
+            | b"CMY "
+            | b"1CLR"
+            | b"2CLR"
+            | b"3CLR"
+            | b"4CLR"
+            | b"5CLR"
+            | b"6CLR"
+            | b"7CLR"
+            | b"8CLR"
+            | b"9CLR"
+            | b"ACLR"
+            | b"BCLR"
+            | b"CCLR"
+            | b"DCLR"
+            | b"ECLR"
+            | b"FCLR"
+    )
+}
+
+fn canonical_icc_text(
+    signature: &[u8; 4],
+    original: &[u8],
+    value: &str,
+) -> Result<Vec<u8>, MediaError> {
+    if original.get(0..4) == Some(b"mluc") {
+        let utf16 = value
+            .encode_utf16()
+            .flat_map(u16::to_be_bytes)
+            .collect::<Vec<_>>();
+        let mut data = Vec::with_capacity(28 + utf16.len());
+        data.extend_from_slice(b"mluc");
+        data.extend_from_slice(&[0; 4]);
+        data.extend_from_slice(&1_u32.to_be_bytes());
+        data.extend_from_slice(&12_u32.to_be_bytes());
+        data.extend_from_slice(b"enUS");
+        data.extend_from_slice(&(utf16.len() as u32).to_be_bytes());
+        data.extend_from_slice(&28_u32.to_be_bytes());
+        data.extend_from_slice(&utf16);
+        Ok(data)
+    } else if signature == b"desc" && original.get(0..4) == Some(b"desc") {
+        let mut data = Vec::with_capacity(91 + value.len());
+        data.extend_from_slice(b"desc");
+        data.extend_from_slice(&[0; 4]);
+        data.extend_from_slice(&((value.len() + 1) as u32).to_be_bytes());
+        data.extend_from_slice(value.as_bytes());
+        data.push(0);
+        data.extend_from_slice(&[0; 8]);
+        data.extend_from_slice(&[0; 2]);
+        data.push(0);
+        data.extend_from_slice(&[0; 67]);
+        Ok(data)
+    } else if signature == b"cprt" && original.get(0..4) == Some(b"text") {
+        let mut data = Vec::with_capacity(9 + value.len());
+        data.extend_from_slice(b"text");
+        data.extend_from_slice(&[0; 4]);
+        data.extend_from_slice(value.as_bytes());
+        data.push(0);
+        Ok(data)
+    } else {
+        Err(MediaError::SanitizationFailed)
+    }
+}
+
+fn canonical_icc_rendering_tag(signature: &[u8; 4], data: &[u8]) -> Result<Vec<u8>, MediaError> {
+    if !ICC_RENDERING_TAGS.contains(signature) || data.get(4..8) != Some(&[0; 4]) {
+        return Err(MediaError::SanitizationFailed);
+    }
+    let tag_type = data.get(0..4).ok_or(MediaError::SanitizationFailed)?;
+    let expected_size = match signature {
+        b"A2B0" | b"A2B1" | b"A2B2" | b"B2A0" | b"B2A1" | b"B2A2" | b"gamt" | b"pre0" | b"pre1"
+        | b"pre2" => match tag_type {
+            b"mft1" => icc_lut8_size(data)?,
+            b"mft2" => icc_lut16_size(data)?,
+            // mAB/mBA and multi-process elements are standards-compliant but
+            // contain nested offset graphs. Reject them until every element
+            // can be rebuilt without opaque trailing bytes.
+            _ => return Err(MediaError::SanitizationFailed),
+        },
+        b"bTRC" | b"gTRC" | b"kTRC" | b"rTRC" => icc_curve_size(data)?,
+        b"bXYZ" | b"bkpt" | b"gXYZ" | b"lumi" | b"rXYZ" | b"wtpt" if tag_type == b"XYZ " => 20,
+        b"chad" if tag_type == b"sf32" => 44,
+        b"chrm" if tag_type == b"chrm" => {
+            let channels = usize::from(read_icc_u16(data, 8)?);
+            12_usize
+                .checked_add(
+                    channels
+                        .checked_mul(8)
+                        .ok_or(MediaError::SanitizationFailed)?,
+                )
+                .ok_or(MediaError::SanitizationFailed)?
+        }
+        b"cicp" if tag_type == b"cicp" => 12,
+        b"clro" if tag_type == b"clro" => {
+            let channels = usize::try_from(read_icc_u32(data, 8)?)
+                .map_err(|_| MediaError::SanitizationFailed)?;
+            12_usize
+                .checked_add(channels)
+                .ok_or(MediaError::SanitizationFailed)?
+        }
+        _ => return Err(MediaError::SanitizationFailed),
+    };
+    let padded_size = expected_size
+        .checked_add(3)
+        .map(|size| size / 4 * 4)
+        .ok_or(MediaError::SanitizationFailed)?;
+    if !(expected_size..=padded_size).contains(&data.len())
+        || data[expected_size..].iter().any(|byte| *byte != 0)
+    {
+        return Err(MediaError::SanitizationFailed);
+    }
+    // ICC writers may include up to the next four-byte boundary in the tag's
+    // declared size. Accept only zero alignment bytes and strip them so the
+    // rebuilt profile is deterministic and cannot retain a trailing payload.
+    Ok(data[..expected_size].to_vec())
+}
+
+fn icc_curve_size(data: &[u8]) -> Result<usize, MediaError> {
+    match data.get(0..4) {
+        Some(b"curv") => {
+            let entries = usize::try_from(read_icc_u32(data, 8)?)
+                .map_err(|_| MediaError::SanitizationFailed)?;
+            12_usize
+                .checked_add(
+                    entries
+                        .checked_mul(2)
+                        .ok_or(MediaError::SanitizationFailed)?,
+                )
+                .ok_or(MediaError::SanitizationFailed)
+        }
+        Some(b"para") => {
+            if data.get(10..12) != Some(&[0; 2]) {
+                return Err(MediaError::SanitizationFailed);
+            }
+            let parameters = match read_icc_u16(data, 8)? {
+                0 => 1,
+                1 => 3,
+                2 => 4,
+                3 => 5,
+                4 => 7,
+                _ => return Err(MediaError::SanitizationFailed),
+            };
+            12_usize
+                .checked_add(parameters * 4)
+                .ok_or(MediaError::SanitizationFailed)
+        }
+        _ => Err(MediaError::SanitizationFailed),
+    }
+}
+
+fn icc_lut8_size(data: &[u8]) -> Result<usize, MediaError> {
+    if data.len() < 48 || data.get(11) != Some(&0) {
+        return Err(MediaError::SanitizationFailed);
+    }
+    let inputs = usize::from(data[8]);
+    let outputs = usize::from(data[9]);
+    let grid = usize::from(data[10]);
+    if inputs == 0 || outputs == 0 || grid < 2 {
+        return Err(MediaError::SanitizationFailed);
+    }
+    let clut_points = checked_icc_power(grid, inputs)?;
+    48_usize
+        .checked_add(
+            inputs
+                .checked_mul(256)
+                .ok_or(MediaError::SanitizationFailed)?,
+        )
+        .and_then(|size| size.checked_add(clut_points.checked_mul(outputs)?))
+        .and_then(|size| size.checked_add(outputs.checked_mul(256)?))
+        .ok_or(MediaError::SanitizationFailed)
+}
+
+fn icc_lut16_size(data: &[u8]) -> Result<usize, MediaError> {
+    if data.len() < 52 || data.get(11) != Some(&0) {
+        return Err(MediaError::SanitizationFailed);
+    }
+    let inputs = usize::from(data[8]);
+    let outputs = usize::from(data[9]);
+    let grid = usize::from(data[10]);
+    let input_entries = usize::from(read_icc_u16(data, 48)?);
+    let output_entries = usize::from(read_icc_u16(data, 50)?);
+    if inputs == 0 || outputs == 0 || grid < 2 || input_entries < 2 || output_entries < 2 {
+        return Err(MediaError::SanitizationFailed);
+    }
+    let clut_points = checked_icc_power(grid, inputs)?;
+    let input_bytes = inputs
+        .checked_mul(input_entries)
+        .and_then(|size| size.checked_mul(2))
+        .ok_or(MediaError::SanitizationFailed)?;
+    52_usize
+        .checked_add(input_bytes)
+        .and_then(|size| size.checked_add(clut_points.checked_mul(outputs)?.checked_mul(2)?))
+        .and_then(|size| size.checked_add(outputs.checked_mul(output_entries)?.checked_mul(2)?))
+        .ok_or(MediaError::SanitizationFailed)
+}
+
+fn checked_icc_power(base: usize, exponent: usize) -> Result<usize, MediaError> {
+    (0..exponent).try_fold(1_usize, |value, _| {
+        value
+            .checked_mul(base)
+            .ok_or(MediaError::SanitizationFailed)
+    })
+}
+
+fn read_icc_u32(bytes: &[u8], offset: usize) -> Result<u32, MediaError> {
+    bytes
+        .get(offset..offset + 4)
+        .and_then(|value| value.try_into().ok())
+        .map(u32::from_be_bytes)
+        .ok_or(MediaError::SanitizationFailed)
+}
+
+fn read_icc_u16(bytes: &[u8], offset: usize) -> Result<u16, MediaError> {
+    bytes
+        .get(offset..offset + 2)
+        .and_then(|value| value.try_into().ok())
+        .map(u16::from_be_bytes)
+        .ok_or(MediaError::SanitizationFailed)
+}
+
+async fn verify_embedded_icc(
+    path: &Path,
+    class: MediaClass,
+    config: &MediaConfig,
+) -> Result<(), MediaError> {
+    let path_arg = path_string(path);
+    let timeout_secs = icc_verification_timeout_secs(
+        class,
+        config.image_process_timeout_secs,
+        config.av_process_timeout_secs,
+    );
+    let output = run_tool(
+        &config.exiftool_path,
+        &["-b", "-ICC_Profile", &path_arg],
+        Duration::from_secs(timeout_secs),
+    )
+    .await?;
+    if !output.status.success() {
+        return Err(MediaError::SanitizationFailed);
+    }
+    if output.stdout.is_empty() {
+        return Ok(());
+    }
+    let expected = scrub_icc_profile(&output.stdout)?;
+    if expected != output.stdout {
+        return Err(MediaError::ResidualMetadata);
+    }
+    Ok(())
+}
+
+fn icc_verification_timeout_secs(
+    class: MediaClass,
+    image_timeout_secs: u64,
+    av_timeout_secs: u64,
+) -> u64 {
+    match class {
+        MediaClass::Image => image_timeout_secs,
+        MediaClass::Video | MediaClass::Audio => av_timeout_secs,
+    }
 }
 
 async fn sanitize_video(
@@ -1072,6 +1567,51 @@ fn strings(values: &[&str]) -> Vec<String> {
 mod tests {
     use super::*;
 
+    fn test_icc_profile() -> Vec<u8> {
+        let private_description =
+            canonical_icc_text(b"desc", b"desc", "Alice's iPhone profile").unwrap();
+        let private_copyright = canonical_icc_text(b"cprt", b"text", "Copyright Alice").unwrap();
+        let private_model = canonical_icc_text(b"desc", b"desc", "Alice's iPhone 17").unwrap();
+        let mut xyz = Vec::from(&b"XYZ \0\0\0\0"[..]);
+        xyz.extend_from_slice(&[0; 12]);
+        let tags = [
+            (*b"desc", private_description),
+            (*b"cprt", private_copyright),
+            (*b"dmdd", private_model),
+            (*b"rXYZ", xyz),
+        ];
+
+        let table_end = 132 + tags.len() * 12;
+        let mut profile = vec![0_u8; table_end];
+        profile[4..8].copy_from_slice(b"Buzz");
+        profile[8..12].copy_from_slice(&[4, 0x30, 0, 0]);
+        profile[12..16].copy_from_slice(b"mntr");
+        profile[16..20].copy_from_slice(b"RGB ");
+        profile[20..24].copy_from_slice(b"XYZ ");
+        profile[24..36].fill(1);
+        profile[36..40].copy_from_slice(b"acsp");
+        profile[40..44].copy_from_slice(b"APPL");
+        profile[48..52].copy_from_slice(b"APPL");
+        profile[52..56].copy_from_slice(b"iPhn");
+        profile[80..84].copy_from_slice(b"Buzz");
+        profile[84..100].fill(0x5a);
+        profile[128..132].copy_from_slice(&(tags.len() as u32).to_be_bytes());
+        for (index, (signature, data)) in tags.into_iter().enumerate() {
+            while !profile.len().is_multiple_of(4) {
+                profile.push(0);
+            }
+            let offset = profile.len();
+            profile.extend_from_slice(&data);
+            let entry = 132 + index * 12;
+            profile[entry..entry + 4].copy_from_slice(&signature);
+            profile[entry + 4..entry + 8].copy_from_slice(&(offset as u32).to_be_bytes());
+            profile[entry + 8..entry + 12].copy_from_slice(&(data.len() as u32).to_be_bytes());
+        }
+        let size = profile.len() as u32;
+        profile[0..4].copy_from_slice(&size.to_be_bytes());
+        profile
+    }
+
     #[test]
     fn supported_format_tables_are_bounded() {
         assert_eq!(supported_image("image/jpeg"), Some(("image/jpeg", "jpg")));
@@ -1089,6 +1629,172 @@ mod tests {
         assert!(is_structural_tag("language"));
         assert!(!is_structural_tag("location"));
         assert!(!is_structural_tag("title"));
+        assert!(valid_icc_color_space(b"1CLR"));
+    }
+
+    #[test]
+    fn icc_scrubber_preserves_color_data_but_removes_identity() {
+        let source = test_icc_profile();
+        let scrubbed = scrub_icc_profile(&source).expect("scrub ICC profile");
+        assert_eq!(scrub_icc_profile(&scrubbed).unwrap(), scrubbed);
+        assert!(!scrubbed
+            .windows("Alice".len())
+            .any(|window| window == b"Alice"));
+        assert!(scrubbed
+            .windows(ICC_CANONICAL_DESCRIPTION.len())
+            .any(|window| window == ICC_CANONICAL_DESCRIPTION.as_bytes()));
+        assert!(scrubbed
+            .windows(ICC_CANONICAL_COPYRIGHT.len())
+            .any(|window| window == ICC_CANONICAL_COPYRIGHT.as_bytes()));
+        assert!(scrubbed.windows(4).any(|window| window == b"rXYZ"));
+        assert!(!scrubbed.windows(4).any(|window| window == b"dmdd"));
+        for range in [4..8, 10..12, 24..36, 40..64, 80..100, 100..128] {
+            assert!(scrubbed[range].iter().all(|byte| *byte == 0));
+        }
+    }
+
+    #[test]
+    fn icc_header_reserved_channels_are_canonicalized() {
+        let mut source = test_icc_profile();
+        source[10..12].fill(0x5a);
+        source[44..64].fill(0x5a);
+        source[64..68].copy_from_slice(&2_u32.to_be_bytes());
+        source[68..80].fill(0x5a);
+        let scrubbed = scrub_icc_profile(&source).unwrap();
+        assert_eq!(&scrubbed[8..12], &[4, 0x30, 0, 0]);
+        assert!(scrubbed[44..64].iter().all(|byte| *byte == 0));
+        assert_eq!(&scrubbed[64..68], &2_u32.to_be_bytes());
+        assert_eq!(
+            &scrubbed[68..80],
+            &[0x00, 0x00, 0xf6, 0xd6, 0x00, 0x01, 0, 0, 0, 0, 0xd3, 0x2d]
+        );
+    }
+
+    #[test]
+    fn icc_verification_uses_media_class_timeout() {
+        assert_eq!(
+            icc_verification_timeout_secs(MediaClass::Image, 120, 600),
+            120
+        );
+        assert_eq!(
+            icc_verification_timeout_secs(MediaClass::Audio, 120, 600),
+            600
+        );
+        assert_eq!(
+            icc_verification_timeout_secs(MediaClass::Video, 120, 600),
+            600
+        );
+    }
+
+    #[test]
+    fn icc_scrubber_rejects_private_tag_payloads() {
+        let mut source = test_icc_profile();
+        let tag_count = read_icc_u32(&source, 128).unwrap() as usize;
+        source[132 + (tag_count - 1) * 12..136 + (tag_count - 1) * 12].copy_from_slice(b"priv");
+        assert!(matches!(
+            scrub_icc_profile(&source),
+            Err(MediaError::SanitizationFailed)
+        ));
+    }
+
+    #[test]
+    fn icc_scrubber_rejects_duplicate_signatures() {
+        let mut source = test_icc_profile();
+        source[168..172].copy_from_slice(b"desc");
+        assert!(matches!(
+            scrub_icc_profile(&source),
+            Err(MediaError::SanitizationFailed)
+        ));
+    }
+
+    #[test]
+    fn icc_scrubber_drops_common_apple_display_profile_tags() {
+        for private_tag in [*b"aarg", *b"aabg", *b"aagg", *b"vcgt", *b"ndin", *b"vcgp"] {
+            let mut source = test_icc_profile();
+            source[168..172].copy_from_slice(&private_tag);
+            let scrubbed = scrub_icc_profile(&source).expect("scrub Apple display profile");
+            assert!(!scrubbed
+                .windows(private_tag.len())
+                .any(|window| window == private_tag));
+        }
+    }
+
+    #[test]
+    fn icc_scrubber_canonicalizes_tag_order() {
+        let source = test_icc_profile();
+        let mut reordered = source.clone();
+        let tag_count = read_icc_u32(&source, 128).unwrap() as usize;
+        for index in 0..tag_count {
+            let source_entry = 132 + index * 12;
+            let target_entry = 132 + (tag_count - index - 1) * 12;
+            reordered[target_entry..target_entry + 12]
+                .copy_from_slice(&source[source_entry..source_entry + 12]);
+        }
+        assert_eq!(
+            scrub_icc_profile(&source).unwrap(),
+            scrub_icc_profile(&reordered).unwrap()
+        );
+    }
+
+    #[test]
+    fn icc_rendering_payloads_reject_trailing_private_bytes() {
+        let mut curve = Vec::from(&b"curv\0\0\0\0\0\0\0\x01\x01\0"[..]);
+        assert!(canonical_icc_rendering_tag(b"rTRC", &curve).is_ok());
+        curve.extend_from_slice(&[0; 2]);
+        assert_eq!(
+            canonical_icc_rendering_tag(b"rTRC", &curve).unwrap(),
+            &curve[..14]
+        );
+        curve.extend_from_slice(b"Alice in Chicago");
+        assert!(matches!(
+            canonical_icc_rendering_tag(b"rTRC", &curve),
+            Err(MediaError::SanitizationFailed)
+        ));
+    }
+
+    #[test]
+    fn icc_parametric_curves_reject_reserved_bytes() {
+        let mut curve = Vec::from(&b"para\0\0\0\0\0\0\0\0\0\x01\0\0"[..]);
+        assert!(canonical_icc_rendering_tag(b"rTRC", &curve).is_ok());
+        curve[10] = 0x5a;
+        assert!(canonical_icc_rendering_tag(b"rTRC", &curve).is_err());
+    }
+
+    #[test]
+    fn icc_scrubber_pads_total_profile_size() {
+        let mut source = test_icc_profile();
+        let tag_entry = 168;
+        let data_offset = read_icc_u32(&source, tag_entry + 4).unwrap() as usize;
+        source[tag_entry..tag_entry + 4].copy_from_slice(b"rTRC");
+        source[tag_entry + 8..tag_entry + 12].copy_from_slice(&14_u32.to_be_bytes());
+        source[data_offset..data_offset + 14].copy_from_slice(b"curv\0\0\0\0\0\0\0\x01\x01\0");
+        let scrubbed = scrub_icc_profile(&source).unwrap();
+        assert!(scrubbed.len().is_multiple_of(4));
+        assert_eq!(read_icc_u32(&scrubbed, 0).unwrap() as usize, scrubbed.len());
+    }
+
+    #[test]
+    fn icc_colorant_order_uses_specified_type_and_exact_length() {
+        let mut colorant_order = Vec::from(&b"clro\0\0\0\0\0\0\0\x03"[..]);
+        colorant_order.extend_from_slice(&[0, 1, 2]);
+        assert_eq!(
+            canonical_icc_rendering_tag(b"clro", &colorant_order).unwrap(),
+            colorant_order
+        );
+
+        colorant_order[0..4].copy_from_slice(b"ui08");
+        assert!(canonical_icc_rendering_tag(b"clro", &colorant_order).is_err());
+    }
+
+    #[test]
+    fn icc_v2_description_has_complete_script_code_fields() {
+        let description = canonical_icc_text(b"desc", b"desc", "profile").unwrap();
+        assert_eq!(description.len(), 91 + "profile".len());
+        let script_code_start = 21 + "profile".len();
+        assert_eq!(
+            &description[script_code_start..script_code_start + 70],
+            &[0; 70]
+        );
     }
 
     #[test]
