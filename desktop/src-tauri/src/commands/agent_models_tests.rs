@@ -437,3 +437,38 @@ fn openrouter_saved_agent_model_discovery_resolves_provider() {
     );
     assert!(!config.env.contains_key("BUZZ_PRIVATE_KEY"));
 }
+
+/// B5/T4: unsaved-agent ("draft") discovery mirrors the saved-agent path —
+/// `draft_agent_model_discovery_env` must derive the provider env var from
+/// form input the same way `saved_agent_model_discovery_config` derives it
+/// from a persisted record, and preserve caller-supplied env (including the
+/// OpenRouter API key) unmodified.
+#[test]
+fn openrouter_draft_agent_model_discovery_derives_provider_env() {
+    let env_vars = BTreeMap::from([(
+        "OPENROUTER_API_KEY".to_string(),
+        "sk-or-draft-key".to_string(),
+    )]);
+
+    let merged = draft_agent_model_discovery_env("buzz-agent", Some("openrouter"), &env_vars);
+
+    assert_eq!(
+        merged.get("BUZZ_AGENT_PROVIDER").map(String::as_str),
+        Some("openrouter"),
+        "provider env var must be derived from form input for a known ACP runtime"
+    );
+    assert_eq!(
+        merged.get("OPENROUTER_API_KEY").map(String::as_str),
+        Some("sk-or-draft-key"),
+        "caller-supplied env vars must survive the merge"
+    );
+}
+
+#[test]
+fn draft_agent_model_discovery_env_omits_provider_when_absent() {
+    let merged = draft_agent_model_discovery_env("buzz-agent", None, &BTreeMap::new());
+    assert!(
+        !merged.contains_key("BUZZ_AGENT_PROVIDER"),
+        "no provider must be derived when the caller supplies none"
+    );
+}

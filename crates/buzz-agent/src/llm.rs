@@ -186,15 +186,12 @@ impl Llm {
                 Ok(parse_anthropic(self.post_anthropic(cfg, &body).await?)?.text)
             }
             Provider::OpenRouter => {
-                let body = json!({
-                    "model": effective_model,
-                    "stream": false,
-                    "max_completion_tokens": max_output_tokens,
-                    "messages": [
-                        { "role": "system", "content": system_prompt },
-                        { "role": "user", "content": user_prompt },
-                    ],
-                });
+                let body = openrouter_summary_body(
+                    effective_model,
+                    system_prompt,
+                    user_prompt,
+                    max_output_tokens,
+                );
                 let v = self.post_openrouter(cfg, &body).await?;
                 Ok(parse_openai(v)?.text)
             }
@@ -969,14 +966,29 @@ fn parse_openai(v: Value) -> Result<LlmResponse, AgentError> {
     {
         if choice.get("finish_reason").and_then(Value::as_str) == Some("error") {
             let err = choice.get("error").cloned().unwrap_or(Value::Null);
-            let code = err.get("code").and_then(Value::as_str).unwrap_or("unknown");
+            // OpenRouter's `error.code` is numeric; other OpenAI-compat hosts
+            // may send a string. Accept either rather than discarding the
+            // typed code as "unknown".
+            let code = err
+                .get("code")
+                .and_then(|c| {
+                    c.as_str()
+                        .map(str::to_string)
+                        .or_else(|| c.as_i64().map(|n| n.to_string()))
+                })
+                .unwrap_or_else(|| "unknown".into());
             let message = err
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("provider error in 200 response");
-            return Err(AgentError::Llm(format!(
-                "provider error ({code}): {message}"
-            )));
+            let error_type = err
+                .get("metadata")
+                .and_then(|m| m.get("error_type"))
+                .and_then(Value::as_str);
+            return Err(AgentError::Llm(match error_type {
+                Some(et) => format!("provider error ({code}, {et}): {message}"),
+                None => format!("provider error ({code}): {message}"),
+            }));
         }
     }
     let choice = v
@@ -1037,6 +1049,7 @@ fn parse_openai_with_reasoning_details(v: Value) -> Result<LlmResponse, AgentErr
         .and_then(|a| a.first())
         .and_then(|c| c.get("message"))
         .and_then(|m| m.get("reasoning_details"))
+        .filter(|rd| rd.is_array())
         .cloned();
     let mut response = parse_openai(v)?;
     response.reasoning_details = reasoning_details;
@@ -1237,6 +1250,27 @@ pub(crate) fn build_token_source(cfg: &Config) -> Result<Arc<dyn TokenSource>, A
     }
 }
 
+/// Build the request body for `Llm::summarize` on `Provider::OpenRouter`.
+/// Extracted so tests can assert on the actual wire shape instead of a
+/// hand-rolled literal — summaries never carry `reasoning` or `provider`
+/// (see `apply_openrouter_mutations`, which the summary path never calls).
+fn openrouter_summary_body(
+    effective_model: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    max_output_tokens: u32,
+) -> Value {
+    json!({
+        "model": effective_model,
+        "stream": false,
+        "max_completion_tokens": max_output_tokens,
+        "messages": [
+            { "role": "system", "content": system_prompt },
+            { "role": "user", "content": user_prompt },
+        ],
+    })
+}
+
 /// Return a clone of `body` with any top-level `"model"` field removed.
 /// Used for Databricks model-serving, which encodes the model in the URL
 /// path and rejects the field in the body.
@@ -1257,10 +1291,20 @@ enum OpenRouterErrorClass {
     Unknown,
 }
 
+/// Ceiling applied to any server-supplied `Retry-After` hint (header or
+/// body) before we sleep on it. OpenRouter can advertise waits up to an
+/// hour, but `openrouter_post`'s per-attempt sleep happens *outside*
+/// `Client::timeout` (`cfg.llm_timeout`, default 240s) — an unclamped hint
+/// could keep a single turn alive for up to two full-duration sleeps across
+/// `MAX_RETRIES`. Clamping (never rejecting) keeps us honoring the server's
+/// backoff signal while bounding worst-case turn latency to a value smaller
+/// than the connect/response timeout.
+const RETRY_AFTER_CAP_SECS: u64 = 60;
+
 fn parse_retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
     let val = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
     let secs: u64 = val.trim().parse().ok()?;
-    (secs > 0 && secs <= 3600).then(|| std::time::Duration::from_secs(secs))
+    (secs > 0).then(|| std::time::Duration::from_secs(secs.min(RETRY_AFTER_CAP_SECS)))
 }
 
 fn classify_openrouter_error(
@@ -1275,15 +1319,10 @@ fn classify_openrouter_error(
         .and_then(|e| e.get("metadata"))
         .and_then(|m| m.get("error_type"))
         .and_then(Value::as_str);
-    let body_retry_after = parsed
-        .as_ref()
-        .and_then(|v| v.get("error"))
-        .and_then(|e| e.get("metadata"))
-        .and_then(|m| m.get("retry_after"))
-        .and_then(Value::as_f64)
-        .filter(|&s| s > 0.0 && s <= 3600.0)
-        .map(std::time::Duration::from_secs_f64);
-    let retry_after = header_retry_after.or(body_retry_after);
+    // OpenRouter's documented retry hint is the HTTP `Retry-After` header
+    // (see docs/api_reference__errors-and-debugging.md "Retry-After Header");
+    // no current doc specifies a body-level retry field, so we don't parse one.
+    let retry_after = header_retry_after;
 
     match (status, error_type) {
         (429, Some("rate_limit_exceeded")) => OpenRouterErrorClass::Retryable(retry_after),
@@ -1332,8 +1371,21 @@ async fn openrouter_post(
             }
         };
         let status = resp.status();
-        if status == 401 || status == 403 {
+        // Unlike the generic `post` path, OpenRouter's static-key auth makes
+        // 401 and 403 distinguishable: 401 is an invalid/expired key (worth
+        // one refresh-and-retry), while OpenRouter documents 403 as a
+        // guardrail/moderation/permission rejection the same key will always
+        // reproduce. Refreshing a static key returns the identical key, so
+        // classifying 403 as `LlmAuth` would just waste a duplicate request
+        // and surface Desktop's unrelated "access denied" copy.
+        if status == 401 {
             return Err(AgentError::LlmAuth(read_error_body(resp).await));
+        }
+        if status == 403 {
+            return Err(AgentError::Llm(format!(
+                "{status}: {}",
+                read_error_body(resp).await
+            )));
         }
         if status == 402 {
             return Err(AgentError::Llm(
@@ -1526,7 +1578,9 @@ mod tests {
     use super::*;
     use crate::config::{Config, HookServers, OpenAiApi, Provider};
     use crate::types::{HistoryItem, ToolCall, ToolResult, ToolResultContent};
+    use std::collections::VecDeque;
     use std::time::Duration;
+    use tokio::sync::Mutex;
 
     fn cfg(provider: Provider) -> Config {
         Config {
@@ -3038,15 +3092,15 @@ mod tests {
 
     #[test]
     fn openrouter_summary_carries_neither_reasoning_nor_provider() {
-        let body = json!({
-            "model": "anthropic/claude-opus-4-7",
-            "stream": false,
-            "max_completion_tokens": 1024,
-            "messages": [
-                { "role": "system", "content": "summarize" },
-                { "role": "user", "content": "text to summarize" },
-            ],
-        });
+        let body = openrouter_summary_body(
+            "anthropic/claude-opus-4-7",
+            "summarize",
+            "text to summarize",
+            1024,
+        );
+        assert_eq!(body["model"], "anthropic/claude-opus-4-7");
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][1]["content"], "text to summarize");
         assert!(
             body.get("reasoning").is_none(),
             "summary body must not carry reasoning"
@@ -3073,8 +3127,51 @@ mod tests {
         let err = parse_openai(v).unwrap_err();
         match &err {
             AgentError::Llm(s) => {
-                assert!(s.contains("provider error"), "got: {s}");
+                assert!(s.contains("provider error (503)"), "got: {s}");
                 assert!(s.contains("No endpoints found"), "got: {s}");
+            }
+            _ => panic!("expected AgentError::Llm, got: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_openai_error_inside_200_accepts_string_code() {
+        let v = serde_json::json!({
+            "choices": [{
+                "finish_reason": "error",
+                "error": {
+                    "code": "insufficient_quota",
+                    "message": "quota exceeded"
+                }
+            }]
+        });
+        let err = parse_openai(v).unwrap_err();
+        match &err {
+            AgentError::Llm(s) => assert!(
+                s.contains("provider error (insufficient_quota)"),
+                "got: {s}"
+            ),
+            _ => panic!("expected AgentError::Llm, got: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_openai_error_inside_200_surfaces_error_type() {
+        let v = serde_json::json!({
+            "choices": [{
+                "finish_reason": "error",
+                "error": {
+                    "code": 429,
+                    "message": "Rate limit exceeded",
+                    "metadata": { "error_type": "rate_limit_exceeded" }
+                }
+            }]
+        });
+        let err = parse_openai(v).unwrap_err();
+        match &err {
+            AgentError::Llm(s) => {
+                assert!(s.contains("429"), "got: {s}");
+                assert!(s.contains("rate_limit_exceeded"), "got: {s}");
             }
             _ => panic!("expected AgentError::Llm, got: {err:?}"),
         }
@@ -3124,18 +3221,15 @@ mod tests {
     }
 
     #[test]
-    fn classify_429_rate_limit_with_body_retry_after() {
+    fn classify_429_rate_limit_body_retry_after_is_ignored() {
+        // M1: no documented body-level retry field, so a `retry_after` key
+        // inside `error.metadata` is inert — only the HTTP header (passed
+        // separately) can produce a delay.
         let body =
             r#"{"error":{"metadata":{"error_type":"rate_limit_exceeded","retry_after":2.5}}}"#;
         match classify_openrouter_error(429, body, None) {
-            OpenRouterErrorClass::Retryable(Some(d)) => {
-                assert!(
-                    (d.as_secs_f64() - 2.5).abs() < 0.01,
-                    "expected ~2.5s, got {:?}",
-                    d
-                );
-            }
-            other => panic!("expected Retryable with delay, got: {other:?}"),
+            OpenRouterErrorClass::Retryable(None) => {}
+            other => panic!("expected Retryable(None), got: {other:?}"),
         }
     }
 
@@ -3150,16 +3244,13 @@ mod tests {
 
     #[test]
     fn classify_429_prefers_http_header_over_body() {
-        let body =
-            r#"{"error":{"metadata":{"error_type":"rate_limit_exceeded","retry_after":10.0}}}"#;
+        // Body-level retry hints are no longer parsed (M1: undocumented field);
+        // the HTTP header is the only source, and it's honored when present.
+        let body = r#"{"error":{"metadata":{"error_type":"rate_limit_exceeded"}}}"#;
         let header = Some(Duration::from_secs(3));
         match classify_openrouter_error(429, body, header) {
             OpenRouterErrorClass::Retryable(Some(d)) => {
-                assert_eq!(
-                    d,
-                    Duration::from_secs(3),
-                    "HTTP header must take precedence"
-                );
+                assert_eq!(d, Duration::from_secs(3), "HTTP header must be honored");
             }
             other => panic!("expected Retryable with header delay, got: {other:?}"),
         }
@@ -3176,15 +3267,13 @@ mod tests {
 
     #[test]
     fn classify_503_provider_overloaded_with_retry_after() {
-        let body =
-            r#"{"error":{"metadata":{"error_type":"provider_overloaded","retry_after":5.0}}}"#;
-        match classify_openrouter_error(503, body, None) {
+        // No documented body-level retry field (M1); the header is the only
+        // source `classify_openrouter_error` consults.
+        let body = r#"{"error":{"metadata":{"error_type":"provider_overloaded"}}}"#;
+        let header = Some(Duration::from_secs(5));
+        match classify_openrouter_error(503, body, header) {
             OpenRouterErrorClass::Retryable(Some(d)) => {
-                assert!(
-                    (d.as_secs_f64() - 5.0).abs() < 0.01,
-                    "expected ~5s, got {:?}",
-                    d
-                );
+                assert_eq!(d, Duration::from_secs(5));
             }
             other => panic!("expected Retryable with delay, got: {other:?}"),
         }
@@ -3225,10 +3314,27 @@ mod tests {
     }
 
     #[test]
-    fn parse_retry_after_header_over_cap_rejected() {
+    fn parse_retry_after_header_over_cap_clamped() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(reqwest::header::RETRY_AFTER, "3601".parse().unwrap());
-        assert_eq!(parse_retry_after_header(&headers), None);
+        assert_eq!(
+            parse_retry_after_header(&headers),
+            Some(Duration::from_secs(RETRY_AFTER_CAP_SECS)),
+            "over-cap hints clamp to the ceiling rather than being dropped"
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_header_at_cap_unclamped() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            RETRY_AFTER_CAP_SECS.to_string().parse().unwrap(),
+        );
+        assert_eq!(
+            parse_retry_after_header(&headers),
+            Some(Duration::from_secs(RETRY_AFTER_CAP_SECS))
+        );
     }
 
     #[test]
@@ -3646,5 +3752,336 @@ mod tests {
             !body_str.contains("reasoning_details"),
             "responses_body must not replay reasoning_details"
         );
+    }
+
+    // ---- T4: openrouter_post transport-level regressions ----
+    //
+    // These stub an HTTP server directly and drive `openrouter_post` (not the
+    // classifier in isolation), proving the retry/attempt-accounting and
+    // header behavior the classifier-only tests above cannot see.
+
+    /// One canned response: status, body, and any extra headers (e.g.
+    /// `Retry-After`) to send back for a single request.
+    struct CannedResponse {
+        status: u16,
+        body: String,
+        extra_headers: Vec<(String, String)>,
+    }
+
+    impl CannedResponse {
+        fn new(status: u16, body: &str) -> Self {
+            Self {
+                status,
+                body: body.into(),
+                extra_headers: Vec::new(),
+            }
+        }
+
+        fn with_header(mut self, name: &str, value: &str) -> Self {
+            self.extra_headers.push((name.into(), value.into()));
+            self
+        }
+    }
+
+    fn status_line(status: u16) -> &'static str {
+        match status {
+            200 => "200 OK",
+            402 => "402 Payment Required",
+            403 => "403 Forbidden",
+            429 => "429 Too Many Requests",
+            500 => "500 Internal Server Error",
+            502 => "502 Bad Gateway",
+            503 => "503 Service Unavailable",
+            _ => panic!("unsupported status {status} in test stub"),
+        }
+    }
+
+    /// Spawns a stub HTTP server that pops one `CannedResponse` per request
+    /// (repeating the last one once the queue is exhausted, so an
+    /// over-budget attempt count is visible rather than hanging), and
+    /// captures each request's raw header block for header-attribution
+    /// assertions. Returns (url, captured_header_blocks, attempt_counter).
+    async fn spawn_openrouter_stub(
+        responses: Vec<CannedResponse>,
+    ) -> (
+        String,
+        Arc<Mutex<Vec<String>>>,
+        Arc<std::sync::atomic::AtomicU32>,
+    ) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let queue = Arc::new(Mutex::new(VecDeque::from(responses)));
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let attempts = Arc::new(AtomicU32::new(0));
+        let captured_clone = captured.clone();
+        let attempts_clone = attempts.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                let queue = queue.clone();
+                let captured = captured_clone.clone();
+                let attempts = attempts_clone.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                        if buf.len() > 1_000_000 {
+                            return;
+                        }
+                    }
+                    let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                    let header_str = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+                    // Drain any remaining body per Content-Length so `Connection:
+                    // close` doesn't race the client's write.
+                    let content_length: usize = header_str
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse().ok())
+                        })
+                        .unwrap_or(0);
+                    let mut body_len = buf.len() - header_end;
+                    while body_len < content_length {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => body_len += n,
+                        }
+                    }
+                    captured.lock().await.push(header_str);
+                    attempts.fetch_add(1, Ordering::SeqCst);
+
+                    let mut q = queue.lock().await;
+                    let canned = if q.len() > 1 {
+                        q.pop_front().unwrap()
+                    } else {
+                        // Repeat the final canned response so a test bug that
+                        // over-retries produces a visible extra attempt
+                        // instead of a hung connection.
+                        let last = q.front().unwrap();
+                        CannedResponse {
+                            status: last.status,
+                            body: last.body.clone(),
+                            extra_headers: last.extra_headers.clone(),
+                        }
+                    };
+                    drop(q);
+
+                    let mut resp = format!(
+                        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+                        status_line(canned.status),
+                        canned.body.len()
+                    );
+                    for (name, value) in &canned.extra_headers {
+                        resp.push_str(&format!("{name}: {value}\r\n"));
+                    }
+                    resp.push_str("Connection: close\r\n\r\n");
+                    resp.push_str(&canned.body);
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (url, captured, attempts)
+    }
+
+    /// A 403 (guardrail/moderation/permission rejection, per OpenRouter docs)
+    /// must NOT be classified as `LlmAuth`: refreshing a static key returns
+    /// the identical key, so retrying would just waste a duplicate request.
+    /// Exactly one attempt, plain `AgentError::Llm` with the body preserved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn openrouter_post_403_single_attempt_not_auth_error() {
+        let (url, _captured, attempts) = spawn_openrouter_stub(vec![CannedResponse::new(
+            403,
+            r#"{"error":{"message":"model flagged by moderation"}}"#,
+        )])
+        .await;
+        let http = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let err = openrouter_post(&http, &format!("{url}/x"), &json!({}), "key")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, AgentError::Llm(s) if s.contains("403") && s.contains("model flagged by moderation")),
+            "403 must surface as AgentError::Llm with status+body, not LlmAuth: got {err:?}"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "403 must not be retried (a refreshed static key is identical)"
+        );
+    }
+
+    /// A 402 short-circuits on the first attempt: no retry, one request,
+    /// the actionable credits-exhausted message.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn openrouter_post_402_single_attempt_short_circuit() {
+        let (url, _captured, attempts) = spawn_openrouter_stub(vec![CannedResponse::new(
+            402,
+            r#"{"error":{"message":"payment required"}}"#,
+        )])
+        .await;
+        let http = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let err = openrouter_post(&http, &format!("{url}/x"), &json!({}), "key")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, AgentError::Llm(s) if s.contains("credits exhausted")),
+            "got {err:?}"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "402 must not be retried"
+        );
+    }
+
+    /// A 429 with `Retry-After: 1` sleeps for that duration before the retry
+    /// succeeds — proving the header value is actually honored, not just
+    /// classified.
+    #[tokio::test(flavor = "current_thread")]
+    async fn openrouter_post_429_honors_retry_after_header() {
+        let (url, _captured, attempts) = spawn_openrouter_stub(vec![
+            CannedResponse::new(429, r#"{"error":{"message":"rate limited"}}"#)
+                .with_header("Retry-After", "1"),
+            CannedResponse::new(200, r#"{"choices":[{"message":{"content":"ok"}}]}"#),
+        ])
+        .await;
+        let http = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let before = std::time::Instant::now();
+        let out = openrouter_post(&http, &format!("{url}/x"), &json!({}), "key")
+            .await
+            .expect("second attempt succeeds");
+        assert_eq!(out["choices"][0]["message"]["content"], "ok");
+        assert!(
+            before.elapsed() >= Duration::from_secs(1),
+            "must sleep at least the Retry-After hint"
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A `Retry-After` far beyond `RETRY_AFTER_CAP_SECS` must not stall the
+    /// retry loop for anywhere near its advertised duration — proving the
+    /// cap is enforced end-to-end in `openrouter_post`'s actual sleep, not
+    /// merely in the isolated `parse_retry_after_header` unit tests above.
+    /// Runs on a paused clock so a real 999999s wait would hang the test
+    /// instead of silently passing.
+    #[tokio::test(start_paused = true)]
+    async fn openrouter_post_429_retry_sleep_capped_despite_huge_retry_after() {
+        let (url, _captured, attempts) = spawn_openrouter_stub(vec![
+            CannedResponse::new(429, r#"{"error":{"message":"rate limited"}}"#)
+                .with_header("Retry-After", "999999"),
+            CannedResponse::new(200, r#"{"choices":[{"message":{"content":"ok"}}]}"#),
+        ])
+        .await;
+        let http = Client::builder().build().unwrap();
+        let before = tokio::time::Instant::now();
+        let out = openrouter_post(&http, &format!("{url}/x"), &json!({}), "key")
+            .await
+            .expect("second attempt succeeds");
+        assert_eq!(out["choices"][0]["message"]["content"], "ok");
+        assert!(
+            before.elapsed() <= Duration::from_secs(RETRY_AFTER_CAP_SECS + 5),
+            "retry sleep must be clamped to RETRY_AFTER_CAP_SECS ({RETRY_AFTER_CAP_SECS}s), \
+             not the header's 999999s: elapsed {:?}",
+            before.elapsed()
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// An untyped 503 (no `error.metadata.error_type`) exhausts all
+    /// `MAX_RETRIES` attempts, then returns the actionable routing message —
+    /// proving attempt accounting terminates rather than retrying forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn openrouter_post_untyped_503_exhausts_retries_into_actionable_message() {
+        let canned = CannedResponse::new(503, r#"{"error":{"message":"no capacity"}}"#);
+        let (url, _captured, attempts) = spawn_openrouter_stub(vec![canned]).await;
+        let http = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let err = openrouter_post(&http, &format!("{url}/x"), &json!({}), "key")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, AgentError::Llm(s) if s.contains("no OpenRouter endpoint supports")),
+            "got {err:?}"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_RETRIES,
+            "must exhaust exactly MAX_RETRIES attempts, no more"
+        );
+    }
+
+    /// Attribution headers (`HTTP-Referer`, `X-OpenRouter-Title`) are on the
+    /// actual wire request, not merely asserted against a body fixture.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn openrouter_post_sends_attribution_headers() {
+        let (url, captured, _attempts) = spawn_openrouter_stub(vec![CannedResponse::new(
+            200,
+            r#"{"choices":[{"message":{"content":"ok"}}]}"#,
+        )])
+        .await;
+        let http = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        openrouter_post(&http, &format!("{url}/x"), &json!({}), "key")
+            .await
+            .expect("200 succeeds");
+        let headers = captured.lock().await;
+        let header_str = headers
+            .first()
+            .expect("one request captured")
+            .to_lowercase();
+        assert!(
+            header_str.contains("http-referer: https://github.com/block/buzz"),
+            "got: {header_str}"
+        );
+        assert!(
+            header_str.contains("x-openrouter-title: buzz"),
+            "got: {header_str}"
+        );
+    }
+
+    /// A 502 without `provider_unavailable` still retries (the classifier's
+    /// unconditional-retry branch), then succeeds on attempt 2 — proving the
+    /// generic 502 path isn't accidentally routed to `Unknown`/terminal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn openrouter_post_502_retries_then_succeeds() {
+        let (url, _captured, attempts) = spawn_openrouter_stub(vec![
+            CannedResponse::new(502, r#"{"error":{"message":"bad gateway"}}"#),
+            CannedResponse::new(200, r#"{"choices":[{"message":{"content":"ok"}}]}"#),
+        ])
+        .await;
+        let http = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let out = openrouter_post(&http, &format!("{url}/x"), &json!({}), "key")
+            .await
+            .expect("retry succeeds");
+        assert_eq!(out["choices"][0]["message"]["content"], "ok");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

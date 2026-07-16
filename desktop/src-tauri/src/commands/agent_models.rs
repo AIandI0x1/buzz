@@ -171,6 +171,23 @@ fn saved_agent_model_discovery_config(
     }
 }
 
+fn draft_agent_model_discovery_env(
+    agent_command: &str,
+    provider: Option<&str>,
+    env_vars: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut derived_env = BTreeMap::new();
+    if let Some(meta) = known_acp_runtime(agent_command) {
+        let provider = provider.map(str::trim).filter(|value| !value.is_empty());
+        if !meta.provider_locked {
+            if let (Some(env_key), Some(provider)) = (meta.provider_env_var, provider) {
+                derived_env.insert(env_key.to_string(), provider.to_string());
+            }
+        }
+    }
+    crate::managed_agents::merged_user_env(&derived_env, env_vars)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoverAgentModelsInput {
@@ -215,20 +232,8 @@ pub async fn discover_agent_models(
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| agent_command.to_string());
 
-    let mut derived_env = BTreeMap::new();
-    if let Some(meta) = known_acp_runtime(agent_command) {
-        let provider = input
-            .provider
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        if !meta.provider_locked {
-            if let (Some(env_key), Some(provider)) = (meta.provider_env_var, provider) {
-                derived_env.insert(env_key.to_string(), provider.to_string());
-            }
-        }
-    }
-    let merged_env = crate::managed_agents::merged_user_env(&derived_env, &input.env_vars);
+    let merged_env =
+        draft_agent_model_discovery_env(agent_command, input.provider.as_deref(), &input.env_vars);
     let merged_env = discovery_env_with_baked_floor(merged_env);
 
     // Buzz shared compute discovery must not depend on the local OpenAI ingress: that
