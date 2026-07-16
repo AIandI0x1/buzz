@@ -12,8 +12,10 @@ import {
   useStopManagedAgentMutation,
   useDeleteManagedAgentMutation,
 } from "@/features/agents/hooks";
+import { partitionAgentsByRelay } from "@/features/agents/agentRelayScope";
 import { useGlobalAgentConfig } from "@/features/agents/useGlobalAgentConfig";
 import { useChannelsQuery } from "@/features/channels/hooks";
+import { useActiveRelayUrl } from "@/features/communities/useCommunities";
 import { usePresenceQuery } from "@/features/presence/hooks";
 import type {
   AgentPersona,
@@ -75,16 +77,33 @@ export function useManagedAgentActions() {
     return () => window.clearTimeout(timeoutId);
   }, []);
 
+  // The agents screen is presented per community ("Agents in this
+  // community"), so scope the list — and every action derived from it (bulk
+  // stop, start/stop/delete lookups, presence) — to records pinned to the
+  // active community's relay. Agents pinned elsewhere keep running; they
+  // surface only through `otherCommunityRunningCount`.
+  const activeRelayUrl = useActiveRelayUrl();
+  const allManagedAgents = managedAgentsQuery.data;
+  const relayPartition = React.useMemo(
+    () => partitionAgentsByRelay(allManagedAgents, activeRelayUrl),
+    [allManagedAgents, activeRelayUrl],
+  );
+
   const managedAgents = React.useMemo(
     () =>
-      [...(managedAgentsQuery.data ?? [])].sort((left, right) => {
+      [...relayPartition.inCommunity].sort((left, right) => {
         const activeScore = (s: string) =>
           s === "running" || s === "deployed" ? 1 : 0;
         const diff = activeScore(right.status) - activeScore(left.status);
         if (diff !== 0) return diff;
         return left.name.localeCompare(right.name);
       }),
-    [managedAgentsQuery.data],
+    [relayPartition],
+  );
+
+  const otherCommunityRunningCount = React.useMemo(
+    () => relayPartition.other.filter(isManagedAgentActive).length,
+    [relayPartition],
   );
   // Observer ingestion is owner-global (useAgentObserverIngestion in
   // AppShell); this hook only reads derived state.
@@ -395,6 +414,10 @@ export function useManagedAgentActions() {
     managedAgentLogQuery,
     managedPresenceQuery,
     managedAgents,
+    /** Unscoped record set — for cross-community concerns only (e.g. how
+     * many instances a persona delete would remove across ALL communities). */
+    allManagedAgents,
+    otherCommunityRunningCount,
     managedPubkeys,
     channelIdToName,
     channelsByPubkey,
