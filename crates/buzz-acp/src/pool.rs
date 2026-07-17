@@ -4067,11 +4067,11 @@ mod tests {
         let author_hex = event.pubkey.to_hex();
         let batch = FlushBatch {
             channel_id: Uuid::new_v4(),
-            events: vec![crate::queue::BatchEvent {
+            events: vec![crate::queue::BatchEvent::for_test(
                 event,
-                prompt_tag: "@mention".into(),
-                received_at: std::time::Instant::now(),
-            }],
+                "@mention".into(),
+                std::time::Instant::now(),
+            )],
             cancelled_events: vec![],
             cancel_reason: None,
         };
@@ -4393,11 +4393,11 @@ mod tests {
             .unwrap();
         FlushBatch {
             channel_id,
-            events: vec![crate::queue::BatchEvent {
+            events: vec![crate::queue::BatchEvent::for_test(
                 event,
-                prompt_tag: "test".into(),
-                received_at: std::time::Instant::now(),
-            }],
+                "test".into(),
+                std::time::Instant::now(),
+            )],
             cancelled_events: vec![],
             cancel_reason: None,
         }
