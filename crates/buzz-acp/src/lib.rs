@@ -4,6 +4,7 @@ mod acp;
 mod config;
 mod engram_fetch;
 mod filter;
+mod ledger;
 mod observer;
 mod pool;
 mod queue;
