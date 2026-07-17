@@ -432,6 +432,16 @@ test("announcement story shows background work and pivots through a mention", as
   ).toEqual({ permission: "granted", platform: "MacIntel" });
   await expect(page.getByText("The Hive", { exact: true })).toBeVisible();
 
+  // Startup may restore or default to flight-path and subscribe immediately;
+  // that must not start the film before the recorder's explicit sidebar click.
+  for (const channel of ["design", "engineering", "marketing"] as const) {
+    await expect(page.getByTestId(`channel-working-${channel}`)).toHaveCount(0);
+  }
+  await page.waitForTimeout(1_000);
+  for (const channel of ["design", "engineering", "marketing"] as const) {
+    await expect(page.getByTestId(`channel-working-${channel}`)).toHaveCount(0);
+  }
+
   await page.getByTestId("channel-flight-path").click();
   await expect(page.getByTestId("chat-title")).toHaveText("flight-path");
 

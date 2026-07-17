@@ -4886,10 +4886,34 @@ function startAnnouncementDemoStory() {
   }, pivot.delayMs);
 }
 
+function handleAnnouncementDemoStoryClick(event: MouseEvent) {
+  if (!(event.target instanceof Element)) {
+    return;
+  }
+  const triggerTestId = `channel-${ANNOUNCEMENT_DEMO_STORY.triggerChannelName}`;
+  if (event.target.closest(`[data-testid="${triggerTestId}"]`)) {
+    startAnnouncementDemoStory();
+  }
+}
+
 function maybeStartAnnouncementDemoLiveConversation(channelId: string) {
   const channel = mockChannels.find((candidate) => candidate.id === channelId);
-  if (channel?.name === ANNOUNCEMENT_DEMO_STORY.triggerChannelName) {
-    startAnnouncementDemoStory();
+  if (
+    channel?.name === ANNOUNCEMENT_DEMO_STORY.triggerChannelName &&
+    getConfig()?.mock?.announcementDemoStory !== false
+  ) {
+    // A live subscription can be created for the restored/default route before
+    // the viewer interacts with the sidebar. Reserve the pivot immediately so
+    // its standalone conversation cannot race the film, but wait for the
+    // viewer's actual sidebar click before starting any visible story beats.
+    const pivotChannel = mockChannels.find(
+      (candidate) =>
+        candidate.name === ANNOUNCEMENT_DEMO_STORY.pivot.channelName,
+    );
+    if (pivotChannel) {
+      startedAnnouncementDemoLiveConversations.add(pivotChannel.id);
+    }
+    return;
   }
 
   if (
@@ -9738,6 +9762,12 @@ export function maybeInstallE2eTauriMocks() {
   resetMockUserStatuses();
   resetMockPendingCommunityDeepLinks(config);
   mockWebsocketSendMutexWedged = false;
+  if (config.mock?.announcementDemo) {
+    // Subscription creation is not proof of user intent: the app may restore
+    // or default to flight-path during startup. Gate the film on the actual
+    // sidebar click so the opening frame remains under the recorder's control.
+    window.addEventListener("click", handleAnnouncementDemoStoryClick);
+  }
   // The browser test harness has no Tauri globals, so install the complete
   // window mock there. The native announcement demo already has Tauri's
   // read-only `window.__TAURI_INTERNALS__` binding; attempting to replace it
