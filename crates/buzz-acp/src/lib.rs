@@ -1859,6 +1859,10 @@ async fn tokio_main() -> Result<()> {
                                     // the agent lost access).
                                     let drained_ids = queue.drain_channel(ch);
                                     let invalidated = pool.invalidate_channel_sessions(ch);
+                                    // Purge durable live + unresolved records together —
+                                    // re-adding the channel later must not resurrect
+                                    // discarded work (P3-F3 invalidation exit).
+                                    ledger.invalidate_channel(ch);
                                     // Track removed channels so checked-out agents get
                                     // their sessions stripped when they return to the pool.
                                     removed_channels.insert(ch);
