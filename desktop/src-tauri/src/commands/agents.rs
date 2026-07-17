@@ -355,9 +355,16 @@ pub(super) async fn start_local_agent_with_preflight(
     // at the end — avoids a second disk read for the same file in the same call.
     let personas = load_personas(app).unwrap_or_default();
     if let Some(persona_id) = record.persona_id.clone() {
-        if let Some(persona) = personas.iter().find(|p| p.id == persona_id) {
-            crate::managed_agents::persona_events::apply_persona_snapshot(record, persona);
-            record.updated_at = crate::util::now_iso();
+        match personas.iter().find(|p| p.id == persona_id) {
+            Some(persona) => {
+                crate::managed_agents::persona_events::apply_persona_snapshot(record, persona);
+                record.updated_at = crate::util::now_iso();
+            }
+            None => {
+                return Err(
+                    crate::managed_agents::effective_config::ORPHANED_INSTANCE_ERROR.to_string(),
+                );
+            }
         }
     }
     start_managed_agent_process(app, record, &mut runtimes, Some(owner_hex))?;

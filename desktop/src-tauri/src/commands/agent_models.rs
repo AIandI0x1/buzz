@@ -804,14 +804,17 @@ pub async fn update_managed_agent(
                 name_changed = true;
             }
         }
-        if let Some(model_update) = input.model {
-            record.model = model_update;
-        }
-        if let Some(provider_update) = input.provider {
-            record.provider = provider_update;
-        }
-        if let Some(prompt_update) = input.system_prompt {
-            record.system_prompt = prompt_update;
+        let is_linked = record.persona_id.is_some();
+        if !is_linked {
+            if let Some(model_update) = input.model {
+                record.model = model_update;
+            }
+            if let Some(provider_update) = input.provider {
+                record.provider = provider_update;
+            }
+            if let Some(prompt_update) = input.system_prompt {
+                record.system_prompt = prompt_update;
+            }
         }
         if let Some(parallelism) = input.parallelism {
             record.parallelism = parallelism;

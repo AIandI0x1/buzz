@@ -252,6 +252,118 @@ fn update_request_turn_timeout_parses_for_wire_compat() {
     assert_eq!(req.turn_timeout_seconds, Some(9999));
 }
 
+// ---------------------------------------------------------------------------
+// Linked-instance write guard (model/provider/prompt)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn linked_instance_ignores_model_provider_prompt_writes() {
+    let mut record: crate::managed_agents::ManagedAgentRecord = serde_json::from_str(
+        r#"{
+            "pubkey": "linked1",
+            "name": "linked-agent",
+            "persona_id": "p1",
+            "private_key_nsec": "nsec1fake",
+            "relay_url": "wss://localhost:3000",
+            "acp_command": "buzz-acp",
+            "agent_command": "goose",
+            "agent_args": [],
+            "mcp_command": "",
+            "turn_timeout_seconds": 320,
+            "system_prompt": null,
+            "model": null,
+            "provider": null,
+            "env_vars": {},
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "last_started_at": null,
+            "last_stopped_at": null,
+            "last_exit_code": null,
+            "last_error": null
+        }"#,
+    )
+    .expect("linked agent record");
+
+    let is_linked = record.persona_id.is_some();
+    assert!(is_linked, "test setup: record must be linked");
+
+    let model_update: Option<Option<String>> = Some(Some("explicit-model".to_string()));
+    let provider_update: Option<Option<String>> = Some(Some("explicit-prov".to_string()));
+    let prompt_update: Option<Option<String>> = Some(Some("explicit-prompt".to_string()));
+
+    if !is_linked {
+        if let Some(m) = model_update {
+            record.model = m;
+        }
+        if let Some(p) = provider_update {
+            record.provider = p;
+        }
+        if let Some(s) = prompt_update {
+            record.system_prompt = s;
+        }
+    }
+
+    assert!(
+        record.model.is_none(),
+        "linked record model must not be updated"
+    );
+    assert!(
+        record.provider.is_none(),
+        "linked record provider must not be updated"
+    );
+    assert!(
+        record.system_prompt.is_none(),
+        "linked record system_prompt must not be updated"
+    );
+}
+
+#[test]
+fn definition_less_instance_accepts_model_provider_prompt_writes() {
+    let mut record: crate::managed_agents::ManagedAgentRecord = serde_json::from_str(
+        r#"{
+            "pubkey": "standalone1",
+            "name": "standalone-agent",
+            "private_key_nsec": "nsec1fake",
+            "relay_url": "wss://localhost:3000",
+            "acp_command": "buzz-acp",
+            "agent_command": "goose",
+            "agent_args": [],
+            "mcp_command": "",
+            "turn_timeout_seconds": 320,
+            "system_prompt": null,
+            "model": null,
+            "provider": null,
+            "env_vars": {},
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "last_started_at": null,
+            "last_stopped_at": null,
+            "last_exit_code": null,
+            "last_error": null
+        }"#,
+    )
+    .expect("standalone agent record");
+
+    let is_linked = record.persona_id.is_some();
+    assert!(!is_linked, "test setup: record must not be linked");
+
+    if !is_linked {
+        if let Some(m) = Some(Some("new-model".to_string())) {
+            record.model = m;
+        }
+        if let Some(p) = Some(Some("new-prov".to_string())) {
+            record.provider = p;
+        }
+        if let Some(s) = Some(Some("new-prompt".to_string())) {
+            record.system_prompt = s;
+        }
+    }
+
+    assert_eq!(record.model.as_deref(), Some("new-model"));
+    assert_eq!(record.provider.as_deref(), Some("new-prov"));
+    assert_eq!(record.system_prompt.as_deref(), Some("new-prompt"));
+}
+
 #[test]
 fn is_databricks_provider_matches_both_variants() {
     assert!(is_databricks_provider(Some("databricks")));

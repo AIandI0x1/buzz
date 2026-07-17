@@ -123,8 +123,7 @@ const overrides = new Map([
   // activity-feed threads avatar_url into build_managed_agent_summary for the
   // assistant-bubble pinned snapshot.
   // +1 for agent_pubkey field in setup payload (config-nudge card wire).
-  // persona-blank-fallback: resolve_effective_prompt_model_provider gains a
-  // record_provider param + applies persona_field_with_record_fallback. +5 lines.
+  // effective-config resolver: single resolver replaces the old fallback chain.
   // global-agent-config: spawn_agent_child loads global config and merges as
   // lowest env layer (+8 lines). Queued to split.
   ["src-tauri/src/managed_agents/runtime.rs", 2216],
@@ -208,7 +207,8 @@ const overrides = new Map([
   // mapper. This is the existing API boundary; split remains queued.
   // team-instructions-first-class: createManagedAgent Tauri bridge threads the
   // new teamId input through to the backend (+1 line).
-  ["src/shared/api/tauri.ts", 1305],
+  // +2 for model_source field in RawManagedAgent + fromRawManagedAgent mapping.
+  ["src/shared/api/tauri.ts", 1307],
   // doctor-npm-eacces-preflight: hint field added to InstallStepResult (+1 line).
   // codex-acp-package-swap: "adapter_outdated" variant added to AcpAvailabilityStatus (+1 line).
   // doctor-install-reliability: AuthStatus tagged union + nodeRequired/authStatus/

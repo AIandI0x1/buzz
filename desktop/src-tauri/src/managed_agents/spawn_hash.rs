@@ -111,8 +111,14 @@ pub(crate) fn spawn_config_hash(
     // Prompt and runtime-layered team instructions use the same resolver as spawn.
     effective_spawn_prompt(record).hash(&mut hasher);
     effective_team_instructions(record, teams).hash(&mut hasher);
-    record.model.hash(&mut hasher);
-    record.provider.hash(&mut hasher);
+    // Hash the RESOLVED model/provider (through the effective-config resolver),
+    // not the raw record fields. For linked inherited agents record.model is
+    // None after snapshot — hashing it would miss global-default changes for
+    // runtimes without a model_env_var.
+    let (resolved_model, resolved_provider) =
+        super::global_config::resolve_effective_model_provider(record, personas, global);
+    resolved_model.hash(&mut hasher);
+    resolved_provider.hash(&mut hasher);
     record.auth_tag.hash(&mut hasher);
     record.respond_to.as_str().hash(&mut hasher);
     // The allowlist is hashed as the env receives it: spawn sets

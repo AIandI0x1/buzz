@@ -416,6 +416,67 @@ fn missing_definition_leaves_materialized_runtime_in_hash() {
     );
 }
 
+// ── Global default trips hash for linked inherited agents ─────────────────
+
+#[test]
+fn global_model_change_trips_hash_for_linked_inherited_agent() {
+    let mut rec = record();
+    rec.persona_id = Some("p1".into());
+    rec.model = Some("stale-record-model".into());
+
+    let personas = vec![persona("p1", Some("goose"), "prompt")];
+
+    let global_a = GlobalAgentConfig {
+        model: Some("model-a".to_string()),
+        provider: Some("prov-a".to_string()),
+        ..Default::default()
+    };
+    let global_b = GlobalAgentConfig {
+        model: Some("model-b".to_string()),
+        provider: Some("prov-b".to_string()),
+        ..Default::default()
+    };
+
+    let hash_a = spawn_config_hash(&rec, &personas, &[], "wss://ws.example", &global_a);
+    let hash_b = spawn_config_hash(&rec, &personas, &[], "wss://ws.example", &global_b);
+
+    assert_ne!(
+        hash_a, hash_b,
+        "changing the global default must trip the hash for a linked inherited agent"
+    );
+}
+
+#[test]
+fn global_model_change_trips_hash_without_model_env_var() {
+    let mut rec = record();
+    rec.persona_id = Some("p1".into());
+    rec.agent_command = "some-harness-without-model-env".into();
+
+    let personas = vec![{
+        let mut p = persona("p1", None, "prompt");
+        p.model = None;
+        p.provider = None;
+        p
+    }];
+
+    let global_a = GlobalAgentConfig {
+        model: Some("model-a".to_string()),
+        ..Default::default()
+    };
+    let global_b = GlobalAgentConfig {
+        model: Some("model-b".to_string()),
+        ..Default::default()
+    };
+
+    let hash_a = spawn_config_hash(&rec, &personas, &[], "wss://ws.example", &global_a);
+    let hash_b = spawn_config_hash(&rec, &personas, &[], "wss://ws.example", &global_b);
+
+    assert_ne!(
+        hash_a, hash_b,
+        "global model change must trip hash even without a model_env_var runtime"
+    );
+}
+
 #[test]
 fn effective_spawn_prompt_matches_hash_semantics() {
     // The env write and the hash share effective_spawn_prompt — this row

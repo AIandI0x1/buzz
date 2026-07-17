@@ -23,10 +23,9 @@ type AgentSpawnResult = (String, SpawnResult);
 /// `model`/`provider` were clobbered by the old unconditional snapshot code before
 /// this fix — are skipped here; they self-heal on the next manual start via the
 /// start-path re-snapshot in `start_local_agent_with_preflight`.
-/// If the linked persona is gone, we log loudly and leave the snapshot empty —
-/// the record's own `system_prompt`/`model` (possibly empty for persona-created
-/// agents) is then all the config that remains, which is the same fallback an
-/// orphaned agent already gets.
+/// If the linked persona is gone, we log loudly and leave the record untouched —
+/// it stays orphaned and `spawn_agent_child` refuses to start it (see
+/// `effective_config::spawn_orphan_refusal`).
 pub fn backfill_persona_snapshots(app: &tauri::AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     let _store_guard = state
@@ -53,7 +52,7 @@ pub fn backfill_persona_snapshots(app: &tauri::AppHandle) -> Result<(), String> 
         }
         let Some(persona) = personas.iter().find(|p| p.id == persona_id) else {
             eprintln!(
-                "buzz-desktop: persona-snapshot backfill: agent {} links persona {persona_id} which no longer exists; leaving snapshot empty — it will spawn from its record fields",
+                "buzz-desktop: persona-snapshot backfill: agent {} links persona {persona_id} which no longer exists; leaving it orphaned — spawn will refuse it",
                 record.pubkey
             );
             continue;
@@ -178,6 +177,9 @@ pub async fn restore_managed_agents_on_launch(
                 continue;
             };
             let Some(persona) = personas_for_snapshot.iter().find(|p| p.id == persona_id) else {
+                // Orphaned: no current persona to re-snapshot from. Leave the
+                // record as-is — `spawn_agent_child` (Phase B below) refuses to
+                // spawn it and Phase C persists the refusal to `last_error`.
                 continue;
             };
             super::persona_events::apply_persona_snapshot(record, persona);

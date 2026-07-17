@@ -1311,11 +1311,36 @@ pub fn build_managed_agent_summary(
         }
     };
 
-    // Display contract: show the pinned record snapshot — what the agent
-    // actually runs — not the live persona. The drift flags below signal when
-    // the snapshot has fallen behind an edited persona; showing live values
-    // next to an "out of date" badge would contradict it.
     let (persona_out_of_date, persona_orphaned) = persona_drift_state(record, personas);
+
+    let global_for_summary =
+        crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
+    let effective_cfg = crate::managed_agents::effective_config::resolve_effective_config(
+        record,
+        personas,
+        &global_for_summary,
+    );
+    let (effective_model, effective_provider, effective_prompt, model_source) = match effective_cfg
+    {
+        crate::managed_agents::effective_config::EffectiveConfigResult::Resolved(cfg) => {
+            let source = cfg.model.source.clone();
+            (
+                cfg.model.value,
+                cfg.provider.value,
+                cfg.system_prompt.value,
+                Some(source),
+            )
+        }
+        crate::managed_agents::effective_config::EffectiveConfigResult::OrphanedInstance {
+            record_pubkey,
+            missing_persona_id,
+        } => {
+            eprintln!(
+                "orphaned agent instance: pubkey={record_pubkey}, missing_persona_id={missing_persona_id}"
+            );
+            (None, None, None, None)
+        }
+    };
 
     // Restart badge: the running process stamped its effective spawn config
     // at launch; recompute from current disk state and flag drift. Only a
@@ -1372,10 +1397,11 @@ pub fn build_managed_agent_summary(
         idle_timeout_seconds: record.idle_timeout_seconds,
         max_turn_duration_seconds: record.max_turn_duration_seconds,
         parallelism: record.parallelism,
-        system_prompt: record.system_prompt.clone(),
+        system_prompt: effective_prompt,
         avatar_url: record.avatar_url.clone(),
-        model: record.model.clone(),
-        provider: record.provider.clone(),
+        model: effective_model,
+        model_source,
+        provider: effective_provider,
         persona_out_of_date,
         persona_orphaned,
         needs_restart,
@@ -1480,6 +1506,28 @@ pub fn spawn_agent_child(
     if let Some(error) = spawn_key_refusal(record) {
         return Err(error);
     }
+    // Resolve the effective harness (agent command) from the linked persona, so
+    // persona harness edits propagate on the next spawn; an explicit per-agent
+    // override wins. `agent_args` and `mcp_command` are pure derivations of the
+    // command, so we recompute them from the effective value rather than the
+    // frozen record snapshot. Mirrors the model resolution below.
+    let personas = super::load_personas(app).unwrap_or_default();
+    let teams = super::load_teams(app).unwrap_or_default();
+    // Load global config once; used for runtime_metadata_env_vars (model/provider fallback)
+    // and for the env-var merge at spawn time.
+    let global = crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
+
+    // Orphan refusal lives HERE, at the shared spawn boundary, so every
+    // caller (interactive start, launch restore, `start_managed_agent_process`)
+    // inherits it — no caller can bypass this by reaching `spawn_agent_child`
+    // directly. Checked before any side effect (log marker, log file, process
+    // spawn) so a refused spawn leaves no trace.
+    if let Some(error) =
+        crate::managed_agents::effective_config::spawn_orphan_refusal(record, &personas, &global)
+    {
+        return Err(error);
+    }
+
     let log_path = managed_agent_log_path(app, &record.pubkey)?;
     append_log_marker(
         &log_path,
@@ -1495,16 +1543,6 @@ pub fn spawn_agent_child(
     let stderr = stdout
         .try_clone()
         .map_err(|error| format!("failed to clone log handle: {error}"))?;
-    // Resolve the effective harness (agent command) from the linked persona, so
-    // persona harness edits propagate on the next spawn; an explicit per-agent
-    // override wins. `agent_args` and `mcp_command` are pure derivations of the
-    // command, so we recompute them from the effective value rather than the
-    // frozen record snapshot. Mirrors the model resolution below.
-    let personas = super::load_personas(app).unwrap_or_default();
-    let teams = super::load_teams(app).unwrap_or_default();
-    // Load global config once; used for runtime_metadata_env_vars (model/provider fallback)
-    // and for the env-var merge at spawn time.
-    let global = crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
     let effective_command = super::record_agent_command(record, &personas);
     let agent_args = normalize_agent_args(&effective_command, record.agent_args.clone());
     let resolved_acp_command = resolve_command(&record.acp_command)
@@ -1728,10 +1766,10 @@ pub fn spawn_agent_child(
 
     // System prompt via the shared spawn-effective filter — the SAME function the
     // config hash digests, so env write and badge cannot disagree (see
-    // `effective_spawn_prompt` for the Some("")/None collapse). Model and provider
-    // use the shared
-    // resolver: agent → persona → global → None, so a global-default-only agent
-    // spawns with the correct provider/model env.
+    // `effective_spawn_prompt` for the Some("")/None collapse). Model and
+    // provider use the shared resolver: definition → global (linked
+    // instances never consult the record's own model/provider bytes), or
+    // instance → global for definition-less agents.
     let effective_prompt = super::spawn_hash::effective_spawn_prompt(record);
     let (effective_model, effective_provider) =
         crate::managed_agents::resolve_effective_model_provider(record, &personas, &global);
@@ -1741,22 +1779,19 @@ pub fn spawn_agent_child(
     } else {
         command.env_remove("BUZZ_ACP_SYSTEM_PROMPT");
     }
-    if let Some(model) = effective_model {
+    if let Some(model) = effective_model.as_deref() {
         command.env("BUZZ_ACP_MODEL", model);
     } else {
         command.env_remove("BUZZ_ACP_MODEL");
     }
-    // Baked-in provider defaults for internal builds (buzz-releases sets
-    // BUZZ_BUILD_BUZZ_AGENT_* at compile time; OSS builds bake nothing).
-    // Written FIRST so that record/persona metadata env vars below override them.
     build_buzz_agent_provider_defaults(&mut command);
     if let Some(meta) = runtime_meta {
         for (key, value) in runtime_metadata_env_vars(
             meta.model_env_var,
             meta.provider_env_var,
             meta.provider_locked,
-            effective_model,
-            effective_provider,
+            effective_model.as_deref(),
+            effective_provider.as_deref(),
         ) {
             command.env(key, value);
         }
@@ -2092,15 +2127,11 @@ pub(crate) fn runtime_metadata_env_vars<'a>(
 /// Resolve the effective (prompt, model, provider) triple for a persona-linked agent.
 ///
 /// Given a persona_id, finds the persona in the list and returns its system_prompt,
-/// model, and provider as the authoritative values. When the persona leaves `model`
-/// or `provider` blank (None or whitespace-only), falls back to the record's own
-/// field using the same precedence rule as `persona_snapshot_with_agent_config_fallback`
-/// so the display surface matches spawn behavior. Falls back to the record's own
-/// prompt/model/provider when no persona is linked or found.
+/// Resolve effective prompt/model/provider using definition-authoritative
+/// semantics for linked instances.
 ///
 /// Used by `agent_config.rs` to inject persona defaults into the config surface
-/// before running the reader, so BuzzExplicit-tagged fields can be re-tagged to
-/// PersonaDefault for fields the record did not independently set.
+/// before running the reader.
 pub(crate) fn resolve_effective_prompt_model_provider(
     persona_id: Option<&str>,
     personas: &[crate::managed_agents::types::AgentDefinition],
@@ -2108,13 +2139,16 @@ pub(crate) fn resolve_effective_prompt_model_provider(
     record_model: Option<String>,
     record_provider: Option<String>,
 ) -> (Option<String>, Option<String>, Option<String>) {
-    let fallback = crate::managed_agents::persona_events::persona_field_with_record_fallback;
     match persona_id.and_then(|pid| personas.iter().find(|p| p.id == pid)) {
-        Some(p) => (
-            Some(p.system_prompt.clone()),
-            fallback(p.model.as_deref(), record_model.as_deref()), // fallback: record.model
-            fallback(p.provider.as_deref(), record_provider.as_deref()), // fallback: record.provider
-        ),
+        Some(p) => {
+            fn non_blank(v: Option<&str>) -> Option<String> {
+                v.filter(|s| !s.trim().is_empty()).map(str::to_owned)
+            }
+            let prompt = non_blank(Some(&p.system_prompt));
+            let model = non_blank(p.model.as_deref());
+            let provider = non_blank(p.provider.as_deref());
+            (prompt, model, provider)
+        }
         None => (record_prompt, record_model, record_provider),
     }
 }
