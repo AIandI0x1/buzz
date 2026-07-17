@@ -23,6 +23,8 @@ type ProviderErrorBody = {
   message?: string;
 };
 
+type OpenAiReasoningEffort = "low" | "minimal" | "none";
+
 type AgentEnvironment = Record<string, string | undefined>;
 
 function nonEmptyString(value: unknown) {
@@ -198,6 +200,22 @@ function extractOpenAiText(body: unknown) {
   return text || null;
 }
 
+export function announcementDemoOpenAiReasoningEffort(
+  model: string,
+): OpenAiReasoningEffort | null {
+  const normalizedModel = model.trim().toLowerCase();
+  if (/^gpt-5\.(?:4|5|6)(?:[.-]|$)/.test(normalizedModel)) {
+    return "none";
+  }
+  if (/^gpt-5(?:[.-]|$)/.test(normalizedModel)) {
+    return "minimal";
+  }
+  if (/^o[1-9](?:[.-]|$)/.test(normalizedModel)) {
+    return "low";
+  }
+  return null;
+}
+
 function extractAnthropicText(body: unknown) {
   if (typeof body !== "object" || body === null) {
     return null;
@@ -215,6 +233,7 @@ function extractAnthropicText(body: unknown) {
 }
 
 async function requestOpenAiResponse(input: AnnouncementDemoAgentRequest) {
+  const reasoningEffort = announcementDemoOpenAiReasoningEffort(input.model);
   const response = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: {
@@ -225,7 +244,8 @@ async function requestOpenAiResponse(input: AnnouncementDemoAgentRequest) {
       model: input.model,
       instructions: input.systemPrompt,
       input: input.messages,
-      max_output_tokens: 350,
+      max_output_tokens: 2_000,
+      ...(reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
       store: false,
     }),
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
@@ -239,6 +259,18 @@ async function requestOpenAiResponse(input: AnnouncementDemoAgentRequest) {
 
   const text = extractOpenAiText(body);
   if (!text) {
+    const responseDetails = body as {
+      status?: unknown;
+      incomplete_details?: { reason?: unknown };
+    };
+    if (
+      responseDetails.status === "incomplete" &&
+      responseDetails.incomplete_details?.reason === "max_output_tokens"
+    ) {
+      throw new Error(
+        "OpenAI ran out of output tokens before producing visible text.",
+      );
+    }
     throw new Error("OpenAI returned a response without any text.");
   }
   return text;

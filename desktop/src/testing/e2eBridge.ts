@@ -53,7 +53,7 @@ import {
   ANNOUNCEMENT_DEMO_AGENTS,
   ANNOUNCEMENT_DEMO_CHANNELS,
   ANNOUNCEMENT_DEMO_DMS,
-  ANNOUNCEMENT_DEMO_LIVE_CONVERSATION,
+  ANNOUNCEMENT_DEMO_LIVE_CONVERSATIONS,
   ANNOUNCEMENT_DEMO_MESSAGES,
   ANNOUNCEMENT_DEMO_PEOPLE,
   ANNOUNCEMENT_DEMO_PROJECT_SUBJECTS,
@@ -2461,6 +2461,32 @@ const mockChannels: MockChannel[] = [
     ],
   }),
   createMockChannel({
+    id: "4e91b4d2-8207-4d63-9b1a-3c72a8f01142",
+    name: "engineering-demo",
+    channel_type: "stream",
+    visibility: "open",
+    description: "Desktop, relay, and infrastructure engineering",
+    topic: "Reconnect reliability and the next release candidate",
+    purpose: "Debug together, review changes, and keep the build healthy.",
+    last_message_at: isoMinutesAgo(5),
+    archived_at: null,
+    created_by: ALICE_PUBKEY,
+    topic_set_by: ALICE_PUBKEY,
+    topic_set_at: isoMinutesAgo(100),
+    purpose_set_by: ALICE_PUBKEY,
+    purpose_set_at: isoMinutesAgo(110),
+    topic_required: false,
+    max_members: null,
+    nip29_group_id: null,
+    created_minutes_ago: 1310,
+    updated_minutes_ago: 5,
+    members: [
+      createMockMember(ALICE_PUBKEY, "owner", 1310),
+      createMockMember(MOCK_IDENTITY_PUBKEY, "member", 1170),
+      createMockMember(BOB_PUBKEY, "member", 890),
+    ],
+  }),
+  createMockChannel({
     id: "94a444a4-c0a3-5966-ab05-530c6ddc2301",
     name: "agents",
     channel_type: "stream",
@@ -2721,7 +2747,7 @@ let mockWebsocketSendMutexWedged = false;
 const realSockets = new Map<number, WebSocket>();
 let mockManagedAgents: MockManagedAgent[] = [];
 const pendingAnnouncementDemoAgentResponses = new Set<string>();
-let announcementDemoLiveConversationStarted = false;
+const startedAnnouncementDemoLiveConversations = new Set<string>();
 let mockGlobalAgentConfig: MockGlobalAgentConfig = {
   env_vars: {},
   provider: null,
@@ -4216,6 +4242,32 @@ type AnnouncementDemoAgentReply = {
   error?: string;
 };
 
+function getAnnouncementDemoLiveConversation(channelId: string) {
+  const channel = mockChannels.find((candidate) => candidate.id === channelId);
+  return ANNOUNCEMENT_DEMO_LIVE_CONVERSATIONS.find(
+    (conversation) => conversation.channelName === channel?.name,
+  );
+}
+
+function getAnnouncementDemoNextAgentName(
+  channelId: string,
+  currentAgentPubkey: string,
+): AnnouncementDemoAgentName | null {
+  const currentAgent = ANNOUNCEMENT_DEMO_AGENTS.find(
+    (candidate) =>
+      normalizePubkey(candidate.pubkey) === normalizePubkey(currentAgentPubkey),
+  );
+  if (!currentAgent) {
+    return null;
+  }
+
+  const agentOrder =
+    getAnnouncementDemoLiveConversation(channelId)?.agentOrder ??
+    ANNOUNCEMENT_DEMO_AGENTS.map((agent) => agent.name);
+  const currentIndex = agentOrder.indexOf(currentAgent.name);
+  return agentOrder[currentIndex + 1] ?? null;
+}
+
 function getAnnouncementDemoProviderConfig(
   agent: MockManagedAgent,
 ): AnnouncementDemoProviderConfig {
@@ -4285,21 +4337,18 @@ function getAnnouncementDemoAgentTargets(channelId: string, event: RelayEvent) {
     channel.channel_type === "dm"
       ? new Set(channel.members.map((member) => normalizePubkey(member.pubkey)))
       : new Set<string>();
-  const sourceAgentIndex = isAgentAuthored
-    ? ANNOUNCEMENT_DEMO_AGENTS.findIndex(
-        (candidate) =>
-          normalizePubkey(candidate.pubkey) === normalizePubkey(event.pubkey),
-      )
-    : -1;
+  const nextAgentName = isAgentAuthored
+    ? getAnnouncementDemoNextAgentName(channelId, event.pubkey)
+    : null;
 
   return mockManagedAgents.filter((agent) => {
     const pubkey = normalizePubkey(agent.pubkey);
     const isActive = agent.status === "running" || agent.status === "deployed";
     if (isAgentAuthored) {
-      const targetAgentIndex = ANNOUNCEMENT_DEMO_AGENTS.findIndex(
+      const targetDefinition = ANNOUNCEMENT_DEMO_AGENTS.find(
         (candidate) => normalizePubkey(candidate.pubkey) === pubkey,
       );
-      if (targetAgentIndex !== sourceAgentIndex + 1) {
+      if (targetDefinition?.name !== nextAgentName) {
         return false;
       }
     }
@@ -4310,6 +4359,7 @@ function getAnnouncementDemoAgentTargets(channelId: string, event: RelayEvent) {
 }
 
 function getAnnouncementDemoNextAgent(
+  channelId: string,
   sourceEvent: RelayEvent,
   agent: MockManagedAgent,
 ) {
@@ -4320,11 +4370,13 @@ function getAnnouncementDemoNextAgent(
     return null;
   }
 
-  const currentIndex = ANNOUNCEMENT_DEMO_AGENTS.findIndex(
-    (candidate) =>
-      normalizePubkey(candidate.pubkey) === normalizePubkey(agent.pubkey),
+  const nextAgentName = getAnnouncementDemoNextAgentName(
+    channelId,
+    agent.pubkey,
   );
-  const nextDefinition = ANNOUNCEMENT_DEMO_AGENTS[currentIndex + 1];
+  const nextDefinition = ANNOUNCEMENT_DEMO_AGENTS.find(
+    (candidate) => candidate.name === nextAgentName,
+  );
   if (!nextDefinition) {
     return null;
   }
@@ -4374,7 +4426,7 @@ function getAnnouncementDemoSystemPrompt(
     channel?.channel_type === "dm"
       ? "a direct message"
       : `#${channel?.name ?? "a team channel"}`;
-  const nextAgent = getAnnouncementDemoNextAgent(sourceEvent, agent);
+  const nextAgent = getAnnouncementDemoNextAgent(channelId, sourceEvent, agent);
   const isAgentChainEvent = sourceEvent.tags.some(
     (tag) => tag[0] === ANNOUNCEMENT_DEMO_AGENT_CHAIN_TAG,
   );
@@ -4383,7 +4435,7 @@ function getAnnouncementDemoSystemPrompt(
     : isAgentChainEvent
       ? " This is the final turn in a short agent collaboration: respond directly to the previous agent, share one useful check or refinement, and close the loop without handing off again."
       : "";
-  return `${basePrompt}\n\nYou are replying in ${location}. Use the conversation context, sound like a real colleague, and do not prefix the reply with your name.${collaborationInstruction}`;
+  return `${basePrompt}\n\nYou are replying in ${location}. Use the conversation context, sound like a real colleague, and do not prefix the reply with your name. Keep the reply to one to three short sentences with no lists or code blocks.${collaborationInstruction}`;
 }
 
 async function requestAnnouncementDemoAgentReply(
@@ -4392,6 +4444,8 @@ async function requestAnnouncementDemoAgentReply(
   sourceEvent: RelayEvent,
 ) {
   const provider = getAnnouncementDemoProviderConfig(agent);
+  // The local Vite proxy keeps provider credentials out of the webview while
+  // still allowing the native demo to use the settings entered in the app.
   const response = await fetch("/__announcement-demo/agent-response", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -4437,7 +4491,7 @@ function publishAnnouncementDemoAgentReply(
     (tag) => tag[0] === ANNOUNCEMENT_DEMO_AGENT_CHAIN_TAG,
   );
   const nextAgent = continueAgentChain
-    ? getAnnouncementDemoNextAgent(sourceEvent, agent)
+    ? getAnnouncementDemoNextAgent(channelId, sourceEvent, agent)
     : null;
   const mentionPubkeys = [
     sourceEvent.pubkey,
@@ -4472,16 +4526,24 @@ function publishAnnouncementDemoAgentReply(
       ANNOUNCEMENT_DEMO_AGENT_HANDOFF_DELAY_MS,
     );
   } else if (isAgentChainEvent && continueAgentChain) {
-    const producerPubkey = getAnnouncementDemoPersonPubkey("producer");
+    const humanClose = getAnnouncementDemoLiveConversation(channelId)
+      ?.humanClose ?? {
+      delayMs: 1_000,
+      author: "producer" as const,
+      content: "That’s the version. I can cut to that — nice swarm work 🐝",
+    };
+    const closingAuthorPubkey = getAnnouncementDemoPersonPubkey(
+      humanClose.author,
+    );
     window.setTimeout(() => {
-      emitMockTypingIndicator(channelId, producerPubkey);
+      emitMockTypingIndicator(channelId, closingAuthorPubkey);
       window.setTimeout(
         () =>
           emitMockChannelMessage(
             channelId,
-            "That’s the version. I can cut to that — nice swarm work 🐝",
+            humanClose.content,
             null,
-            producerPubkey,
+            closingAuthorPubkey,
             9,
             undefined,
             [["announcement-demo-live", "1"]],
@@ -4490,7 +4552,7 @@ function publishAnnouncementDemoAgentReply(
           ),
         650,
       );
-    }, ANNOUNCEMENT_DEMO_HUMAN_CLOSE_DELAY_MS);
+    }, humanClose.delayMs);
   }
 }
 
@@ -4501,7 +4563,6 @@ const ANNOUNCEMENT_DEMO_AGENT_WORKING_DELAY_MS = 350;
 const ANNOUNCEMENT_DEMO_AGENT_MIN_TURN_MS = 1_800;
 const ANNOUNCEMENT_DEMO_AGENT_REACTION_CLEANUP_DELAY_MS = 2_500;
 const ANNOUNCEMENT_DEMO_AGENT_HANDOFF_DELAY_MS = 700;
-const ANNOUNCEMENT_DEMO_HUMAN_CLOSE_DELAY_MS = 700;
 
 function publishAnnouncementDemoAgentReaction(
   channelId: string,
@@ -4635,25 +4696,25 @@ function queueAnnouncementDemoAgentResponses(
 
 function maybeStartAnnouncementDemoLiveConversation(channelId: string) {
   if (
-    announcementDemoLiveConversationStarted ||
+    startedAnnouncementDemoLiveConversations.has(channelId) ||
     !getConfig()?.mock?.announcementDemo
   ) {
     return;
   }
 
-  const channel = mockChannels.find((candidate) => candidate.id === channelId);
-  if (channel?.name !== ANNOUNCEMENT_DEMO_LIVE_CONVERSATION.channelName) {
+  const conversation = getAnnouncementDemoLiveConversation(channelId);
+  if (!conversation) {
     return;
   }
 
-  announcementDemoLiveConversationStarted = true;
+  startedAnnouncementDemoLiveConversations.add(channelId);
   let elapsedMs = 0;
-  for (const step of ANNOUNCEMENT_DEMO_LIVE_CONVERSATION.steps) {
+  for (const step of conversation.steps) {
     elapsedMs += step.delayMs;
     const authorPubkey = getAnnouncementDemoPersonPubkey(step.author);
     window.setTimeout(
       () => emitMockTypingIndicator(channelId, authorPubkey),
-      Math.max(0, elapsedMs - 850),
+      Math.max(0, elapsedMs - 1_000),
     );
     window.setTimeout(() => {
       const agentMentionPubkeys = (

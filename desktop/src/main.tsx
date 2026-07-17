@@ -11,9 +11,11 @@ import { CommunityOnboardingProvider } from "@/features/onboarding/communityOnbo
 import {
   ANNOUNCEMENT_DEMO_AGENTS,
   ANNOUNCEMENT_DEMO_COMMUNITY_NAME,
+  ANNOUNCEMENT_DEMO_INITIAL_READ_CHANNEL_IDS,
   ANNOUNCEMENT_DEMO_PEOPLE,
   ANNOUNCEMENT_DEMO_SECTION_STORE,
 } from "@/testing/announcementDemoFixtures";
+import { localReadStateKey } from "@/features/channels/readState/readStateFormat";
 import { ThemeProvider } from "@/shared/theme/ThemeProvider";
 import { EmojiBurstProvider } from "@/shared/ui/EmojiBurstProvider";
 import { PoofBurstProvider } from "@/shared/ui/PoofBurstProvider";
@@ -66,6 +68,8 @@ function configureMockBridgeFromUrl() {
     return;
   }
 
+  // The native recording build intentionally reuses the browser mock bridge;
+  // only live model calls leave the webview through the local provider proxy.
   const e2eWindow = window as E2eWindow;
   if (isAnnouncementDemo) {
     e2eWindow.__BUZZ_E2E__ = {
@@ -104,9 +108,21 @@ function configureMockBridgeFromUrl() {
 
   if (isAnnouncementDemo) {
     const relayStorageScope = encodeURIComponent(mockRelayWsUrl);
+    const initialReadAt = new Date().toISOString();
     window.localStorage.setItem(
       `${CHANNEL_SECTIONS_STORAGE_KEY_PREFIX}:${E2E_DEFAULT_PUBKEY}:${relayStorageScope}`,
       JSON.stringify(ANNOUNCEMENT_DEMO_SECTION_STORE),
+    );
+    window.localStorage.setItem(
+      localReadStateKey(E2E_DEFAULT_PUBKEY),
+      JSON.stringify(
+        Object.fromEntries(
+          ANNOUNCEMENT_DEMO_INITIAL_READ_CHANNEL_IDS.map((channelId) => [
+            channelId,
+            initialReadAt,
+          ]),
+        ),
+      ),
     );
     window.localStorage.setItem(
       `${SELF_PROFILE_STORAGE_KEY_PREFIX}:${mockRelayWsUrl}:${E2E_DEFAULT_PUBKEY}`,

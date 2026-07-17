@@ -3,7 +3,7 @@ import { expect, test } from "@playwright/test";
 test("announcement demo loads its workspace, people, and projects", async ({
   page,
 }) => {
-  test.setTimeout(60_000);
+  test.setTimeout(75_000);
   const agentReply =
     "I’d lead with the handoff moment, then land on the shared launch room. That gives the story a clear before-and-after.";
   const fizzReply =
@@ -12,6 +12,14 @@ test("announcement demo loads its workspace, people, and projects", async ({
     "Frame it as one thought moving with you: send, surface, arrive together. @Bumble, can you sanity-check the sequence? 🍯";
   const bumbleReply =
     "The sequence tracks. Keep the notification visible for a full beat before the cut, and the handoff will read without narration. 🐝🔎";
+  const engineeringBumbleReply =
+    "The duplicate points to the previous subscription generation delivering once after reconnect. @Fizz, can you turn that into the smallest safe guard?";
+  const engineeringFizzReply =
+    "I’d reject callbacks whose generation no longer matches the active subscription, then add a sleep-wake regression case. @Honey, can you package the rollout check?";
+  const engineeringHoneyReply =
+    "Ship the guard behind the existing reconnect path, run the twenty-cycle soak, and call out duplicate delivery in the release checklist. That closes the loop cleanly.";
+  const engineeringHumanClose =
+    "Perfect. That gives me the patch and the verification path — I’m on it.";
   const humanClose =
     "That’s the version. I can cut to that — nice swarm work 🐝";
   const fizzReplyVisible = fizzReply.replace("@Honey", "Honey");
@@ -34,8 +42,14 @@ test("announcement demo loads its workspace, people, and projects", async ({
     const isFinalTurn = body.systemPrompt?.includes(
       "final turn in a short agent collaboration",
     );
-    const text =
-      body.systemPrompt?.includes("You are Fizz") && isCollaborativeTurn
+    const isEngineering = body.systemPrompt?.includes("in #engineering");
+    const text = isEngineering
+      ? body.systemPrompt?.includes("You are Bumble") && isCollaborativeTurn
+        ? engineeringBumbleReply
+        : body.systemPrompt?.includes("You are Fizz") && isCollaborativeTurn
+          ? engineeringFizzReply
+          : engineeringHoneyReply
+      : body.systemPrompt?.includes("You are Fizz") && isCollaborativeTurn
         ? fizzReply
         : body.systemPrompt?.includes("You are Honey") && isCollaborativeTurn
           ? honeyReply
@@ -98,6 +112,54 @@ test("announcement demo loads its workspace, people, and projects", async ({
     page.getByTestId("channel-DM").filter({ hasText: "Priya Shah" }),
   ).toBeVisible();
   await expect(page.getByTestId("channel-DM")).toHaveCount(3);
+
+  const unreadChannels = [
+    "announcements",
+    "engineering",
+    "design",
+    "marketing",
+    "queen-bee-launch",
+  ] as const;
+  const readChannels = [
+    "general",
+    "flight-path",
+    "mobile",
+    "product-ideas",
+    "launch-notes",
+  ] as const;
+  for (const channel of unreadChannels) {
+    await expect(
+      page
+        .getByTestId(`channel-${channel}`)
+        .locator("[data-testid^='channel-unread-']"),
+    ).toBeVisible();
+  }
+  for (const channel of readChannels) {
+    await expect(
+      page
+        .getByTestId(`channel-${channel}`)
+        .locator("[data-testid^='channel-unread-']"),
+    ).toHaveCount(0);
+  }
+
+  const mayaDm = page
+    .getByTestId("channel-DM")
+    .filter({ hasText: "Maya Chen" });
+  const jordanDm = page
+    .getByTestId("channel-DM")
+    .filter({ hasText: "Jordan Brooks" });
+  const priyaDm = page
+    .getByTestId("channel-DM")
+    .filter({ hasText: "Priya Shah" });
+  await expect(
+    mayaDm.locator("xpath=..").getByTestId("channel-unread-DM"),
+  ).toBeVisible();
+  await expect(
+    jordanDm.locator("xpath=..").getByTestId("channel-unread-DM"),
+  ).toHaveCount(0);
+  await expect(
+    priyaDm.locator("xpath=..").getByTestId("channel-unread-DM"),
+  ).toHaveCount(0);
 
   await page.getByTestId("channel-flight-path").click();
   const channelTimeline = page.getByTestId("message-timeline");
@@ -209,6 +271,47 @@ test("announcement demo loads its workspace, people, and projects", async ({
   await messageInput.pressSequentially(" suggest the strongest story beat?");
   await page.getByTestId("send-message").click();
   await expect(channelTimeline).toContainText(agentReply, { timeout: 10_000 });
+
+  await page.getByTestId("channel-engineering").click();
+  await expect(channelTimeline).toContainText(
+    "Release build is green. I’m doing one last sleep / wake pass.",
+  );
+  await expect(
+    channelTimeline.locator('[data-link-preview="github-pull-request"]'),
+  ).toBeVisible();
+  await expect(
+    channelTimeline.locator('[data-link-preview="linear-issue"]'),
+  ).toBeVisible();
+  await expect(channelTimeline).toContainText(
+    "I can still reproduce one duplicate message after waking the laptop.",
+    { timeout: 5_000 },
+  );
+  await expect(channelTimeline).toContainText("Only on the first reconnect?");
+  await expect(channelTimeline).toContainText(
+    "One duplicate, then the subscription settles.",
+  );
+  await expect(channelTimeline).toContainText(
+    "Bumble can you trace the likely path and pull Fizz and Honey into a fix plan?",
+    { timeout: 10_000 },
+  );
+  await expect(channelTimeline).toContainText(
+    engineeringBumbleReply.replace("@Fizz", "Fizz"),
+    { timeout: 5_000 },
+  );
+  await expect(channelTimeline).toContainText(
+    engineeringFizzReply.replace("@Honey", "Honey"),
+    { timeout: 5_000 },
+  );
+  await expect(channelTimeline).toContainText(engineeringHoneyReply, {
+    timeout: 5_000,
+  });
+  await expect(channelTimeline).toContainText(engineeringHumanClose, {
+    timeout: 5_000,
+  });
+  const engineeringAgentRows = page
+    .getByTestId("message-row")
+    .filter({ has: page.locator('img[src^="/demo/agents/"]') });
+  await expect(engineeringAgentRows).toHaveCount(3);
 
   const populatedChannels = [
     ["announcements", "Final smoke pass is clean"],

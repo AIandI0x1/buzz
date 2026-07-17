@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { resolveAnnouncementDemoAgentRequest } from "../../announcementDemoAgentPlugin.ts";
+import {
+  announcementDemoOpenAiReasoningEffort,
+  resolveAnnouncementDemoAgentRequest,
+} from "../../announcementDemoAgentPlugin.ts";
 
 const baseRequest = {
   provider: null,
@@ -52,4 +55,11 @@ test("prefers credentials entered in the app over environment fallbacks", () => 
 
   assert.equal(request.apiKey, "in-app-key");
   assert.equal(request.model, "in-app-model");
+});
+
+test("uses the smallest supported reasoning effort for short demo replies", () => {
+  assert.equal(announcementDemoOpenAiReasoningEffort("gpt-5.4-mini"), "none");
+  assert.equal(announcementDemoOpenAiReasoningEffort("gpt-5"), "minimal");
+  assert.equal(announcementDemoOpenAiReasoningEffort("o3-mini"), "low");
+  assert.equal(announcementDemoOpenAiReasoningEffort("gpt-4.1-mini"), null);
 });

@@ -25,7 +25,13 @@ export const ANNOUNCEMENT_DEMO_AGENTS = [
     avatarUrl: "/demo/agents/fizz.png",
     systemPrompt:
       "You are Fizz, an energetic maker who turns ideas into action. Be upbeat, practical, and decisive. Help users plan, create, solve problems, and finish work. Add occasional bee wordplay or 🐝✨—keep it charming, never distracting.",
-    channelNames: ["flight-path", "design", "marketing", "queen-bee-launch"],
+    channelNames: [
+      "flight-path",
+      "engineering",
+      "design",
+      "marketing",
+      "queen-bee-launch",
+    ],
   },
   {
     pubkey: "71".repeat(32),
@@ -33,7 +39,13 @@ export const ANNOUNCEMENT_DEMO_AGENTS = [
     avatarUrl: "/demo/agents/honey.png",
     systemPrompt:
       "You are Honey, a warm and thoughtful communicator. Help users write clearly, organize ideas, brainstorm, summarize, and prepare for conversations. Be kind, creative, and concise. Add occasional bee wordplay or 🍯🐝—keep it sweet, never excessive.",
-    channelNames: ["flight-path", "design", "marketing", "queen-bee-launch"],
+    channelNames: [
+      "flight-path",
+      "engineering",
+      "design",
+      "marketing",
+      "queen-bee-launch",
+    ],
   },
   {
     pubkey: "72".repeat(32),
@@ -41,47 +53,104 @@ export const ANNOUNCEMENT_DEMO_AGENTS = [
     avatarUrl: "/demo/agents/bumble.png",
     systemPrompt:
       "You are Bumble, a curious and adventurous researcher. Explore questions, compare options, check assumptions, and explain what you find clearly. Be candid when uncertain and favor useful evidence. Add occasional bee wordplay or 🐝🔎—keep it playful, never chaotic.",
-    channelNames: ["flight-path", "design", "marketing", "queen-bee-launch"],
+    channelNames: [
+      "flight-path",
+      "engineering",
+      "design",
+      "marketing",
+      "queen-bee-launch",
+    ],
   },
 ] as const;
 
 export type AnnouncementDemoAgentName =
   (typeof ANNOUNCEMENT_DEMO_AGENTS)[number]["name"];
 
-export const ANNOUNCEMENT_DEMO_LIVE_CONVERSATION = {
-  channelName: "flight-path",
-  steps: [
-    {
-      delayMs: 1_800,
+export const ANNOUNCEMENT_DEMO_LIVE_CONVERSATIONS = [
+  {
+    channelName: "flight-path",
+    agentOrder: ["Fizz", "Honey", "Bumble"],
+    humanClose: {
+      delayMs: 1_000,
+      author: "producer",
+      content: "That’s the version. I can cut to that — nice swarm work 🐝",
+    },
+    steps: [
+      {
+        delayMs: 2_400,
+        author: "engineer",
+        content:
+          "Small thing: the desktop-to-mobile handoff still feels a little fast.",
+        agentMentions: [],
+        startsAgentChain: false,
+      },
+      {
+        delayMs: 2_800,
+        author: "designer",
+        content: "Yeah — I want one extra beat on the sent message.",
+        agentMentions: [],
+        startsAgentChain: false,
+      },
+      {
+        delayMs: 2_600,
+        author: "producer",
+        content: "That would give the camera somewhere to land too.",
+        agentMentions: [],
+        startsAgentChain: false,
+      },
+      {
+        delayMs: 2_800,
+        author: "engineer",
+        content:
+          "@Fizz can you turn that into a clean three-beat capture plan?",
+        agentMentions: ["Fizz"],
+        startsAgentChain: true,
+      },
+    ],
+  },
+  {
+    channelName: "engineering",
+    agentOrder: ["Bumble", "Fizz", "Honey"],
+    humanClose: {
+      delayMs: 1_100,
       author: "engineer",
       content:
-        "Small thing: the desktop-to-mobile handoff still feels a little fast.",
-      agentMentions: [],
-      startsAgentChain: false,
+        "Perfect. That gives me the patch and the verification path — I’m on it.",
     },
-    {
-      delayMs: 2_200,
-      author: "designer",
-      content: "Yeah — I want one extra beat on the sent message.",
-      agentMentions: [],
-      startsAgentChain: false,
-    },
-    {
-      delayMs: 2_000,
-      author: "producer",
-      content: "That would give the camera somewhere to land too.",
-      agentMentions: [],
-      startsAgentChain: false,
-    },
-    {
-      delayMs: 2_200,
-      author: "engineer",
-      content: "@Fizz can you turn that into a clean three-beat capture plan?",
-      agentMentions: ["Fizz"],
-      startsAgentChain: true,
-    },
-  ],
-} as const;
+    steps: [
+      {
+        delayMs: 2_600,
+        author: "qa",
+        content:
+          "I can still reproduce one duplicate message after waking the laptop.",
+        agentMentions: [],
+        startsAgentChain: false,
+      },
+      {
+        delayMs: 3_000,
+        author: "engineer",
+        content: "Only on the first reconnect?",
+        agentMentions: [],
+        startsAgentChain: false,
+      },
+      {
+        delayMs: 2_800,
+        author: "qa",
+        content: "Yep. One duplicate, then the subscription settles.",
+        agentMentions: [],
+        startsAgentChain: false,
+      },
+      {
+        delayMs: 3_000,
+        author: "engineer",
+        content:
+          "@Bumble can you trace the likely path and pull Fizz and Honey into a fix plan?",
+        agentMentions: ["Bumble"],
+        startsAgentChain: true,
+      },
+    ],
+  },
+] as const;
 
 export const ANNOUNCEMENT_DEMO_PEOPLE = {
   viewer: {
@@ -221,6 +290,25 @@ export const ANNOUNCEMENT_DEMO_CHANNELS = [
     ],
   },
   {
+    id: "4e91b4d2-8207-4d63-9b1a-3c72a8f01142",
+    name: "engineering",
+    channelType: "stream",
+    visibility: "open",
+    description: "Desktop, relay, and infrastructure engineering",
+    topic: "Reconnect reliability and the next release candidate",
+    purpose: "Debug together, review changes, and keep the build healthy.",
+    createdBy: "engineer",
+    lastMessageMinutesAgo: 5,
+    memberRoles: [
+      ["engineer", "owner"],
+      ["viewer", "admin"],
+      ["qa", "member"],
+      ["data", "member"],
+      ["support", "member"],
+      ["designer", "member"],
+    ],
+  },
+  {
     id: "b5e2f8a1-3c44-5912-9e67-4a8d1f2b3c4e",
     name: "design",
     channelType: "stream",
@@ -357,6 +445,18 @@ export const ANNOUNCEMENT_DEMO_DMS = [
   },
 ] as const;
 
+// Start the recording workspace with a believable mix of read and unread
+// conversations. Channels omitted from this list retain their unread state.
+export const ANNOUNCEMENT_DEMO_INITIAL_READ_CHANNEL_IDS = [
+  "9dae0116-799b-5071-a0a8-fdd30a91a35d", // general
+  "1c7e1c02-87bb-5e88-b2da-5a7a9432d0c9", // flight-path
+  "94a444a4-c0a3-5966-ab05-530c6ddc2301", // mobile
+  "a27e1ee9-76a6-5bdf-a5d5-1d85610dad11", // product-ideas
+  "1be1dcdb-4c31-5a8c-81de-ac102552ca10", // launch-notes
+  "7eb9f239-9393-50b0-bd76-d85eef0511c7", // Jordan Brooks DM
+  "d1ec7000-d000-4000-8000-000000000001", // Priya Shah DM
+] as const;
+
 export const ANNOUNCEMENT_DEMO_SECTION_STORE = {
   version: 1,
   sections: [
@@ -373,6 +473,7 @@ export const ANNOUNCEMENT_DEMO_SECTION_STORE = {
     "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50": "the-hive",
     "9dae0116-799b-5071-a0a8-fdd30a91a35d": "the-hive",
     "1c7e1c02-87bb-5e88-b2da-5a7a9432d0c9": "product-garden",
+    "4e91b4d2-8207-4d63-9b1a-3c72a8f01142": "product-garden",
     "b5e2f8a1-3c44-5912-9e67-4a8d1f2b3c4e": "product-garden",
     "94a444a4-c0a3-5966-ab05-530c6ddc2301": "product-garden",
     "a27e1ee9-76a6-5bdf-a5d5-1d85610dad11": "product-garden",
@@ -796,6 +897,142 @@ export const ANNOUNCEMENT_DEMO_MESSAGES: Record<
       minutesAgo: 7,
       content: "Perfect. That’s the move.",
       reactions: [{ emoji: "🎬", authors: ["producer", "marketing"] }],
+    },
+  ],
+  "4e91b4d2-8207-4d63-9b1a-3c72a8f01142": [
+    {
+      id: "announcement-demo-engineering-old-1",
+      author: "engineer",
+      minutesAgo: 6_240,
+      content:
+        "I moved reconnect ownership into the subscription manager. Less state crossing the bridge now.",
+    },
+    {
+      id: "announcement-demo-engineering-old-2",
+      author: "qa",
+      minutesAgo: 6_231,
+      content: "Nice. I’ll run the sleep / wake matrix against it.",
+    },
+    {
+      id: "announcement-demo-engineering-old-3",
+      author: "qa",
+      minutesAgo: 6_198,
+      content: "First ten loops are clean.",
+      reactions: [{ emoji: "✅", authors: ["engineer", "viewer"] }],
+    },
+    {
+      id: "announcement-demo-engineering-old-4",
+      author: "engineer",
+      minutesAgo: 6_194,
+      content: "love to hear it",
+    },
+    {
+      id: "announcement-demo-engineering-old-5",
+      author: "data",
+      minutesAgo: 4_330,
+      content: "Reconnect p95 dropped from 2.8s to 1.1s on the canary cohort.",
+      reactions: [{ emoji: "⚡", authors: ["engineer", "qa"] }],
+    },
+    {
+      id: "announcement-demo-engineering-old-6",
+      author: "engineer",
+      minutesAgo: 4_318,
+      content: "That lines up with removing the second backoff window.",
+    },
+    {
+      id: "announcement-demo-engineering-old-7",
+      author: "support",
+      minutesAgo: 2_915,
+      content: "Two preview teams reported a duplicated message after sleep.",
+    },
+    {
+      id: "announcement-demo-engineering-old-8",
+      author: "engineer",
+      minutesAgo: 2_910,
+      content: "Same OS version?",
+    },
+    {
+      id: "announcement-demo-engineering-old-9",
+      author: "support",
+      minutesAgo: 2_904,
+      content: "Both on macOS 15. One Intel, one Apple silicon.",
+    },
+    {
+      id: "announcement-demo-engineering-old-10",
+      author: "engineer",
+      minutesAgo: 1_860,
+      content:
+        "Reproduced. The old generation can deliver once after the new one starts.",
+    },
+    {
+      id: "announcement-demo-engineering-pr",
+      author: "engineer",
+      minutesAgo: 1_842,
+      content:
+        "Guard is up for review: https://github.com/block/buzz/pull/2037",
+      reactions: [{ emoji: "👀", authors: ["qa", "viewer"] }],
+    },
+    {
+      id: "announcement-demo-engineering-old-11",
+      author: "qa",
+      minutesAgo: 1_831,
+      content: "Pulling it now.",
+    },
+    {
+      id: "announcement-demo-engineering-old-12",
+      author: "qa",
+      minutesAgo: 1_804,
+      content: "Twenty reconnects, no duplicates.",
+      reactions: [{ emoji: "🙌", authors: ["engineer", "support"] }],
+    },
+    {
+      id: "announcement-demo-engineering-1",
+      author: "engineer",
+      minutesAgo: 94,
+      content: "Tightened the generation guard this morning.",
+    },
+    {
+      id: "announcement-demo-engineering-2",
+      author: "engineer",
+      minutesAgo: 92,
+      content: "```ts\nif (generation !== activeGeneration) return;\n```",
+    },
+    {
+      id: "announcement-demo-engineering-3",
+      author: "qa",
+      minutesAgo: 76,
+      content: "Manual reconnect and offline recovery both look good.",
+    },
+    {
+      id: "announcement-demo-engineering-4",
+      author: "data",
+      minutesAgo: 61,
+      content:
+        "Telemetry is clean too — no doubled fan-out in the latest sample.",
+    },
+    {
+      id: "announcement-demo-engineering-linear",
+      author: "engineer",
+      minutesAgo: 43,
+      content:
+        "I put the remaining soak checklist in [BUZ-519 · Reconnect reliability](https://linear.app/honeycomb/issue/BUZ-519/reconnect-reliability).",
+      reactions: [{ emoji: "✅", authors: ["qa"] }],
+    },
+    {
+      id: "announcement-demo-engineering-5",
+      author: "support",
+      minutesAgo: 22,
+      content: "Customer replay passed on both affected machines.",
+    },
+    {
+      id: "announcement-demo-engineering-6",
+      author: "engineer",
+      minutesAgo: 5,
+      content: "Release build is green. I’m doing one last sleep / wake pass.",
+      reactions: [
+        { emoji: "🚀", authors: ["qa", "viewer"] },
+        { emoji: "🙏", authors: ["support"] },
+      ],
     },
   ],
   "b5e2f8a1-3c44-5912-9e67-4a8d1f2b3c4e": [
