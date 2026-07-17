@@ -1462,6 +1462,25 @@ async fn tokio_main() -> Result<()> {
         (Ledger::disabled(), ledger::StagedLedger::default())
     };
 
+    // Boot recovery: membership-gate → chunked REST fetch (reconciled
+    // per-event) → import in admission_seq order (with cap promotion) →
+    // suppression set → unresolved barrier registration → single commit.
+    // No-ops end to end when the ledger is disabled or the stage is empty.
+    // See `boot_recover` and `PLANS/AGENT_AUTO_RESUME_LEDGER.md` §"Boot
+    // recovery".
+    let mut recovered_suppression: HashSet<String> = HashSet::new();
+    if ledger.is_enabled() {
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged_ledger,
+            &channel_ids.iter().copied().collect(),
+            &relay.rest_client(),
+            &mut recovered_suppression,
+        )
+        .await;
+    }
+
     let base_prompt_content = config.base_prompt_content.take();
     let ctx = Arc::new(PromptContext {
         mcp_servers: build_mcp_servers(&config),
@@ -2745,6 +2764,192 @@ fn try_native_steer(
             false
         }
     }
+}
+
+// ── boot_recover ──────────────────────────────────────────────────────────────
+
+/// Maximum event ids fetched per REST `/query` chunk during boot recovery.
+/// One `Filter` with `ids(chunk)` per request — the relay is queried by
+/// id-set, not per-id (see `PLANS/AGENT_AUTO_RESUME_LEDGER.md` R5-F5).
+const BOOT_RECOVERY_CHUNK_SIZE: usize = 100;
+
+/// Overall wall-clock budget for the boot-recovery REST fetch phase,
+/// regardless of ledger cardinality. Also the unresolved-barrier deadline
+/// (measured from boot commit) — see §"Unresolved-trigger lifecycle".
+const BOOT_RECOVERY_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Boot recovery (rev 6.1): stage → membership gate → TTL (already applied
+/// by `Ledger::load`) → chunked id-set fetch under one global deadline,
+/// each chunk reconciled per-event → `import_recovered` in global
+/// `admission_seq` order (cap promotion) → suppression set → unresolved
+/// barrier registration → single commit merging unresolved. See
+/// `PLANS/AGENT_AUTO_RESUME_LEDGER.md` §"Boot recovery" for the full
+/// design and its numbered edge cases.
+///
+/// A no-op (immediate return) when the staged ledger has nothing to
+/// recover. Never blocks boot past `BOOT_RECOVERY_DEADLINE`: any trigger
+/// not fetched by then is retained as unresolved rather than dropped.
+async fn boot_recover(
+    queue: &mut EventQueue,
+    ledger: &mut Ledger,
+    staged: ledger::StagedLedger,
+    live_channels: &HashSet<Uuid>,
+    rest: &relay::RestClient,
+    recovered_suppression: &mut HashSet<String>,
+) {
+    if staged.channels.is_empty() {
+        return;
+    }
+
+    // Membership gate (fixes F5): a ledger channel this boot didn't
+    // discover/subscribe to is dropped wholesale — no speculative
+    // re-subscription as validation.
+    let mut gated: Vec<(Uuid, ledger::LedgerRecord)> = Vec::new();
+    let mut dropped_channels = 0usize;
+    for (channel_id, records) in staged.channels {
+        if live_channels.contains(&channel_id) {
+            gated.extend(records.into_iter().map(|r| (channel_id, r)));
+        } else {
+            dropped_channels += 1;
+        }
+    }
+    if dropped_channels > 0 {
+        tracing::info!(
+            dropped_channels,
+            "boot recovery: dropped ledger channel(s) no longer in this boot's membership"
+        );
+    }
+    if gated.is_empty() {
+        return;
+    }
+
+    let deadline = tokio::time::Instant::now() + BOOT_RECOVERY_DEADLINE;
+    let all_ids: Vec<String> = gated.iter().map(|(_, r)| r.event_id.clone()).collect();
+    let by_id: HashMap<&str, &(Uuid, ledger::LedgerRecord)> = gated
+        .iter()
+        .map(|entry| (entry.1.event_id.as_str(), entry))
+        .collect();
+
+    let mut fetched: HashMap<String, nostr::Event> = HashMap::new();
+    'chunks: for chunk in all_ids.chunks(BOOT_RECOVERY_CHUNK_SIZE) {
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!("boot recovery: global fetch deadline reached — remaining triggers unresolved-retained");
+            break 'chunks;
+        }
+        let ids: Vec<nostr::EventId> = chunk
+            .iter()
+            .filter_map(|id| nostr::EventId::from_hex(id).ok())
+            .collect();
+        if ids.is_empty() {
+            continue;
+        }
+        let filter = nostr::Filter::new().ids(ids);
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let query = tokio::time::timeout(remaining, rest.query(std::slice::from_ref(&filter)));
+        let response = match query.await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    "boot recovery: chunk fetch failed: {e} — chunk unresolved-retained"
+                );
+                continue;
+            }
+            Err(_) => {
+                tracing::warn!("boot recovery: fetch deadline reached mid-chunk — remaining triggers unresolved-retained");
+                break 'chunks;
+            }
+        };
+        let Some(events) = response.as_array() else {
+            tracing::warn!(
+                "boot recovery: chunk response was not a JSON array — chunk unresolved-retained"
+            );
+            continue;
+        };
+        let requested: HashSet<&str> = chunk.iter().map(String::as_str).collect();
+        for raw in events {
+            // Responses are reconciled, never trusted (R6-F5): deserialize,
+            // verify signature/id, require id in the requested chunk and
+            // its `h` tag to match the ledger record's channel.
+            let event = match serde_json::from_value::<nostr::Event>(raw.clone()) {
+                Ok(ev) => ev,
+                Err(e) => {
+                    tracing::warn!(
+                        "boot recovery: malformed event in chunk response: {e} — skipped"
+                    );
+                    continue;
+                }
+            };
+            if event.verify().is_err() {
+                tracing::warn!(event_id = %event.id.to_hex(), "boot recovery: event failed signature verification — skipped");
+                continue;
+            }
+            let id_hex = event.id.to_hex();
+            if !requested.contains(id_hex.as_str()) {
+                tracing::warn!(event_id = %id_hex, "boot recovery: event id not in requested chunk — skipped");
+                continue;
+            }
+            let Some((channel_id, _)) = by_id.get(id_hex.as_str()).copied() else {
+                continue;
+            };
+            let ch_str = channel_id.to_string();
+            let h_tag_matches = event.tags.iter().any(|tag| {
+                let v = tag.as_slice();
+                v.len() >= 2 && v[0] == "h" && v[1] == ch_str
+            });
+            if !h_tag_matches {
+                tracing::warn!(event_id = %id_hex, channel_id = %channel_id, "boot recovery: event's h-tag does not match ledger record's channel — skipped");
+                continue;
+            }
+            fetched.entry(id_hex).or_insert(event);
+        }
+    }
+
+    // Restore fetched events per channel via import_recovered, in global
+    // admission_seq order; unfetched ids stay unresolved-retained.
+    let mut per_channel: HashMap<Uuid, Vec<QueuedEvent>> = HashMap::new();
+    let mut max_seq: u64 = 0;
+    for (channel_id, record) in gated {
+        max_seq = max_seq.max(record.admission_seq);
+        match fetched.remove(&record.event_id) {
+            Some(event) => {
+                recovered_suppression.insert(record.event_id.clone());
+                per_channel
+                    .entry(channel_id)
+                    .or_default()
+                    .push(QueuedEvent::from_recovered(
+                        channel_id,
+                        event,
+                        record.prompt_tag,
+                        record.admission_seq,
+                        record.enqueued_at_unix,
+                        record.cap_exempt,
+                    ));
+            }
+            None => ledger.add_unresolved(channel_id, record),
+        }
+    }
+    queue.set_next_admission_seq(max_seq);
+    for (channel_id, events) in per_channel {
+        queue.import_recovered(channel_id, events);
+    }
+
+    // Register the unresolved ordering barrier per channel (R6-F1) before
+    // the single commit, so the queue's flush gate is armed from boot.
+    for channel_id in ledger.unresolved_channels() {
+        queue.set_unresolved_barrier(
+            channel_id,
+            ledger.unresolved_seqs(channel_id),
+            deadline.into(),
+        );
+    }
+
+    // Single transactional commit (P2-F4): live ∪ unresolved, computed
+    // after every import above. Resumes normal per-mutation sync from here.
+    let mut live: HashMap<Uuid, Vec<queue::RecoverableTrigger>> = HashMap::new();
+    for channel_id in queue.take_dirty_channels() {
+        live.insert(channel_id, queue.recoverable_triggers(channel_id));
+    }
+    ledger.commit(live);
 }
 
 // ── dispatch_pending ──────────────────────────────────────────────────────────
