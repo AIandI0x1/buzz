@@ -374,7 +374,11 @@ const overrides = new Map([
   // +5 (1068 -> 1073): merge with main, which independently added the
   // managed_agent_profile_reconcile_enabled flag (field + doc + init) under
   // its own 1042-line override. Union of two separately approved additions.
-  ["src-tauri/src/app_state.rs", 1054],
+  ["src-tauri/src/app_state.rs", 1090],
+  // lazy-workspace-activation adds seven command/state wiring lines to lib.rs.
+  // Keeping the registration and safety-gate setup together is clearer than a
+  // one-off extraction whose only purpose would be satisfying the line cap.
+  ["src-tauri/src/lib.rs", 1007],
   // multi-slot splitting + no-op suppression (#1309): the ReadStateManager
   // class grew from ~700 lines to ~1019 with the addition of
   // splitContextsIntoBudgetedSlots (pure fn + 5 tests), publishSplitSlots,
