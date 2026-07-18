@@ -727,7 +727,26 @@ pub fn normalize_agent_args(command: &str, agent_args: Vec<String>) -> Vec<Strin
 /// `#[tokio::main]` ensures worker threads are not yet alive.
 ///
 /// // Must be called before tokio runtime starts — see Rust 2024 edition safety.
-pub fn propagate_legacy_env_vars() {
+fn legacy_session_scope(
+    canonical: Option<&str>,
+    legacy: Option<&str>,
+) -> Result<Option<String>, ConfigError> {
+    if canonical.is_some() {
+        return Ok(None);
+    }
+    let Some(value) = legacy else {
+        return Ok(None);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" => Ok(Some("thread".into())),
+        "false" => Ok(Some("channel".into())),
+        _ => Err(ConfigError::ConfigFile(format!(
+            "BUZZ_ACP_TOP_LEVEL_SESSIONS must be true or false, got {value:?}"
+        ))),
+    }
+}
+
+pub fn propagate_legacy_env_vars() -> Result<(), ConfigError> {
     for (legacy, canonical) in [
         ("BUZZ_ACP_PRIVATE_KEY", "BUZZ_PRIVATE_KEY"),
         ("BUZZ_ACP_API_TOKEN", "BUZZ_API_TOKEN"),
@@ -738,6 +757,12 @@ pub fn propagate_legacy_env_vars() {
             }
         }
     }
+    let canonical = std::env::var("BUZZ_ACP_SESSION_SCOPE").ok();
+    let legacy = std::env::var("BUZZ_ACP_TOP_LEVEL_SESSIONS").ok();
+    if let Some(scope) = legacy_session_scope(canonical.as_deref(), legacy.as_deref())? {
+        std::env::set_var("BUZZ_ACP_SESSION_SCOPE", scope);
+    }
+    Ok(())
 }
 
 impl Config {
@@ -2719,6 +2744,26 @@ channels = "ALL"
             msg.contains("exceeds ceiling"),
             "error should mention 'exceeds ceiling': {msg}"
         );
+    }
+
+    #[test]
+    fn legacy_session_scope_translation_and_precedence() {
+        assert_eq!(
+            legacy_session_scope(None, Some("true")).unwrap().as_deref(),
+            Some("thread")
+        );
+        assert_eq!(
+            legacy_session_scope(None, Some("false"))
+                .unwrap()
+                .as_deref(),
+            Some("channel")
+        );
+        assert_eq!(
+            legacy_session_scope(Some("channel"), Some("true")).unwrap(),
+            None
+        );
+        assert_eq!(legacy_session_scope(None, None).unwrap(), None);
+        assert!(legacy_session_scope(None, Some("not-a-bool")).is_err());
     }
 
     #[test]

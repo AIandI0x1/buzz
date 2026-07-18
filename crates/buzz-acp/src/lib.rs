@@ -826,10 +826,12 @@ fn resolve_control_frame_scope(
 /// (pre-cancel guard), then set `desired_model` + invalidate. The override
 /// takes visible effect on the agent's next turn.
 ///
-/// An optional `rootEventId` targets one thread scope exactly. Without it,
+/// An optional `rootEventId` targets one live thread scope exactly. Without it,
 /// a busy channel is only switchable when exactly one scope is in flight;
-/// with several, the target is ambiguous and nothing is touched
-/// (`status: "ambiguous_target"`). Control never fans out across roots.
+/// with several, the live-turn target is ambiguous and nothing is touched
+/// (`status: "ambiguous_target"`). Live-turn control never fans out across
+/// roots. Once an exact live target accepts the switch, the durable model
+/// preference is intentionally propagated to idle roots in the same channel.
 fn handle_switch_model_control(
     payload: &serde_json::Value,
     pool: &mut AgentPool,
@@ -1140,7 +1142,7 @@ impl Drop for RespawnGuard {
 // worker threads (Rust 2024 edition safety requirement).
 
 pub fn run() -> Result<()> {
-    config::propagate_legacy_env_vars();
+    config::propagate_legacy_env_vars()?;
     tokio_main()
 }
 
@@ -2142,16 +2144,13 @@ async fn tokio_main() -> Result<()> {
                             // backed payload) so the cost is negligible.
                             let event_for_steer = buzz_event.event.clone();
                             let prompt_tag_for_steer = prompt_tag.clone();
-                            let conversation_root = if matches!(config.session_scope, config::SessionScope::Thread) {
-                                let tags = queue::parse_thread_tags(&event_for_steer);
-                                Some(tags.root_event_id.unwrap_or_else(|| event_id_hex.clone()))
-                            } else {
-                                None
-                            };
-                            let scope = ConversationSessionKey {
-                                channel_id: buzz_event.channel_id,
-                                root_event_id: conversation_root.clone(),
-                            };
+                            let scope = conversation_scope_for_event(
+                                &config,
+                                &event_for_steer,
+                                buzz_event.channel_id,
+                                &event_id_hex,
+                            );
+                            let conversation_root = scope.root_event_id.clone();
                             let accepted = queue.push(QueuedEvent {
                                 channel_id: buzz_event.channel_id,
                                 event: buzz_event.event,
@@ -2671,6 +2670,27 @@ fn signal_in_flight_task(
         }
     }
     false
+}
+
+fn conversation_scope_for_event(
+    config: &Config,
+    event: &nostr::Event,
+    channel_id: uuid::Uuid,
+    event_id_hex: &str,
+) -> ConversationSessionKey {
+    let root_event_id = if matches!(config.session_scope, config::SessionScope::Thread) {
+        let tags = queue::parse_thread_tags(event);
+        Some(
+            tags.root_event_id
+                .unwrap_or_else(|| event_id_hex.to_owned()),
+        )
+    } else {
+        None
+    };
+    ConversationSessionKey {
+        channel_id,
+        root_event_id,
+    }
 }
 
 /// Resolve a channel-level control action (no explicit root) to a single
@@ -4858,6 +4878,14 @@ mod error_outcome_emission_tests {
     async fn panic_event_retains_task_turn_id() {
         let mut pool = AgentPool::from_slots(vec![]);
         let channel_id = Uuid::new_v4();
+        let panic_scope = ConversationSessionKey {
+            channel_id,
+            root_event_id: Some("root-a".into()),
+        };
+        let sibling_scope = ConversationSessionKey {
+            channel_id,
+            root_event_id: Some("root-b".into()),
+        };
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let abort_handle = pool.join_set.spawn(async move {
             let _ = started_tx.send(());
@@ -4868,7 +4896,7 @@ mod error_outcome_emission_tests {
             task_id,
             crate::pool::TaskMeta {
                 agent_index: 0,
-                scope: Some(ConversationSessionKey::channel(channel_id)),
+                scope: Some(panic_scope.clone()),
                 turn_id: "panic-turn-id".to_string(),
                 recoverable_batch: None,
                 control_tx: None,
@@ -4883,7 +4911,10 @@ mod error_outcome_emission_tests {
         let config = test_config();
         let mut heartbeat_in_flight = false;
         let removed_channels = HashSet::new();
-        let mut typing_channels = HashMap::new();
+        let mut typing_scopes = HashMap::from([
+            (panic_scope.clone(), ThreadTags::default()),
+            (sibling_scope.clone(), ThreadTags::default()),
+        ]);
         let mut crash_history = vec![SlotCircuit {
             crash_times: Vec::new(),
             open_until: None,
@@ -4900,7 +4931,7 @@ mod error_outcome_emission_tests {
             join_error,
             &mut heartbeat_in_flight,
             &removed_channels,
-            &mut typing_channels,
+            &mut typing_scopes,
             &mut crash_history,
             &respawn_tx,
             &mut respawn_tasks,
@@ -4917,6 +4948,14 @@ mod error_outcome_emission_tests {
             Some(channel_id.to_string().as_str())
         );
         assert_eq!(panic.turn_id.as_deref(), Some("panic-turn-id"));
+        assert!(
+            !typing_scopes.contains_key(&panic_scope),
+            "panic cleanup must remove only the failed root's typing state"
+        );
+        assert!(
+            typing_scopes.contains_key(&sibling_scope),
+            "panic cleanup must preserve a sibling root's typing state"
+        );
     }
 
     #[tokio::test]
@@ -5477,11 +5516,90 @@ mod dispatch_scope_tests {
         });
     }
 
+    fn tagged_event(content: &str, tags: impl IntoIterator<Item = nostr::Tag>) -> nostr::Event {
+        EventBuilder::new(Kind::Custom(9), content)
+            .tags(tags)
+            .sign_with_keys(&Keys::generate())
+            .unwrap()
+    }
+
+    fn push_via_config_scope(
+        queue: &mut EventQueue,
+        config: &Config,
+        ch: Uuid,
+        event: nostr::Event,
+    ) -> ConversationSessionKey {
+        let event_id = event.id.to_hex();
+        let scope = conversation_scope_for_event(config, &event, ch, &event_id);
+        queue.push(QueuedEvent {
+            channel_id: ch,
+            conversation_root: scope.root_event_id.clone(),
+            event,
+            received_at: std::time::Instant::now(),
+            prompt_tag: "test".into(),
+        });
+        scope
+    }
+
     fn key(ch: Uuid, root: &str) -> ConversationSessionKey {
         ConversationSessionKey {
             channel_id: ch,
             root_event_id: Some(root.into()),
         }
+    }
+
+    #[tokio::test]
+    async fn configured_channel_mode_serializes_distinct_thread_roots() {
+        let mut config = build_mcp_servers_tests::test_config();
+        config.session_scope = config::SessionScope::Channel;
+        let mut pool =
+            AgentPool::from_slots(vec![Some(dummy_agent(0).await), Some(dummy_agent(1).await)]);
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        for root in ["root-a", "root-b"] {
+            let event = tagged_event(root, [nostr::Tag::parse(["e", root, "", "root"]).unwrap()]);
+            assert_eq!(
+                push_via_config_scope(&mut queue, &config, ch, event),
+                ConversationSessionKey::channel(ch)
+            );
+        }
+
+        let dispatched = dispatch_pending(&mut pool, &mut queue, &test_ctx());
+        assert_eq!(dispatched.len(), 1);
+        assert_eq!(dispatched[0].0, ConversationSessionKey::channel(ch));
+        assert_eq!(pool.task_map().len(), 1);
+        assert!(
+            pool.any_idle(),
+            "second worker must remain idle in channel mode"
+        );
+    }
+
+    #[test]
+    fn nested_reply_joins_outermost_root_session_scope() {
+        let mut config = build_mcp_servers_tests::test_config();
+        config.session_scope = config::SessionScope::Thread;
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let direct = tagged_event(
+            "direct",
+            [nostr::Tag::parse(["e", "outer-root", "", "reply"]).unwrap()],
+        );
+        let nested = tagged_event(
+            "nested",
+            [
+                nostr::Tag::parse(["e", "outer-root", "", "root"]).unwrap(),
+                nostr::Tag::parse(["e", "intermediate-parent", "", "reply"]).unwrap(),
+            ],
+        );
+        let direct_scope = push_via_config_scope(&mut queue, &config, ch, direct);
+        let nested_scope = push_via_config_scope(&mut queue, &config, ch, nested);
+
+        assert_eq!(direct_scope, key(ch, "outer-root"));
+        assert_eq!(nested_scope, direct_scope);
+        let batch = queue.flush_next().expect("shared outer-root batch");
+        assert_eq!(batch.scope_key(), key(ch, "outer-root"));
+        assert_eq!(batch.events.len(), 2);
+        assert!(queue.flush_next().is_none());
     }
 
     #[tokio::test]
@@ -5628,6 +5746,46 @@ mod dispatch_scope_tests {
         // A busy scope in a DIFFERENT channel never bleeds in.
         let other = Uuid::new_v4();
         assert_eq!(resolve_channel_control_scope(&pool, other), Ok(None));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_channel_cancel_handler_is_a_no_op_for_all_live_roots() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let ch = Uuid::new_v4();
+        let mut receivers = Vec::new();
+        for (agent_index, root) in ["root-a", "root-b"].into_iter().enumerate() {
+            let (control_tx, control_rx) = tokio::sync::oneshot::channel();
+            let task_id = pool.join_set.spawn(std::future::pending()).id();
+            pool.task_map_mut().insert(
+                task_id,
+                pool::TaskMeta {
+                    agent_index,
+                    scope: Some(key(ch, root)),
+                    turn_id: Uuid::new_v4().to_string(),
+                    recoverable_batch: None,
+                    control_tx: Some(control_tx),
+                    steer_tx: None,
+                },
+            );
+            receivers.push(control_rx);
+        }
+
+        handle_cancel_turn_control(
+            &serde_json::json!({
+                "type": "cancel_turn",
+                "channelId": ch.to_string(),
+            }),
+            &mut pool,
+            None,
+        );
+
+        for mut receiver in receivers {
+            assert_eq!(
+                receiver.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty),
+                "ambiguous channel-only cancel must not signal either root"
+            );
+        }
     }
 
     #[tokio::test]
