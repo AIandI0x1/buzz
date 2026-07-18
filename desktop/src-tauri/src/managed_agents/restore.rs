@@ -624,3 +624,238 @@ mod tests {
         assert!(!record_activates_on_relay(&record, "wss://relay-a.example"));
     }
 }
+
+/// Orchestration-level coverage of the `apply_workspace` → activation decision.
+///
+/// The tests above exercise `begin_relay_activation` and
+/// `record_activates_on_relay` as isolated predicates. These drive the full
+/// cross-community *sequence* through [`plan_workspace_activation`] — apply A,
+/// switch to B, switch back to A — asserting the spawn decision (and the
+/// blank-pin migration that gates it) at each step. That composition is what
+/// the fast-switch defect regresses: an isolated predicate can stay correct
+/// while a later apply wrongly re-spawns A, stops A to serve B, or lets a
+/// blank-pinned record float from A to B. Assertions are on the observable
+/// plan (`spawn_pubkeys`, `run_boot_sweeps`, `None`), not the predicates.
+#[cfg(test)]
+mod orchestration_tests {
+    use super::{plan_workspace_activation, ManagedAgentRecord};
+    use crate::managed_agents::stamp_blank_agent_relay_urls;
+    use std::collections::HashSet;
+
+    const RELAY_A: &str = "wss://relay-a.example";
+    const RELAY_B: &str = "wss://relay-b.example";
+
+    /// A local start-on-launch record with an explicit pubkey and pin. Distinct
+    /// pubkeys let a single record set model several agents across the switch
+    /// sequence.
+    fn agent(pubkey: &str, relay_url: &str) -> ManagedAgentRecord {
+        serde_json::from_str(&format!(
+            r#"{{
+                "pubkey": "{pubkey}",
+                "name": "{pubkey}",
+                "private_key_nsec": "nsec1fake",
+                "relay_url": "{relay_url}",
+                "acp_command": "buzz-acp",
+                "agent_command": "goose",
+                "agent_args": [],
+                "mcp_command": "",
+                "turn_timeout_seconds": 320,
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z"
+            }}"#
+        ))
+        .expect("sample record")
+    }
+
+    fn spawn_set(
+        records: &[ManagedAgentRecord],
+        relay: &str,
+        activated: &mut HashSet<String>,
+    ) -> Option<Vec<String>> {
+        let running = HashSet::new();
+        plan_workspace_activation(records, &running, activated, relay)
+            .map(|plan| plan.spawn_pubkeys)
+    }
+
+    /// Applying community A starts only A's agent — B's pinned agent is not
+    /// spawned by A's activation.
+    #[test]
+    fn apply_a_spawns_only_a() {
+        let records = vec![agent("agent-a", RELAY_A), agent("agent-b", RELAY_B)];
+        let mut activated = HashSet::new();
+
+        let plan = plan_workspace_activation(&records, &HashSet::new(), &mut activated, RELAY_A)
+            .expect("first apply activates");
+
+        assert_eq!(plan.spawn_pubkeys, vec!["agent-a".to_string()]);
+        assert!(
+            plan.run_boot_sweeps,
+            "first activation of the session sweeps"
+        );
+    }
+
+    /// Fast-switch A→B starts only B and never stops or restarts A: A is already
+    /// running, the plan carries no stop channel, and B's plan omits A.
+    #[test]
+    fn switch_to_b_spawns_only_b_and_leaves_a_running() {
+        let records = vec![agent("agent-a", RELAY_A), agent("agent-b", RELAY_B)];
+        let mut activated = HashSet::new();
+
+        // Apply A first (consumes the session boot sweep), then switch to B with
+        // A's process live.
+        plan_workspace_activation(&records, &HashSet::new(), &mut activated, RELAY_A)
+            .expect("apply A");
+        let mut running = HashSet::new();
+        running.insert("agent-a".to_string());
+
+        let plan = plan_workspace_activation(&records, &running, &mut activated, RELAY_B)
+            .expect("switching to a new workspace activates it");
+
+        assert_eq!(
+            plan.spawn_pubkeys,
+            vec!["agent-b".to_string()],
+            "B activation spawns only B's agent"
+        );
+        assert!(
+            !plan.run_boot_sweeps,
+            "a later activation must not re-run the one-shot boot sweeps"
+        );
+        // Nothing in the plan can stop A: the type has no stop channel, and A
+        // remains in the running set the caller holds across the switch.
+        assert!(
+            running.contains("agent-a"),
+            "A stays running across the switch"
+        );
+    }
+
+    /// Switching back to a workspace already activated this session is a no-op:
+    /// A→B→A must not resurrect an agent the user stopped in A.
+    #[test]
+    fn revisiting_a_does_not_respawn() {
+        let records = vec![agent("agent-a", RELAY_A), agent("agent-b", RELAY_B)];
+        let mut activated = HashSet::new();
+
+        plan_workspace_activation(&records, &HashSet::new(), &mut activated, RELAY_A)
+            .expect("apply A");
+        plan_workspace_activation(&records, &HashSet::new(), &mut activated, RELAY_B)
+            .expect("apply B");
+
+        // A user who stopped agent-a in A leaves it not-running; revisiting A
+        // must still decline to plan, so the stop is honored.
+        assert!(
+            plan_workspace_activation(&records, &HashSet::new(), &mut activated, RELAY_A).is_none(),
+            "a re-activated relay yields no plan, so no agent is respawned"
+        );
+    }
+
+    /// Home pins and agent keys are stable across the whole switch sequence: the
+    /// planner reads records immutably, so a switch can never rewrite an agent's
+    /// identity or move its pin.
+    #[test]
+    fn keys_and_pins_are_stable_across_the_sequence() {
+        let records = vec![agent("agent-a", RELAY_A), agent("agent-b", RELAY_B)];
+        let mut activated = HashSet::new();
+
+        for relay in [RELAY_A, RELAY_B, RELAY_A, RELAY_B] {
+            let _ = spawn_set(&records, relay, &mut activated);
+        }
+
+        assert_eq!(records[0].pubkey, "agent-a");
+        assert_eq!(records[0].relay_url, RELAY_A);
+        assert_eq!(records[1].pubkey, "agent-b");
+        assert_eq!(records[1].relay_url, RELAY_B);
+    }
+
+    /// A legacy blank-pinned record is stamped to the first workspace applied,
+    /// then never floats to a later workspace switch. This is the composition of
+    /// the one-shot stamp migration (before activation) with the relay-filtered
+    /// planner: on plain main the same record would spawn against whichever
+    /// workspace was visited, because a blank pin matches every relay.
+    #[test]
+    fn blank_record_stamps_to_first_workspace_and_never_floats() {
+        let mut records = vec![agent("agent-blank", "")];
+        let mut activated = HashSet::new();
+
+        // Before stamping, a blank pin matches any relay — proving the float
+        // hazard the migration closes.
+        assert!(
+            plan_workspace_activation(&records, &HashSet::new(), &mut HashSet::new(), RELAY_B)
+                .expect("blank pin activates on any relay")
+                .spawn_pubkeys
+                == vec!["agent-blank".to_string()],
+            "a blank pin would otherwise activate on B too — this is the float"
+        );
+
+        // Apply A: the one-shot migration stamps the blank record to A, then A's
+        // activation spawns it.
+        let stamped = stamp_blank_agent_relay_urls(&mut records, RELAY_A);
+        assert_eq!(stamped, 1, "the blank record is stamped on the first apply");
+        assert_eq!(
+            records[0].relay_url, RELAY_A,
+            "stamped to the first workspace"
+        );
+
+        let plan_a = plan_workspace_activation(&records, &HashSet::new(), &mut activated, RELAY_A)
+            .expect("apply A");
+        assert_eq!(plan_a.spawn_pubkeys, vec!["agent-blank".to_string()]);
+
+        // Switch to B: the now-A-pinned record is filtered out — it does not
+        // float to B.
+        let mut running = HashSet::new();
+        running.insert("agent-blank".to_string());
+        let plan_b = plan_workspace_activation(&records, &running, &mut activated, RELAY_B)
+            .expect("apply B");
+        assert!(
+            plan_b.spawn_pubkeys.is_empty(),
+            "a stamped record must not float to a later workspace"
+        );
+    }
+
+    /// Within a single activation, a record already running on the *same* relay
+    /// is not spawned again — the `already_running` exclusion, not just the
+    /// relay filter, keeps the plan idempotent. Two agents share relay A; one is
+    /// live when A is applied, so only the down one is planned.
+    #[test]
+    fn a_running_agent_on_the_active_relay_is_not_respawned() {
+        let records = vec![agent("agent-a1", RELAY_A), agent("agent-a2", RELAY_A)];
+        let mut activated = HashSet::new();
+        let mut running = HashSet::new();
+        running.insert("agent-a1".to_string()); // a1 already up on A
+
+        let plan = plan_workspace_activation(&records, &running, &mut activated, RELAY_A)
+            .expect("apply A");
+
+        assert_eq!(
+            plan.spawn_pubkeys,
+            vec!["agent-a2".to_string()],
+            "only the not-running A agent is spawned; a1 is not double-spawned"
+        );
+    }
+
+    /// A failed spawn in A must not cause B's activation to adopt A's record.
+    /// A claimed its relay activation even though its process never came up, so
+    /// it is absent from `already_running`; B's relay-filtered plan still omits
+    /// A's A-pinned record.
+    #[test]
+    fn failed_spawn_in_a_does_not_leak_into_b() {
+        let records = vec![agent("agent-a", RELAY_A), agent("agent-b", RELAY_B)];
+        let mut activated = HashSet::new();
+
+        // Apply A: A is planned for spawn, but model the spawn as having failed —
+        // A never enters the running set.
+        let plan_a = plan_workspace_activation(&records, &HashSet::new(), &mut activated, RELAY_A)
+            .expect("apply A");
+        assert_eq!(plan_a.spawn_pubkeys, vec!["agent-a".to_string()]);
+        let running = HashSet::new(); // A's spawn failed: not running.
+
+        // Switch to B: only B is planned. A's A-pinned record is not selected on
+        // B even though it is neither running nor successfully started.
+        let plan_b = plan_workspace_activation(&records, &running, &mut activated, RELAY_B)
+            .expect("apply B");
+        assert_eq!(
+            plan_b.spawn_pubkeys,
+            vec!["agent-b".to_string()],
+            "a failed A spawn must not make B adopt A's record"
+        );
+    }
+}
