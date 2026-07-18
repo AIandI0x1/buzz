@@ -1,6 +1,6 @@
 use nostr::Keys;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::app_state::AppState;
@@ -166,14 +166,13 @@ pub async fn apply_workspace(
         // from floating to a later workspace switch. Runs before the restore
         // trigger below so restored agents spawn from stamped records. A
         // failure is logged and retried on the next boot.
-        if state
-            .agent_relay_stamp_pending
-            .swap(false, Ordering::AcqRel)
-        {
-            if let Err(error) = pin_blank_agent_relays(&app, &state, &relay_url) {
-                eprintln!("buzz-desktop: blank agent relay migration failed: {error}");
-            }
-        }
+        run_pending_agent_relay_stamp(&state.agent_relay_stamp_pending, || {
+            pin_blank_agent_relays(&app, &state, &relay_url)
+        })
+        .unwrap_or_else(|error| {
+            eprintln!("buzz-desktop: blank agent relay migration failed: {error}");
+            None
+        });
 
         // ── Filesystem side-effect (non-fatal) ────────────────────────────────
         // Persist the *effective* repos_dir (None when the candidate failed
@@ -258,6 +257,45 @@ pub async fn apply_workspace(
     });
 
     Ok(())
+}
+
+fn run_pending_agent_relay_stamp<T>(
+    pending: &AtomicBool,
+    stamp: impl FnOnce() -> Result<T, String>,
+) -> Result<Option<T>, String> {
+    if !pending.swap(false, Ordering::AcqRel) {
+        return Ok(None);
+    }
+    stamp().map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_pending_agent_relay_stamp;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn agent_relay_stamp_runs_once_and_completes_before_returning() {
+        let pending = AtomicBool::new(true);
+        let stamps = AtomicUsize::new(0);
+
+        let first = run_pending_agent_relay_stamp(&pending, || {
+            stamps.fetch_add(1, Ordering::SeqCst);
+            Ok(7)
+        })
+        .expect("first stamp succeeds");
+        assert_eq!(first, Some(7));
+        assert_eq!(stamps.load(Ordering::SeqCst), 1);
+
+        let second = run_pending_agent_relay_stamp(&pending, || {
+            stamps.fetch_add(1, Ordering::SeqCst);
+            Ok(8)
+        })
+        .expect("second apply skips the migration");
+        assert_eq!(second, None);
+        assert_eq!(stamps.load(Ordering::SeqCst), 1);
+        assert!(!pending.load(Ordering::Acquire));
+    }
 }
 
 /// Stamp legacy blank-relay agent records with the applied workspace relay.
