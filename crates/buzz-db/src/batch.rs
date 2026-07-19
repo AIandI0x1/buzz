@@ -242,13 +242,30 @@ enum BatchAttempt {
 
 /// Whether a COMMIT error proves the transaction aborted.
 ///
-/// A [`sqlx::Error::Database`] carries a server-reported SQLSTATE — the
-/// server processed COMMIT and rolled the transaction back (this is how a
-/// deferred-trigger failure such as the 0021 floor surfaces). Anything else
-/// (I/O, protocol, pool) means the response was lost and the server may have
-/// committed.
+/// Only an explicit allowlist of SQLSTATEs qualifies — codes PostgreSQL
+/// raises *while rolling the transaction back*:
+///
+/// - class `23` (integrity constraint violation): deferred constraint
+///   triggers fire during COMMIT and abort it — the 0021/0022 guards raise
+///   `check_violation` (23514) — as do deferred FK/unique checks;
+/// - `40001` (`serialization_failure`) and `40P01` (`deadlock_detected`):
+///   PostgreSQL guarantees the transaction rolled back.
+///
+/// Everything else is indeterminate, **including** server-reported errors:
+/// `08007` (`transaction_resolution_unknown`) and `40003`
+/// (`statement_completion_unknown`) explicitly mean the server lost track of
+/// the outcome, and an unknown or missing SQLSTATE proves nothing. A false
+/// "aborted" here would replay a transaction that actually committed —
+/// misreporting durable inserts as duplicates and skipping their mentions —
+/// so the default must be indeterminate.
 fn commit_definitely_aborted(error: &sqlx::Error) -> bool {
-    matches!(error, sqlx::Error::Database(_))
+    let sqlx::Error::Database(db_error) = error else {
+        return false;
+    };
+    let Some(code) = db_error.code() else {
+        return false;
+    };
+    code.starts_with("23") || code == "40001" || code == "40P01"
 }
 
 async fn run_batch_txn(db: &Db, batch: &[BatchRequest]) -> BatchAttempt {
@@ -699,19 +716,47 @@ mod tests {
         assert_eq!(counters.indeterminate_commits.load(Ordering::Relaxed), 0);
     }
 
-    /// Commit-error classification: a server-reported error (SQLSTATE
-    /// present) proves the abort; transport-shaped errors must not be
-    /// treated as aborted.
+    /// Commit-error classification allowlist, exercised with real
+    /// server-reported SQLSTATEs raised by Postgres: only codes proving
+    /// rollback (class 23, 40001, 40P01) classify as aborted. Indeterminate
+    /// server-reported outcomes — `08007 transaction_resolution_unknown`,
+    /// `40003 statement_completion_unknown` — and arbitrary other database
+    /// errors must NOT be treated as proof of abort, nor may transport-shaped
+    /// non-database errors.
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn commit_abort_classification() {
         let db = setup_db().await;
-        let server_error = sqlx::query("SELECT no_such_column FROM communities")
-            .execute(&db.pool)
-            .await
-            .expect_err("bad query errors");
-        assert!(commit_definitely_aborted(&server_error));
 
+        let raise = |code: &'static str| {
+            let pool = db.pool.clone();
+            async move {
+                sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                    "DO $$ BEGIN RAISE EXCEPTION 'classifier probe' USING ERRCODE = '{code}'; END $$;"
+                )))
+                .execute(&pool)
+                .await
+                .expect_err("raise must error")
+            }
+        };
+
+        // Proves rollback → replay is safe.
+        for code in ["23514", "23503", "23505", "40001", "40P01"] {
+            assert!(
+                commit_definitely_aborted(&raise(code).await),
+                "{code} proves rollback"
+            );
+        }
+
+        // Server-reported but outcome-indeterminate or irrelevant → no replay.
+        for code in ["08007", "40003", "42703", "57014", "53300", "XX000"] {
+            assert!(
+                !commit_definitely_aborted(&raise(code).await),
+                "{code} must not be treated as proof of abort"
+            );
+        }
+
+        // Transport/pool-shaped errors carry no SQLSTATE at all → no replay.
         let io_error = sqlx::Error::Io(std::io::Error::new(
             std::io::ErrorKind::ConnectionReset,
             "connection reset by peer",
