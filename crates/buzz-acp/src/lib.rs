@@ -5548,6 +5548,165 @@ mod dispatch_scope_tests {
         }
     }
 
+    /// A `test_ctx` whose channel registry marks `ch` as a DM. Scope
+    /// derivation and dispatch must not consult `channel_type`, so every
+    /// assertion made against this context must match the stream-channel
+    /// behaviour pinned by the tests above.
+    fn test_ctx_dm(ch: Uuid) -> Arc<PromptContext> {
+        let ctx = test_ctx();
+        let mut ctx = Arc::into_inner(ctx).expect("fresh ctx has a single owner");
+        ctx.channel_info.insert(
+            ch,
+            relay::ChannelInfo {
+                name: "dm".into(),
+                channel_type: "dm".into(),
+            },
+        );
+        Arc::new(ctx)
+    }
+
+    /// DM equivalence, part 0: scope derivation is channel-type-agnostic by
+    /// construction. For byte-identical tag shapes, a DM channel and a stream
+    /// channel derive the same root component in both modes — DMs are private
+    /// channels, not a separate scoping model.
+    #[test]
+    fn dm_and_stream_channels_derive_identical_scope_components() {
+        let mut config = build_mcp_servers_tests::test_config();
+        let dm_ch = Uuid::new_v4();
+        let stream_ch = Uuid::new_v4();
+
+        let cases: Vec<Vec<nostr::Tag>> = vec![
+            // Top-level DM message: no thread tags at all.
+            vec![],
+            // Reply chain: explicit outermost root + intermediate parent.
+            vec![
+                nostr::Tag::parse(["e", "outer-root", "", "root"]).unwrap(),
+                nostr::Tag::parse(["e", "intermediate-parent", "", "reply"]).unwrap(),
+            ],
+            // Direct reply: reply tag only, no explicit root marker.
+            vec![nostr::Tag::parse(["e", "outer-root", "", "reply"]).unwrap()],
+        ];
+
+        for scope_mode in [config::SessionScope::Thread, config::SessionScope::Channel] {
+            config.session_scope = scope_mode;
+            for tags in &cases {
+                let event = tagged_event("same shape", tags.clone());
+                let id = event.id.to_hex();
+                let dm = conversation_scope_for_event(&config, &event, dm_ch, &id);
+                let stream = conversation_scope_for_event(&config, &event, stream_ch, &id);
+                assert_eq!(dm.channel_id, dm_ch);
+                assert_eq!(stream.channel_id, stream_ch);
+                assert_eq!(
+                    dm.root_event_id, stream.root_event_id,
+                    "root derivation must be identical across channel types (mode {scope_mode:?}, tags {tags:?})"
+                );
+            }
+        }
+    }
+
+    /// DM equivalence, thread mode: two top-level DM messages (no thread
+    /// tags — each is its own outermost root) derive distinct root scopes and
+    /// dispatch concurrently to distinct workers, exactly like two roots in a
+    /// stream channel. The context registers the channel as a DM to prove the
+    /// dispatch path never special-cases `channel_type`.
+    #[tokio::test]
+    async fn dm_thread_mode_top_level_messages_are_distinct_concurrent_roots() {
+        let mut config = build_mcp_servers_tests::test_config();
+        config.session_scope = config::SessionScope::Thread;
+        let mut pool =
+            AgentPool::from_slots(vec![Some(dummy_agent(0).await), Some(dummy_agent(1).await)]);
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+
+        let first = tagged_event("dm one", []);
+        let second = tagged_event("dm two", []);
+        let first_root = first.id.to_hex();
+        let second_root = second.id.to_hex();
+        let first_scope = push_via_config_scope(&mut queue, &config, ch, first);
+        let second_scope = push_via_config_scope(&mut queue, &config, ch, second);
+
+        // Untagged events root at their own id: distinct scopes, never merged.
+        assert_eq!(first_scope, key(ch, &first_root));
+        assert_eq!(second_scope, key(ch, &second_root));
+        assert_ne!(first_scope, second_scope);
+
+        let dispatched = dispatch_pending(&mut pool, &mut queue, &test_ctx_dm(ch));
+
+        let scopes: HashSet<_> = dispatched.iter().map(|(s, _)| s.clone()).collect();
+        assert_eq!(
+            scopes,
+            HashSet::from([first_scope.clone(), second_scope.clone()])
+        );
+        assert!(queue.is_scope_in_flight(&first_scope));
+        assert!(queue.is_scope_in_flight(&second_scope));
+        assert!(!pool.any_idle(), "both workers must be running DM roots");
+    }
+
+    /// DM equivalence, thread mode: a threaded DM reply joins the session of
+    /// its outermost root, sharing one batch with the earlier message — same
+    /// join rule as `nested_reply_joins_outermost_root_session_scope`.
+    #[test]
+    fn dm_thread_mode_reply_joins_outermost_root_scope() {
+        let mut config = build_mcp_servers_tests::test_config();
+        config.session_scope = config::SessionScope::Thread;
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+
+        let opener = tagged_event("dm opener", []);
+        let opener_root = opener.id.to_hex();
+        let reply = tagged_event(
+            "dm reply",
+            [
+                nostr::Tag::parse(["e", opener_root.as_str(), "", "root"]).unwrap(),
+                nostr::Tag::parse(["e", "intermediate-parent", "", "reply"]).unwrap(),
+            ],
+        );
+
+        let opener_scope = push_via_config_scope(&mut queue, &config, ch, opener);
+        let reply_scope = push_via_config_scope(&mut queue, &config, ch, reply);
+
+        assert_eq!(opener_scope, key(ch, &opener_root));
+        assert_eq!(reply_scope, opener_scope);
+        let batch = queue.flush_next().expect("shared DM root batch");
+        assert_eq!(batch.scope_key(), opener_scope);
+        assert_eq!(batch.events.len(), 2);
+        assert!(queue.flush_next().is_none());
+    }
+
+    /// DM equivalence, channel mode: distinct DM messages collapse to the
+    /// bare `(channel, None)` scope and serialize onto a single worker, with
+    /// the second worker idle — the legacy contract, unchanged for DMs.
+    #[tokio::test]
+    async fn dm_channel_mode_collapses_to_channel_scope_and_serializes() {
+        let mut config = build_mcp_servers_tests::test_config();
+        config.session_scope = config::SessionScope::Channel;
+        let mut pool =
+            AgentPool::from_slots(vec![Some(dummy_agent(0).await), Some(dummy_agent(1).await)]);
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+
+        let top_level = tagged_event("dm top-level", []);
+        let threaded = tagged_event(
+            "dm threaded reply",
+            [nostr::Tag::parse(["e", "dm-root", "", "root"]).unwrap()],
+        );
+        for event in [top_level, threaded] {
+            assert_eq!(
+                push_via_config_scope(&mut queue, &config, ch, event),
+                ConversationSessionKey::channel(ch)
+            );
+        }
+
+        let dispatched = dispatch_pending(&mut pool, &mut queue, &test_ctx_dm(ch));
+        assert_eq!(dispatched.len(), 1);
+        assert_eq!(dispatched[0].0, ConversationSessionKey::channel(ch));
+        assert_eq!(pool.task_map().len(), 1);
+        assert!(
+            pool.any_idle(),
+            "second worker must remain idle in channel mode for DMs"
+        );
+    }
+
     #[tokio::test]
     async fn configured_channel_mode_serializes_distinct_thread_roots() {
         let mut config = build_mcp_servers_tests::test_config();
