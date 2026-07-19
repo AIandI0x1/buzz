@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   clearCommunityOnboardingTransaction,
+  communityReplacementOnboardingPatch,
   loadCommunityOnboardingTransaction,
   markCommunityOnboardingComplete,
   startCommunityOnboarding,
@@ -146,4 +147,40 @@ test("completion is scoped by relay and pubkey and preserves legacy gate", () =>
     "true",
   );
   assert.equal(storage.getItem("buzz-onboarding-complete.v1:pubkey"), "true");
+});
+
+test("community replacement retargets a wedged transaction", () => {
+  const storage = createMemoryStorage();
+  const transaction = startCommunityOnboarding(
+    { source: "add-community", relayUrl: "wss://stale.example" },
+    storage,
+  );
+  const connected = updateCommunityOnboardingTransaction(
+    transaction,
+    {
+      communityId: "stale-id",
+      previousCommunityId: "previous-id",
+      addedCommunity: true,
+      stage: "profile",
+      error: "not a relay member",
+    },
+    storage,
+  );
+
+  const repaired = updateCommunityOnboardingTransaction(
+    connected,
+    communityReplacementOnboardingPatch({
+      id: "saved-id",
+      name: "Saved community",
+      relayUrl: "wss://saved.example",
+    }),
+    storage,
+  );
+
+  assert.equal(repaired.communityId, "saved-id");
+  assert.equal(repaired.previousCommunityId, "saved-id");
+  assert.equal(repaired.addedCommunity, false);
+  assert.equal(repaired.relayUrl, "wss://saved.example");
+  assert.equal(repaired.stage, "connecting");
+  assert.equal(repaired.error, undefined);
 });

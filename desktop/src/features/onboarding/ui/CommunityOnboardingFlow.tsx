@@ -3,6 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Plus, Users, X } from "lucide-react";
 
 import {
+  communityReplacementOnboardingPatch,
   markCommunityOnboardingComplete,
   useCommunityOnboarding,
 } from "@/features/onboarding/communityOnboarding";
@@ -273,13 +274,18 @@ export function CommunityOnboardingFlow({
         {isCommunityChangeOpen ? (
           <CommunityChangeOverlay
             onClose={() => setIsCommunityChangeOpen(false)}
-            onUpdated={(communityName, updatedRelayUrl) => {
-              update({
-                communityName,
-                relayUrl: updatedRelayUrl,
-                stage: "connecting",
-                error: undefined,
-              });
+            onUpdated={(updatedCommunity, replaced) => {
+              update(
+                replaced
+                  ? communityReplacementOnboardingPatch(updatedCommunity)
+                  : {
+                      communityId: updatedCommunity.id,
+                      communityName: updatedCommunity.name,
+                      relayUrl: updatedCommunity.relayUrl,
+                      stage: "connecting",
+                      error: undefined,
+                    },
+              );
               setIsMembershipDenied(false);
             }}
           />

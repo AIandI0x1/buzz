@@ -5,7 +5,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { resolveCommunityUpdateResult } from "./useCommunities.tsx";
+import {
+  resolveCommunityReplacement,
+  resolveCommunityUpdateResult,
+} from "./useCommunities.tsx";
 
 const COMMUNITIES = [
   {
@@ -56,7 +59,10 @@ test("resolveCommunityUpdateResult_duplicate_relay_returns_duplicate", () => {
   const result = resolveCommunityUpdateResult(COMMUNITIES, "ws-1", "ws-1", {
     relayUrl: "wss://relay-b.example.com",
   });
-  assert.deepEqual(result, { kind: "duplicate-relay" });
+  assert.deepEqual(result, {
+    kind: "duplicate-relay",
+    existingCommunityId: "ws-2",
+  });
 });
 
 test("resolveCommunityUpdateResult_not_found_returns_not_found", () => {
@@ -104,4 +110,23 @@ test("resolveCommunityUpdateResult_same_relay_url_is_not_duplicate_of_self", () 
     relayUrl: "wss://relay-a.example.com",
   });
   assert.deepEqual(result, { kind: "unchanged" });
+});
+
+test("resolveCommunityReplacement_drops_stale_entry_and_keeps_replacement", () => {
+  const result = resolveCommunityReplacement(COMMUNITIES, "ws-1", "ws-2");
+
+  assert.equal(result.kind, "replaced");
+  assert.deepEqual(result.communities, [COMMUNITIES[1]]);
+  assert.equal(result.removedCommunity, COMMUNITIES[0]);
+  assert.equal(result.replacementCommunity, COMMUNITIES[1]);
+});
+
+test("resolveCommunityReplacement_rejects_missing_or_identical_entries", () => {
+  assert.deepEqual(
+    resolveCommunityReplacement(COMMUNITIES, "missing", "ws-2"),
+    { kind: "not-found" },
+  );
+  assert.deepEqual(resolveCommunityReplacement(COMMUNITIES, "ws-1", "ws-1"), {
+    kind: "not-found",
+  });
 });

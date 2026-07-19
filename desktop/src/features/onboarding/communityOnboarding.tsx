@@ -2,6 +2,7 @@ import {
   deriveCommunityName,
   normalizeRelayUrl,
 } from "@/features/communities/communityStorage";
+import type { Community } from "@/features/communities/types";
 import { setLocalStorageItemWithRecovery } from "@/shared/lib/localStorageQuota";
 
 const STORAGE_KEY = "buzz-community-onboarding-transaction.v1";
@@ -75,6 +76,21 @@ export type StartCommunityOnboardingInput = {
   reposDir?: string;
   policyReceipt?: string;
 };
+
+/** Retarget a wedged onboarding transaction to an existing saved community. */
+export function communityReplacementOnboardingPatch(
+  replacement: Pick<Community, "id" | "name" | "relayUrl">,
+): CommunityOnboardingTransactionPatch {
+  return {
+    communityId: replacement.id,
+    communityName: replacement.name,
+    relayUrl: replacement.relayUrl,
+    addedCommunity: false,
+    previousCommunityId: replacement.id,
+    stage: "connecting",
+    error: undefined,
+  };
+}
 
 function canonicalRelayUrl(rawRelayUrl: string) {
   const trimmed = rawRelayUrl.trim();

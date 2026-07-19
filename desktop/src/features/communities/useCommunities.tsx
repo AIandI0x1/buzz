@@ -24,7 +24,16 @@ import { clearSavedCommunitySnapshot } from "@/features/agents/activeAgentTurnsS
 export type UpdateCommunityResult =
   | { kind: "updated"; requiresReinit: boolean }
   | { kind: "unchanged" }
-  | { kind: "duplicate-relay" }
+  | { kind: "duplicate-relay"; existingCommunityId: string }
+  | { kind: "not-found" };
+
+export type ReplaceCommunityResult =
+  | {
+      kind: "replaced";
+      communities: Community[];
+      removedCommunity: Community;
+      replacementCommunity: Community;
+    }
   | { kind: "not-found" };
 
 /**
@@ -43,12 +52,13 @@ export function resolveCommunityUpdateResult(
   const current = communities.find((w) => w.id === id);
   if (!current) return { kind: "not-found" };
 
-  if (
-    updates.relayUrl !== undefined &&
-    updates.relayUrl !== current.relayUrl &&
-    communities.some((w) => w.id !== id && w.relayUrl === updates.relayUrl)
-  ) {
-    return { kind: "duplicate-relay" };
+  if (updates.relayUrl !== undefined && updates.relayUrl !== current.relayUrl) {
+    const existing = communities.find(
+      (w) => w.id !== id && w.relayUrl === updates.relayUrl,
+    );
+    if (existing) {
+      return { kind: "duplicate-relay", existingCommunityId: existing.id };
+    }
   }
 
   const hasChange =
@@ -72,6 +82,32 @@ export function resolveCommunityUpdateResult(
   return { kind: "updated", requiresReinit: backendFieldsChanged };
 }
 
+/**
+ * Remove a stale local community entry in favor of another saved entry.
+ * This is local-only recovery: it never mutates either relay.
+ */
+export function resolveCommunityReplacement(
+  communities: Community[],
+  removedId: string,
+  replacementId: string,
+): ReplaceCommunityResult {
+  const removedCommunity = communities.find((w) => w.id === removedId);
+  const replacementCommunity = communities.find((w) => w.id === replacementId);
+  if (
+    !removedCommunity ||
+    !replacementCommunity ||
+    removedCommunity.id === replacementCommunity.id
+  ) {
+    return { kind: "not-found" };
+  }
+  return {
+    kind: "replaced",
+    communities: communities.filter((w) => w.id !== removedCommunity.id),
+    removedCommunity,
+    replacementCommunity,
+  };
+}
+
 export type UseCommunitiesReturn = {
   communities: Community[];
   activeCommunity: Community | null;
@@ -81,6 +117,11 @@ export type UseCommunitiesReturn = {
   addCommunity: (community: Community) => string;
   clearCommunities: () => void;
   removeCommunity: (id: string) => void;
+  /** Drop a stale local entry and activate an already-saved replacement. */
+  replaceCommunity: (
+    removedId: string,
+    replacementId: string,
+  ) => ReplaceCommunityResult;
   switchCommunity: (id: string) => void;
   /** Force the active community to re-init (e.g. after a deep-link reconnect). */
   reconnectCommunity: () => void;
@@ -196,6 +237,35 @@ function useCommunitiesInternal(): UseCommunitiesReturn {
     [activeId, communities],
   );
 
+  const replaceCommunity = useCallback(
+    (removedId: string, replacementId: string): ReplaceCommunityResult => {
+      const result = resolveCommunityReplacement(
+        communitiesRef.current,
+        removedId,
+        replacementId,
+      );
+      if (result.kind !== "replaced") return result;
+
+      const removedRelayStillUsed = result.communities.some(
+        (community) => community.relayUrl === result.removedCommunity.relayUrl,
+      );
+      if (!removedRelayStillUsed) {
+        removeSelfProfileCachesForRelay(result.removedCommunity.relayUrl);
+        removeChannelSnapshotForRelay(result.removedCommunity.relayUrl);
+        removeMessageSnapshotsForRelay(result.removedCommunity.relayUrl);
+      }
+      clearSavedCommunitySnapshot(result.removedCommunity.id);
+
+      communitiesRef.current = result.communities;
+      saveCommunities(result.communities);
+      saveActiveCommunityId(result.replacementCommunity.id);
+      setCommunitiesState(result.communities);
+      setActiveId(result.replacementCommunity.id);
+      return result;
+    },
+    [],
+  );
+
   const switchCommunity = useCallback(
     (id: string) => {
       if (id === activeId) return;
@@ -249,6 +319,7 @@ function useCommunitiesInternal(): UseCommunitiesReturn {
     addCommunity,
     clearCommunities,
     removeCommunity,
+    replaceCommunity,
     switchCommunity,
     reconnectCommunity,
     updateCommunity,
