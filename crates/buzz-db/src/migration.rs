@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 24);
+        assert_eq!(migrations.len(), 25);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -879,6 +879,23 @@ mod tests {
             .to_lowercase()
             .contains("for update"));
         assert!(ttl_shared.contains("NEW.kind <> 9007"));
+
+        // Push wake latch: one durable row per lease address replaces
+        // row-per-event wake fanout. The seed must leave the legacy outbox
+        // intact (dual-drain rollout) and cooldown_until must be non-null
+        // with an epoch-zero default so arming never branches on NULL.
+        assert_eq!(migrations[24].version, 25);
+        let latch = migrations[24].sql.as_str();
+        assert!(latch.contains("CREATE TABLE push_wake_latch"));
+        assert!(latch.contains("cooldown_until TIMESTAMPTZ NOT NULL DEFAULT to_timestamp(0)"));
+        assert!(latch.contains("push_wake_latch_due_global"));
+        assert!(latch.contains("push_wake_latch_recovery_global"));
+        assert!(latch.contains("FROM push_wake_outbox"));
+        let latch_lower = strip_sql_comments(latch).to_lowercase();
+        assert!(
+            !latch_lower.contains("drop table") && !latch_lower.contains("delete from"),
+            "0025 must not mutate or drop the legacy outbox; 0026 owns retirement"
+        );
     }
 
     #[test]
@@ -1121,7 +1138,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(24));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(25));
     }
 
     #[tokio::test]
@@ -1182,6 +1199,82 @@ mod tests {
         .await
         .expect("read post-push search behavior");
         assert_eq!(after, vec![(1, Some(true)), (30_350, None)]);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn brownfield_0025_seeds_latches_from_in_flight_outbox_rows() {
+        let pool = connect_test_pool().await;
+        reset_public_schema(&pool).await;
+        MIGRATOR
+            .run_to(24, &pool)
+            .await
+            .expect("apply migrations through 24");
+
+        let community_id = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            .bind(community_id)
+            .bind(format!("pre-0025-{}.example", community_id.simple()))
+            .execute(&pool)
+            .await
+            .expect("insert community");
+        sqlx::query(
+            "INSERT INTO push_leases (community_id, author, installation_id, source_event_id, \
+                 source_created_at, generation, active, app_profile, endpoint_hash, \
+                 endpoint_grant, max_class, subscriptions, expires_at) \
+             VALUES ($1, $2, 'install', $3, 1, 1, true, 'ios-production', $4, 'grant', \
+                 'default', '[]'::jsonb, $5)",
+        )
+        .bind(community_id)
+        .bind([1_u8; 32])
+        .bind([2_u8; 32])
+        .bind([3_u8; 32])
+        .bind(i64::MAX / 2)
+        .execute(&pool)
+        .await
+        .expect("insert live lease");
+        // An in-flight `sending` wake claimed by an old pod at migration time.
+        sqlx::query(
+            "INSERT INTO push_wake_outbox (community_id, author, installation_id, \
+                 lease_generation, endpoint_hash, event_id, class, expires_at, state, \
+                 lease_until, claim_id) \
+             VALUES ($1, $2, 'install', 1, $3, $4, 'default', $5, 'sending', \
+                 now() + interval '1 minute', gen_random_uuid())",
+        )
+        .bind(community_id)
+        .bind([1_u8; 32])
+        .bind([3_u8; 32])
+        .bind([4_u8; 32])
+        .bind(i64::MAX / 2)
+        .execute(&pool)
+        .await
+        .expect("insert in-flight legacy wake");
+
+        run_migrations(&pool)
+            .await
+            .expect("brownfield migration onto populated database");
+
+        let latch: (String, Vec<u8>) = sqlx::query_as(
+            "SELECT state, event_id FROM push_wake_latch \
+             WHERE community_id = $1 AND author = $2 AND installation_id = 'install'",
+        )
+        .bind(community_id)
+        .bind([1_u8; 32])
+        .fetch_one(&pool)
+        .await
+        .expect("seeded latch for the in-flight address");
+        assert_eq!(latch, ("pending".into(), [4_u8; 32].to_vec()));
+
+        // 0025 must leave the legacy row fully intact — old pods still own it
+        // until the rolling deploy finishes (0026 owns retirement).
+        let legacy: (String, Option<uuid::Uuid>) =
+            sqlx::query_as("SELECT state, claim_id FROM push_wake_outbox WHERE community_id = $1")
+                .bind(community_id)
+                .fetch_one(&pool)
+                .await
+                .expect("legacy row survives 0025");
+        assert_eq!(legacy.0, "sending");
+        assert!(legacy.1.is_some(), "old pod's claim fence untouched");
     }
 
     #[tokio::test]

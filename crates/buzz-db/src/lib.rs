@@ -37,6 +37,8 @@ pub mod partition;
 pub mod product_feedback;
 /// Community-scoped push lease and durable wake-outbox persistence.
 pub mod push;
+/// Durable per-address NIP-PL wake latch (replaces row-per-event wake fanout).
+pub mod push_latch;
 /// Reaction persistence.
 pub mod reaction;
 /// Relay-level membership persistence (NIP-43).
@@ -1373,6 +1375,59 @@ impl Db {
             max_active_leases,
         )
         .await
+    }
+
+    /// Set-wise arm/fold of per-address wake latches for matched events.
+    pub async fn arm_push_latches(
+        &self,
+        community: CommunityId,
+        requests: &[push_latch::LatchArm],
+    ) -> Result<()> {
+        push_latch::arm_latches(&self.pool, community, requests).await
+    }
+
+    /// Globally claim due latch cycles (pending-due + expired-sending recovery).
+    pub async fn claim_due_push_latches(
+        &self,
+        limit: i64,
+        lease_until: DateTime<Utc>,
+    ) -> Result<Vec<push_latch::ClaimedLatch>> {
+        push_latch::claim_due_latches(&self.pool, limit, lease_until).await
+    }
+
+    /// Revalidate a fenced latch claim against the current lease and
+    /// representative event immediately before transport.
+    pub async fn revalidate_push_latch(
+        &self,
+        claim: &push_latch::ClaimedLatch,
+    ) -> Result<push_latch::RevalidateLatchOutcome> {
+        push_latch::revalidate_latch_for_send(&self.pool, claim).await
+    }
+
+    /// Exit a fenced latch claim after an accepted gateway delivery.
+    pub async fn complete_push_latch_delivered(
+        &self,
+        claim: &push_latch::ClaimedLatch,
+        cooldown: chrono::Duration,
+    ) -> Result<bool> {
+        push_latch::complete_latch_delivered(&self.pool, claim, cooldown).await
+    }
+
+    /// Exit a fenced latch claim that delivered nothing (suppressed/terminal).
+    pub async fn release_push_latch_undelivered(
+        &self,
+        claim: &push_latch::ClaimedLatch,
+    ) -> Result<bool> {
+        push_latch::release_latch_undelivered(&self.pool, claim).await
+    }
+
+    /// Return a fenced latch claim to `pending` for a same-cycle retry.
+    pub async fn retry_push_latch(
+        &self,
+        claim: &push_latch::ClaimedLatch,
+        next_attempt_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        push_latch::retry_latch(&self.pool, claim, next_attempt_at).await
     }
 
     /// Atomically insert an event AND its thread metadata in a single transaction.
