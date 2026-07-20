@@ -2863,10 +2863,6 @@ async fn boot_recover(
             "boot recovery: dropped ledger channel(s) no longer in this boot's membership"
         );
     }
-    if gated.is_empty() {
-        return;
-    }
-
     let deadline = tokio::time::Instant::now() + BOOT_RECOVERY_DEADLINE;
     let all_ids: Vec<String> = gated.iter().map(|(_, r)| r.event_id.clone()).collect();
     let by_id: HashMap<&str, &(Uuid, ledger::LedgerRecord)> = gated
@@ -6351,6 +6347,57 @@ mod boot_recovery_integration_tests {
         assert!(queue.recoverable_triggers(ch_gone).is_empty());
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_boot_recover_all_channels_dropped_commits_empty_ledger() {
+        let keys = Keys::generate();
+        let ch_gone = Uuid::new_v4();
+        let ev_gone = make_channel_event(&keys, ch_gone, "stale");
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Persist stale state to disk through the real API so the file
+        // exists before boot_recover runs.
+        {
+            let (mut ledger0, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+            let trigger = queue::RecoverableTrigger {
+                event_id: ev_gone.id.to_hex(),
+                prompt_tag: "test".into(),
+                admission_seq: 1,
+                enqueued_at_unix: 1001,
+                cap_exempt: false,
+            };
+            ledger0.sync(ch_gone, vec![trigger]);
+        }
+
+        // Reload — staged must come from disk, not memory.
+        let (mut ledger, staged) = Ledger::load(dir.path(), "test_pubkey", 0);
+        assert!(
+            !staged.channels.is_empty(),
+            "setup guard: stale record must exist on disk before recovery"
+        );
+
+        let rest = rest_client("http://127.0.0.1:1");
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let live_channels: HashSet<Uuid> = HashSet::new();
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        let (_ledger2, staged2) = Ledger::load(dir.path(), "test_pubkey", 0);
+        assert!(
+            staged2.channels.is_empty(),
+            "all-dropped boot must commit an empty ledger — stale records must not survive on disk"
+        );
     }
 
     // ── Scenario 5: REST-fail → WS-deliver → no duplicate ───────────────
