@@ -23,6 +23,7 @@ use buzz_db::Db;
 use buzz_media::MediaStorage;
 use buzz_pubsub::cache_invalidation::CacheInvalidation;
 use buzz_pubsub::conn_control::ConnControl;
+use buzz_pubsub::rate_limiter::RedisRateLimiter;
 use buzz_pubsub::{PubSubManager, RedisNip98ReplayGuard};
 use buzz_search::SearchService;
 use buzz_workflow::WorkflowEngine;
@@ -437,8 +438,8 @@ pub struct AppState {
     pub db: Db,
     /// Redis pool for readiness health checks.
     pub redis_pool: deadpool_redis::Pool,
-    /// Audit event service.
-    pub audit: Arc<AuditService>,
+    /// Audit event service, absent when audit logging is disabled.
+    pub audit: Option<Arc<AuditService>>,
     /// Pub/sub manager for broadcasting events to subscribers.
     pub pubsub: Arc<PubSubManager>,
     /// Authentication service.
@@ -496,15 +497,18 @@ pub struct AppState {
     /// access check so open channels stay zero-cost. Invalidated on a flip.
     pub channel_visibility_cache: Arc<moka::sync::Cache<(CommunityId, Uuid), String>>,
 
-    /// Bounded channel for audit logging — backpressure instead of unbounded spawns.
-    /// Uses .send().await (blocks caller if full) because audit entries must not be lost.
-    pub audit_tx: mpsc::Sender<buzz_audit::NewAuditEntry>,
+    /// Bounded channel for audit logging, absent when audit logging is disabled.
+    pub audit_tx: Option<mpsc::Sender<buzz_audit::NewAuditEntry>>,
     /// Media storage client (S3/MinIO).
     pub media_storage: Arc<MediaStorage>,
     /// Git object-store backend (content-addressed packs/manifests plus
     /// CAS-guarded manifest pointer). This is the durable git source of truth;
     /// see `api::git::store` and `docs/git-on-object-storage.md`.
     pub git_store: crate::api::git::store::GitStore,
+    /// Process-local, byte-bounded cache of immutable Git pack/index pairs.
+    /// Object storage remains authoritative; this only avoids repeated reads
+    /// and index generation for content-addressed packs.
+    pub git_pack_cache: Arc<crate::api::git::pack_cache::GitPackCache>,
     /// Audio relay room manager — tracks active huddle audio rooms.
     pub audio_rooms: Arc<AudioRoomManager>,
     /// Set to `true` on SIGTERM — readiness probe returns 503.
@@ -518,6 +522,8 @@ pub struct AppState {
     /// replace this with process-local caching; replay freshness must survive
     /// cross-pod routing.
     pub nip98_replay: Arc<dyn Nip98ReplayGuard>,
+    /// Shared Redis-backed admission limits for ordinary HTTP and WebSocket work.
+    pub admission_rate_limiter: Arc<RedisRateLimiter>,
 
     /// Per-agent sliding-window rate limiter for observer frames (kind 24200).
     /// Key: (community_id, agent pubkey bytes). Value: (count, window_start).
@@ -568,7 +574,7 @@ impl AppState {
         config: Config,
         db: Db,
         redis_pool: deadpool_redis::Pool,
-        audit: AuditService,
+        audit: impl Into<Option<AuditService>>,
         pubsub: Arc<PubSubManager>,
         auth: AuthService,
         search: SearchService,
@@ -580,12 +586,16 @@ impl AppState {
         let max_concurrent_handlers = config.max_concurrent_handlers;
         let search_arc = Arc::new(search);
 
-        let audit_arc = Arc::new(audit);
+        let audit_arc = audit.into().map(Arc::new);
         let (audit_tx, mut audit_rx) = mpsc::channel::<buzz_audit::NewAuditEntry>(1000);
-        let audit_for_worker = Arc::clone(&audit_arc);
+        let audit_for_worker = audit_arc.clone();
         let audit_cancel = CancellationToken::new();
         let audit_cancel_worker = audit_cancel.clone();
         let audit_worker_handle = tokio::spawn(async move {
+            let Some(audit_for_worker) = audit_for_worker else {
+                audit_cancel_worker.cancelled().await;
+                return;
+            };
             // Normal operation: process entries as they arrive.
             loop {
                 tokio::select! {
@@ -625,8 +635,18 @@ impl AppState {
             &config.media.s3_region,
         )
         .expect("media storage was already constructed with this S3 config");
+        let git_pack_cache = Arc::new(
+            crate::api::git::pack_cache::GitPackCache::new(
+                &config.git_pack_cache_path,
+                config.git_pack_cache_max_bytes,
+                config.git_pack_cache_max_concurrent_populations,
+            )
+            .expect("git pack cache path must be available"),
+        );
         let nip98_replay: Arc<dyn Nip98ReplayGuard> =
             Arc::new(RedisNip98ReplayGuard::new(redis_pool.clone()));
+        let admission_rate_limiter = Arc::new(RedisRateLimiter::new(redis_pool.clone()));
+        let audit_enabled = audit_arc.is_some();
         let state = Self {
             config: Arc::new(config),
             db,
@@ -674,13 +694,15 @@ impl AppState {
                     .support_invalidation_closures()
                     .build(),
             ),
-            audit_tx,
+            audit_tx: audit_enabled.then_some(audit_tx),
             media_storage: Arc::new(media_storage),
             git_store,
+            git_pack_cache,
             audio_rooms: Arc::new(AudioRoomManager::new()),
             shutting_down: Arc::new(AtomicBool::new(false)),
             started_at: Instant::now(),
             nip98_replay,
+            admission_rate_limiter,
             observer_rate_limiter: Arc::new(DashMap::new()),
             media_upload_rate_limiter: Arc::new(DashMap::new()),
             invite_claim_rate_limiter: Arc::new(

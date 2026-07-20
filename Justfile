@@ -11,6 +11,10 @@ web_dir := "web"
 # Turn on to test mesh compute features: `just mesh=1 dev` / `just mesh=1 staging`.
 mesh := ""
 
+# Reset only the current standalone desktop instance before launch.
+# Usage: `just fresh=1 desktop-standalone`.
+fresh := ""
+
 # List all available tasks
 default:
     @just --list
@@ -244,7 +248,7 @@ desktop-e2e-integration: _ensure-migrations
 # Run only the e2e specs changed vs origin/main (both projects) before pushing
 desktop-e2e-pre-push: _ensure-migrations
     git fetch origin main
-    cd {{desktop_dir}} && pnpm build && pnpm exec playwright test --only-changed=origin/main
+    cd {{desktop_dir}} && pnpm build:e2e && pnpm exec playwright test --only-changed=origin/main
 
 # Run all checks suitable for CI / pre-push (no infra needed)
 ci: check test-unit desktop-test desktop-build desktop-tauri-check desktop-tauri-test web-build mobile-test
@@ -336,7 +340,7 @@ mesh-e2e-confidence:
 desktop-screenshot *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
-    just desktop-build
+    pnpm -C {{desktop_dir}} build:e2e
     cd {{desktop_dir}}
     if ! curl -sf http://127.0.0.1:4173/ >/dev/null 2>&1; then
         python3 -m http.server 4173 -d dist >/dev/null 2>&1 &
@@ -362,6 +366,30 @@ relay-web: bootstrap _ensure-migrations
     [[ -d node_modules ]] || pnpm install
     pnpm -C web build
     BUZZ_WEB_DIR=./web/dist cargo run -p buzz-relay
+
+# Build and run the private read-only admin dashboard
+admin: bootstrap _ensure-migrations
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export PATH="{{justfile_directory()}}/bin:$PATH"
+    [[ -d node_modules ]] || pnpm install
+    pnpm -C admin-web build
+    export BUZZ_ADMIN_HOST="${BUZZ_ADMIN_HOST:-admin.localhost:3000}"
+    export BUZZ_ADMIN_WEB_DIR="${BUZZ_ADMIN_WEB_DIR:-{{justfile_directory()}}/admin-web/dist}"
+    echo "Admin dashboard: http://${BUZZ_ADMIN_HOST}/reports"
+    cargo run -p buzz-relay
+
+# Seed deterministic reports and product feedback for local admin dashboard review
+admin-seed: _ensure-migrations
+    ./scripts/seed-admin-dashboard.sh
+
+# Run focused relay and browser checks for the read-only admin dashboard
+admin-check: fmt-check
+    cargo check -p buzz-relay --all-targets
+    cargo test -p buzz-relay api::admin
+    cargo test -p buzz-relay router::tests
+    pnpm -C admin-web check
+    pnpm -C admin-web exec playwright test
 
 # Start the relay server in release mode
 relay-release: _ensure-migrations
@@ -440,13 +468,20 @@ desktop-standalone *ARGS: _ensure-sidecar-stubs
     TARGET_DIR=$(cargo metadata --format-version 1 --no-deps | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).target_directory")
     for bin in buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr buzz; do
         cp "${TARGET_DIR}/debug/${bin}" "desktop/src-tauri/binaries/${bin}-${TARGET}"
+        chmod +x "desktop/src-tauri/binaries/${bin}-${TARGET}"
     done
     cd {{desktop_dir}}
     [[ -d node_modules ]] || pnpm install
     unset BUZZ_PRIVATE_KEY BUZZ_SHARE_IDENTITY
+    if [[ -n "{{fresh}}" ]]; then
+        export BUZZ_RESET_WEBVIEW_STATE=1
+    fi
     source ../scripts/instance-env.sh
     INSTANCE_ID=$(node -e "console.log(JSON.parse(process.env.BUZZ_TAURI_CONFIG).identifier)")
     export BUZZ_DEV_KEYRING_SERVICE="buzz-desktop-dev.${BUZZ_INSTANCE_SLUG:-main}"
+    if [[ -n "{{fresh}}" ]]; then
+        ../scripts/reset-desktop-standalone-state.sh "$INSTANCE_ID" "$BUZZ_DEV_KEYRING_SERVICE"
+    fi
     trap '../scripts/cleanup-instance-agents.sh "$INSTANCE_ID" || true' EXIT
     echo "Starting standalone desktop on Vite port ${BUZZ_VITE_PORT}; no relay services were started"
     pnpm exec tauri dev --config "$BUZZ_TAURI_CONFIG" {{ARGS}}

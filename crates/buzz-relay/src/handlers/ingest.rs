@@ -1498,9 +1498,9 @@ async fn ingest_event_inner(
     // mutations. They are never stored or fanned out as ordinary events; the
     // handler writes the durable audit/enforcement rows after its own capability
     // authorization. These commands are intentionally routed before the
-    // timeout/write-block gate below: restriction-lifting commands must remain
-    // available so a wrongly restricted admin is not stranded, while banned
-    // actors are handled by the auth seam and live-disconnect enforcement.
+    // timeout/write-block gate below so a timed-out admin can lift a timeout.
+    // The handler independently checks the durable ban state before executing
+    // any command, which also covers NIP-98 and missed live disconnects.
     if buzz_core::kind::is_moderation_command_kind(kind_u32) {
         super::moderation_commands::handle_moderation_command(tenant, state, &event)
             .await
@@ -1521,8 +1521,9 @@ async fn ingest_event_inner(
     // subscriber reconnect window), a banned member's open socket would keep
     // writing indefinitely. So the ban is re-checked here — this write-path gate
     // is the durable backstop the fan-out's best-effort delivery relies on.
-    // Moderation/relay-admin commands are exempt: a restriction must never
-    // disarm the tools used to lift or manage it.
+    // Moderation commands enforce bans inside their handler and remain exempt
+    // here only so timeouts do not disarm the tool used to lift them. Relay-admin
+    // commands retain their separate authorization policy.
     //
     // Scope: this gate checks the *authoring* pubkey only, with no NIP-OA
     // owner→agent cascade. That cascade lives at the auth seam for bans, where
@@ -2348,16 +2349,6 @@ async fn ingest_event_inner(
             accepted: true,
             message: "duplicate:".into(),
         });
-    }
-
-    // Any successfully stored channel-scoped event keeps the channel alive.
-    // Skip kind:9007 (create) — the deadline was just set during creation.
-    if let Some(ch_id) = channel_id {
-        if kind_u32 != KIND_NIP29_CREATE_GROUP {
-            if let Err(e) = state.db.bump_ttl_deadline(tenant.community(), ch_id).await {
-                warn!(channel = %ch_id, "TTL deadline bump failed: {e}");
-            }
-        }
     }
 
     if crate::handlers::side_effects::is_side_effect_kind(kind_u32) {

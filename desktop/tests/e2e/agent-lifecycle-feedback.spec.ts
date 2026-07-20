@@ -118,8 +118,11 @@ test.describe("agent lifecycle feedback screenshots", () => {
     const dialog = page.getByRole("alertdialog");
     await expect(dialog).toBeVisible({ timeout: 5_000 });
 
-    // Core assertion: the cascade copy shows the correct instance count (plural).
-    await expect(dialog).toContainText("Also deletes 2 agent instances.");
+    // Core assertion: the cascade copy shows the correct instance count
+    // (plural) and discloses the relay-side archival (PR #2135).
+    await expect(dialog).toContainText(
+      "Also deletes 2 agent instances and archives their identities on the relay",
+    );
 
     await waitForAnimations(page);
 
@@ -243,8 +246,10 @@ test.describe("agent lifecycle feedback screenshots", () => {
     const dialog = page.getByRole("alertdialog");
     await expect(dialog).toBeVisible({ timeout: 5_000 });
 
-    // Singular copy: "Also deletes 1 agent instance." (not "instances").
-    await expect(dialog).toContainText("Also deletes 1 agent instance.");
+    // Singular copy ("instance", "its identity") plus the archival disclosure.
+    await expect(dialog).toContainText(
+      "Also deletes 1 agent instance and archives its identity on the relay",
+    );
 
     await waitForAnimations(page);
     await dialog.screenshot({
@@ -313,7 +318,7 @@ test.describe("agent lifecycle feedback screenshots", () => {
     });
   });
 
-  // Shot 07: global config save — partial failure "M failed to restart".
+  // Shot 07: global config save — partial failure "M couldn't restart".
   test("07-save-failed-restart", async ({ page }) => {
     await installMockBridge(page, {
       globalAgentConfig: {
@@ -335,10 +340,10 @@ test.describe("agent lifecycle feedback screenshots", () => {
 
     await page.getByRole("button", { name: "Save defaults" }).click();
 
-    // Partial failure copy (zero restarted): singular agent + Agents tab prompt.
+    // Partial failure copy (zero restarted): singular agent + Agents page prompt.
     await expect(
       card.getByText(
-        "Saved. 1 agent failed to restart — check the Agents tab.",
+        "Saved. 1 agent couldn't restart — check the Agents page.",
       ),
     ).toBeVisible({ timeout: 5_000 });
 

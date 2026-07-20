@@ -1724,7 +1724,25 @@ test("channel date divider keeps the date sticky while the separator rule scroll
       return Number.parseInt(sharedBackdropZIndex, 10);
     })
     .toBeGreaterThan(Number.parseInt(metrics.dividerZIndex, 10));
-  await expect(page.getByTestId("channel-composer-overlay")).toBeVisible();
+  const composerOverlay = page.getByTestId("channel-composer-overlay");
+  await expect(composerOverlay).toBeVisible();
+  await expect(composerOverlay).toHaveCSS("backdrop-filter", "none");
+  await expect(composerOverlay).toHaveCSS(
+    "background-color",
+    "rgba(0, 0, 0, 0)",
+  );
+  await expect(composerOverlay.getByTestId("message-composer")).not.toHaveCSS(
+    "backdrop-filter",
+    "none",
+  );
+  const composerActivityRow = composerOverlay.getByTestId(
+    "channel-composer-activity-row",
+  );
+  await expect(composerActivityRow).toHaveCSS("backdrop-filter", "none");
+  await expect(composerActivityRow).not.toHaveCSS(
+    "background-color",
+    "rgba(0, 0, 0, 0)",
+  );
   await expect
     .poll(async () => {
       const composerOverlayZIndex = await page
@@ -2512,9 +2530,14 @@ test("home inbox manage affordance opens management without leaving home", async
   }
   expect(detailBox.x + detailBox.width).toBeLessThanOrEqual(sheetBox.x + 1);
   expect(sheetBox.width).toBeGreaterThanOrEqual(300);
-  await page
-    .getByTestId("home-inbox-list")
-    .click({ position: { x: 24, y: 80 } });
+  const inboxList = page.getByTestId("home-inbox-list");
+  const inboxListBox = await inboxList.boundingBox();
+  if (!inboxListBox) {
+    throw new Error("Expected the home inbox list box.");
+  }
+  await inboxList.click({
+    position: { x: 24, y: inboxListBox.height - 24 },
+  });
   await expect(page.getByTestId("channel-management-sheet")).toBeVisible();
   await page.keyboard.press("Escape");
   await expect(page.getByTestId("channel-management-sheet")).toBeVisible();
@@ -2753,6 +2776,21 @@ test("channel header omits the add agent action", async ({ page }) => {
   await expect(page.getByTestId("channel-members-trigger")).toBeVisible();
   await expect(page.getByTestId("channel-start-huddle-trigger")).toBeVisible();
   await expect(page.getByTestId("channel-management-trigger")).toBeVisible();
+});
+
+test("channel header actions show tooltips", async ({ page }) => {
+  await page.goto("/");
+  await page.getByTestId("channel-random").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("random");
+
+  for (const [testId, label] of [
+    ["channel-members-trigger", "Channel members"],
+    ["channel-huddle-tooltip-trigger", "Huddle"],
+    ["channel-management-trigger", "Channel settings"],
+  ] as const) {
+    await page.getByTestId(testId).hover();
+    await expect(page.getByRole("tooltip", { name: label })).toBeVisible();
+  }
 });
 
 test("members sidebar collapses same-persona managed agents", async ({
