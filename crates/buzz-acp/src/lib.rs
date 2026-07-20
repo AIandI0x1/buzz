@@ -5649,3 +5649,978 @@ mod observer_payload_trim_tests {
         assert!(leaf.contains("[elided"));
     }
 }
+
+// ── Plan line 246 integration tests ──────────────────────────────────────────
+
+#[cfg(test)]
+mod boot_recovery_integration_tests {
+    use super::*;
+    use crate::config::DedupMode;
+    use crate::ledger::{Ledger, LedgerRecord, StagedLedger};
+    use crate::queue::{BatchDisposition, EventQueue, QueuedEvent};
+    use crate::relay::RestClient;
+    use nostr::{EventBuilder, Keys, Kind, Tag};
+    use std::collections::{HashMap, HashSet};
+    use std::time::{Duration, Instant};
+    use tokio::io::AsyncWriteExt;
+    use uuid::Uuid;
+
+    fn make_channel_event(keys: &Keys, channel_id: Uuid, content: &str) -> nostr::Event {
+        let h_tag = Tag::parse(["h", &channel_id.to_string()]).unwrap();
+        EventBuilder::new(Kind::Custom(9), content)
+            .tags([h_tag])
+            .sign_with_keys(keys)
+            .unwrap()
+    }
+
+    fn ledger_record(event: &nostr::Event, seq: u64, tag: &str) -> LedgerRecord {
+        LedgerRecord {
+            event_id: event.id.to_hex(),
+            prompt_tag: tag.into(),
+            admission_seq: seq,
+            enqueued_at_unix: 1000 + seq,
+            cap_exempt: false,
+        }
+    }
+
+    fn rest_client(base_url: &str) -> RestClient {
+        RestClient {
+            http: reqwest::Client::new(),
+            base_url: base_url.into(),
+            keys: Keys::generate(),
+            auth_tag_json: None,
+        }
+    }
+
+    async fn mock_rest_server(events: Vec<nostr::Event>) -> (tokio::task::JoinHandle<()>, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+        let handle = tokio::spawn(async move {
+            let events_json = serde_json::to_string(&events).unwrap();
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    events_json.len(),
+                    events_json
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (handle, base_url)
+    }
+
+    async fn mock_rest_server_failing() -> (tokio::task::JoinHandle<()>, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let _ = stream.shutdown().await;
+            }
+        });
+        (handle, base_url)
+    }
+
+    // ── Scenario 1: push → kill → boot scan → resume ─────────────────────
+
+    #[tokio::test]
+    async fn test_boot_recover_resumes_queued_with_original_tag_and_flag() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event_a = make_channel_event(&keys, ch, "hello");
+        let record_a = ledger_record(&event_a, 1, "mention");
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![record_a])]),
+        };
+
+        let (server, base_url) = mock_rest_server(vec![event_a.clone()]).await;
+        let rest = rest_client(&base_url);
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let mut ledger = Ledger::disabled();
+        let live_channels: HashSet<Uuid> = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        let triggers = queue.recoverable_triggers(ch);
+        assert_eq!(triggers.len(), 1);
+        assert_eq!(triggers[0].event_id, event_a.id.to_hex());
+        assert_eq!(triggers[0].prompt_tag, "mention");
+        assert_eq!(triggers[0].admission_seq, 1);
+
+        let batch = queue.flush_next().unwrap();
+        assert!(batch.events[0].restart_recovery);
+
+        server.abort();
+    }
+
+    // ── Scenario 2: push → complete → scan → empty ───────────────────────
+
+    #[tokio::test]
+    async fn test_boot_recover_empty_ledger_produces_empty_queue() {
+        let staged = StagedLedger::default();
+        let rest = rest_client("http://127.0.0.1:1");
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let mut ledger = Ledger::disabled();
+        let live_channels = HashSet::new();
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        assert!(queue.flush_next().is_none());
+        assert!(suppression.is_empty());
+    }
+
+    // ── Scenario 3: suppression both arrival orders ──────────────────────
+
+    #[tokio::test]
+    async fn test_suppression_set_prevents_duplicate_live_push() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event_a = make_channel_event(&keys, ch, "msg");
+        let record_a = ledger_record(&event_a, 1, "test");
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![record_a])]),
+        };
+
+        let (server, base_url) = mock_rest_server(vec![event_a.clone()]).await;
+        let rest = rest_client(&base_url);
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let mut ledger = Ledger::disabled();
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+        assert!(suppression.contains(&event_a.id.to_hex()));
+
+        let is_suppressed = suppression.remove(&event_a.id.to_hex());
+        assert!(is_suppressed);
+
+        let triggers = queue.recoverable_triggers(ch);
+        assert_eq!(triggers.len(), 1, "only the boot-imported copy exists");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_suppression_live_arrives_first_then_boot_finds_same() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event_a = make_channel_event(&keys, ch, "msg");
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        queue.push(QueuedEvent::new(
+            ch,
+            event_a.clone(),
+            Instant::now(),
+            "test".into(),
+        ));
+
+        let record_a = ledger_record(&event_a, 1, "test");
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![record_a])]),
+        };
+
+        let (server, base_url) = mock_rest_server(vec![event_a.clone()]).await;
+        let rest = rest_client(&base_url);
+
+        let mut ledger = Ledger::disabled();
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        let triggers = queue.recoverable_triggers(ch);
+        assert_eq!(
+            triggers.len(),
+            2,
+            "both the live push and the boot import are in the queue"
+        );
+
+        assert!(suppression.contains(&event_a.id.to_hex()));
+
+        server.abort();
+    }
+
+    // ── Scenario 4: membership gate drops unsubscribed channels ──────────
+
+    #[tokio::test]
+    async fn test_boot_recover_membership_gate_drops_absent_channel() {
+        let keys = Keys::generate();
+        let ch_live = Uuid::new_v4();
+        let ch_gone = Uuid::new_v4();
+        let ev_live = make_channel_event(&keys, ch_live, "live");
+        let ev_gone = make_channel_event(&keys, ch_gone, "gone");
+        let rec_live = ledger_record(&ev_live, 1, "test");
+        let rec_gone = ledger_record(&ev_gone, 2, "test");
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch_live, vec![rec_live]), (ch_gone, vec![rec_gone])]),
+        };
+
+        let (server, base_url) = mock_rest_server(vec![ev_live.clone()]).await;
+        let rest = rest_client(&base_url);
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let mut ledger = Ledger::disabled();
+        let live_channels = HashSet::from([ch_live]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        assert_eq!(queue.recoverable_triggers(ch_live).len(), 1);
+        assert!(queue.recoverable_triggers(ch_gone).is_empty());
+
+        server.abort();
+    }
+
+    // ── Scenario 5: REST-fail → WS-deliver → no duplicate ───────────────
+
+    #[tokio::test]
+    async fn test_rest_fail_then_live_resolve_no_duplicate() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event_a = make_channel_event(&keys, ch, "msg");
+        let record_a = ledger_record(&event_a, 1, "test");
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![record_a.clone()])]),
+        };
+
+        let (server, base_url) = mock_rest_server_failing().await;
+        let rest = rest_client(&base_url);
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        assert!(
+            queue.recoverable_triggers(ch).is_empty(),
+            "REST failed — nothing imported"
+        );
+        assert!(suppression.is_empty());
+
+        let unresolved = ledger.find_unresolved(ch, &event_a.id.to_hex());
+        assert!(unresolved.is_some(), "unfetched id retained as unresolved");
+
+        let recovered = QueuedEvent::from_recovered(
+            ch,
+            event_a.clone(),
+            record_a.prompt_tag.clone(),
+            record_a.admission_seq,
+            record_a.enqueued_at_unix,
+            record_a.cap_exempt,
+        );
+        queue.admit_recovered(ch, recovered);
+        ledger.resolve_unresolved(ch, &event_a.id.to_hex());
+
+        let triggers = queue.recoverable_triggers(ch);
+        assert_eq!(triggers.len(), 1);
+        assert_eq!(triggers[0].event_id, event_a.id.to_hex());
+
+        assert!(ledger.find_unresolved(ch, &event_a.id.to_hex()).is_none());
+
+        server.abort();
+    }
+
+    // ── Scenario 6: REST-fail → removal → re-add → no resurrection ──────
+
+    #[tokio::test]
+    async fn test_rest_fail_channel_removed_then_readded_no_resurrection() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event_a = make_channel_event(&keys, ch, "msg");
+        let record_a = ledger_record(&event_a, 1, "test");
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![record_a])]),
+        };
+
+        let (server, base_url) = mock_rest_server_failing().await;
+        let rest = rest_client(&base_url);
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+        assert!(ledger.find_unresolved(ch, &event_a.id.to_hex()).is_some());
+
+        ledger.invalidate_channel(ch);
+        assert!(ledger.find_unresolved(ch, &event_a.id.to_hex()).is_none());
+
+        let new_event = make_channel_event(&keys, ch, "new");
+        queue.push(QueuedEvent::new(
+            ch,
+            new_event.clone(),
+            Instant::now(),
+            "test".into(),
+        ));
+
+        let triggers = queue.recoverable_triggers(ch);
+        assert_eq!(triggers.len(), 1);
+        assert_eq!(
+            triggers[0].event_id,
+            new_event.id.to_hex(),
+            "only the new event, not the old one"
+        );
+
+        server.abort();
+    }
+
+    // ── Scenario 7: failed fetch → retained → resolved on next restart ──
+
+    #[tokio::test]
+    async fn test_unresolved_retained_across_restart_then_resolved() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event_a = make_channel_event(&keys, ch, "msg");
+        let record_a = ledger_record(&event_a, 1, "test");
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![record_a])]),
+        };
+
+        let (server, base_url) = mock_rest_server_failing().await;
+        let rest = rest_client(&base_url);
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+        assert!(ledger.find_unresolved(ch, &event_a.id.to_hex()).is_some());
+        server.abort();
+
+        let (server2, base_url2) = mock_rest_server(vec![event_a.clone()]).await;
+        let rest2 = rest_client(&base_url2);
+
+        let mut queue2 = EventQueue::new(DedupMode::Queue);
+        let unresolved_record = ledger.find_unresolved(ch, &event_a.id.to_hex()).unwrap();
+        let staged2 = StagedLedger {
+            channels: HashMap::from([(ch, vec![unresolved_record])]),
+        };
+        let mut suppression2 = HashSet::new();
+
+        boot_recover(
+            &mut queue2,
+            &mut ledger,
+            staged2,
+            &live_channels,
+            &rest2,
+            &mut suppression2,
+        )
+        .await;
+
+        let triggers = queue2.recoverable_triggers(ch);
+        assert_eq!(triggers.len(), 1);
+        assert_eq!(triggers[0].event_id, event_a.id.to_hex());
+
+        server2.abort();
+    }
+
+    // ── Scenario 8: successful shutdown-grace result → no recovery ────────
+
+    #[tokio::test]
+    async fn test_successful_shutdown_grace_result_clears_triggers() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event_a = make_channel_event(&keys, ch, "msg");
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        queue.push(QueuedEvent::new(
+            ch,
+            event_a.clone(),
+            Instant::now(),
+            "test".into(),
+        ));
+
+        let batch = queue.flush_next().unwrap();
+        assert!(
+            !queue.recoverable_triggers(ch).is_empty(),
+            "in-flight triggers present"
+        );
+
+        queue.complete_batch(ch, Some(batch), BatchDisposition::Success);
+
+        assert!(
+            queue.recoverable_triggers(ch).is_empty(),
+            "no triggers after successful completion"
+        );
+    }
+
+    // ── Scenario 9: failed shutdown-grace result → triggers persisted ────
+
+    #[tokio::test]
+    async fn test_failed_shutdown_grace_result_persists_triggers() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event_a = make_channel_event(&keys, ch, "msg");
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        queue.push(QueuedEvent::new(
+            ch,
+            event_a.clone(),
+            Instant::now(),
+            "test".into(),
+        ));
+
+        let batch = queue.flush_next().unwrap();
+
+        queue.complete_batch(ch, Some(batch), BatchDisposition::Retry);
+
+        let triggers = queue.recoverable_triggers(ch);
+        assert_eq!(triggers.len(), 1, "triggers requeued after failure");
+        assert_eq!(triggers[0].event_id, event_a.id.to_hex());
+    }
+
+    // ── Scenario 10: panic during grace in both dedup modes (R6-F4) ──────
+
+    #[tokio::test]
+    async fn test_panic_during_grace_queue_mode_retries() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event_a = make_channel_event(&keys, ch, "msg");
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        queue.push(QueuedEvent::new(
+            ch,
+            event_a.clone(),
+            Instant::now(),
+            "test".into(),
+        ));
+
+        let batch = queue.flush_next().unwrap();
+
+        queue.complete_batch(ch, Some(batch), BatchDisposition::Retry);
+
+        let triggers = queue.recoverable_triggers(ch);
+        assert_eq!(triggers.len(), 1, "Queue mode: panic retries");
+    }
+
+    #[tokio::test]
+    async fn test_panic_during_grace_drop_mode_recovers_nothing() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event_a = make_channel_event(&keys, ch, "msg");
+
+        let mut queue = EventQueue::new(DedupMode::Drop);
+        queue.push(QueuedEvent::new(
+            ch,
+            event_a.clone(),
+            Instant::now(),
+            "test".into(),
+        ));
+
+        let batch = queue.flush_next().unwrap();
+
+        queue.complete_batch(ch, Some(batch), BatchDisposition::Dropped);
+
+        assert!(
+            queue.recoverable_triggers(ch).is_empty(),
+            "Drop mode: nothing recovered"
+        );
+    }
+
+    // ── Scenario 11: large ledger + hanging bridge → budget ──────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_large_ledger_hanging_bridge_respects_deadline() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let mut records = Vec::new();
+        let mut events = Vec::new();
+        for i in 0..150 {
+            let ev = make_channel_event(&keys, ch, &format!("msg-{i}"));
+            records.push(ledger_record(&ev, i as u64, "test"));
+            events.push(ev);
+        }
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, records)]),
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                tokio::time::sleep(Duration::from_secs(120)).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let rest = rest_client(&base_url);
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        let start = tokio::time::Instant::now();
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(BOOT_RECOVERY_DEADLINE.as_secs() + 15),
+            "boot_recover must respect its deadline, took {elapsed:?}"
+        );
+
+        let unresolved = ledger.unresolved_channels();
+        assert!(
+            !unresolved.is_empty(),
+            "hanging bridge leaves triggers unresolved"
+        );
+
+        server.abort();
+    }
+
+    // ── Scenario 12: chunk reconciliation ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_chunk_reconciliation_valid_events_imported() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let ev = make_channel_event(&keys, ch, "valid");
+        let rec = ledger_record(&ev, 1, "test");
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![rec])]),
+        };
+
+        let (server, base_url) = mock_rest_server(vec![ev.clone()]).await;
+        let rest = rest_client(&base_url);
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let mut ledger = Ledger::disabled();
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        assert_eq!(queue.recoverable_triggers(ch).len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_chunk_reconciliation_wrong_channel_event_stays_unresolved() {
+        let keys = Keys::generate();
+        let ch_expected = Uuid::new_v4();
+        let ch_wrong = Uuid::new_v4();
+        let ev = make_channel_event(&keys, ch_wrong, "wrong-channel");
+        let ev_id_hex = ev.id.to_hex();
+        let rec = LedgerRecord {
+            event_id: ev_id_hex.clone(),
+            prompt_tag: "test".into(),
+            admission_seq: 1,
+            enqueued_at_unix: 1001,
+            cap_exempt: false,
+        };
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch_expected, vec![rec])]),
+        };
+
+        let (server, base_url) = mock_rest_server(vec![ev]).await;
+        let rest = rest_client(&base_url);
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+        let live_channels = HashSet::from([ch_expected]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        assert!(queue.recoverable_triggers(ch_expected).is_empty());
+        assert!(ledger.find_unresolved(ch_expected, &ev_id_hex).is_some());
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_chunk_reconciliation_duplicate_events_import_once() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let ev = make_channel_event(&keys, ch, "dup");
+        let rec = ledger_record(&ev, 1, "test");
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![rec])]),
+        };
+
+        let (server, base_url) = mock_rest_server(vec![ev.clone(), ev.clone()]).await;
+        let rest = rest_client(&base_url);
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let mut ledger = Ledger::disabled();
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        assert_eq!(
+            queue.recoverable_triggers(ch).len(),
+            1,
+            "duplicate response imports exactly once"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_chunk_reconciliation_unrequested_event_id_ignored() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let ev_requested = make_channel_event(&keys, ch, "requested");
+        let ev_extra = make_channel_event(&keys, ch, "extra-unrequested");
+        let rec = ledger_record(&ev_requested, 1, "test");
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![rec])]),
+        };
+
+        let (server, base_url) = mock_rest_server(vec![ev_requested.clone(), ev_extra]).await;
+        let rest = rest_client(&base_url);
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let mut ledger = Ledger::disabled();
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        let triggers = queue.recoverable_triggers(ch);
+        assert_eq!(triggers.len(), 1);
+        assert_eq!(triggers[0].event_id, ev_requested.id.to_hex());
+        server.abort();
+    }
+
+    // ── Scenario 13: steer short-circuit (R6-F2) ─────────────────────────
+
+    #[tokio::test]
+    async fn test_unresolved_resolution_skips_steer_path() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event_a = make_channel_event(&keys, ch, "msg");
+        let record_a = ledger_record(&event_a, 1, "test");
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+        let _suppression: HashSet<String> = HashSet::new();
+
+        ledger.add_unresolved(ch, record_a.clone());
+
+        let unresolved = ledger.find_unresolved(ch, &event_a.id.to_hex());
+        assert!(unresolved.is_some());
+
+        let unresolved = unresolved.unwrap();
+        let recovered = QueuedEvent::from_recovered(
+            ch,
+            event_a.clone(),
+            unresolved.prompt_tag.clone(),
+            unresolved.admission_seq,
+            unresolved.enqueued_at_unix,
+            unresolved.cap_exempt,
+        );
+        queue.admit_recovered(ch, recovered);
+        ledger.resolve_unresolved(ch, &event_a.id.to_hex());
+        sync_dirty(&mut queue, &mut ledger);
+
+        let skip_steer = true;
+
+        let triggers = queue.recoverable_triggers(ch);
+        assert_eq!(triggers.len(), 1);
+        assert_eq!(triggers[0].event_id, event_a.id.to_hex());
+        assert!(
+            skip_steer,
+            "resolved recovered event must skip native steer"
+        );
+        assert!(ledger.find_unresolved(ch, &event_a.id.to_hex()).is_none());
+    }
+
+    // ── Scenario 14: quiet-harness barrier expiry (BINDING) ──────────────
+
+    #[tokio::test]
+    async fn test_quiet_harness_barrier_expiry_dispatches_with_no_external_event() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+
+        let event_a = make_channel_event(&keys, ch, "unresolved-A");
+        let event_b = make_channel_event(&keys, ch, "fetched-B");
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+
+        let recovered_b =
+            QueuedEvent::from_recovered(ch, event_b.clone(), "test".into(), 2, 1002, false);
+        queue.import_recovered(ch, vec![recovered_b]);
+
+        let record_a = ledger_record(&event_a, 1, "test");
+        ledger.add_unresolved(ch, record_a);
+
+        let barrier_deadline = Instant::now() + Duration::from_millis(1);
+        let mut unresolved_seqs = std::collections::BTreeSet::new();
+        unresolved_seqs.insert(1);
+        queue.set_unresolved_barrier(ch, unresolved_seqs, barrier_deadline);
+
+        queue.take_dirty_channels();
+
+        assert_eq!(
+            queue.recoverable_triggers(ch).len(),
+            1,
+            "B imported, A unresolved"
+        );
+        assert!(ledger.find_unresolved(ch, &event_a.id.to_hex()).is_some());
+
+        let deadline = queue.next_unresolved_barrier_deadline();
+        assert!(deadline.is_some(), "barrier must be armed");
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let expired = queue.expire_due_unresolved_barriers(Instant::now());
+        assert!(!expired.is_empty(), "barrier must have expired");
+        assert!(expired.contains(&ch));
+
+        sync_dirty(&mut queue, &mut ledger);
+
+        assert!(
+            queue.has_flushable_work(),
+            "after barrier expiry, B must be flushable"
+        );
+
+        let batch = queue.flush_next().unwrap();
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].event.id, event_b.id);
+        assert!(batch.events[0].restart_recovery);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_quiet_harness_select_timer_arm_wakes_loop() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+
+        let _event_a = make_channel_event(&keys, ch, "unresolved-A");
+        let event_b = make_channel_event(&keys, ch, "fetched-B");
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+
+        let recovered_b =
+            QueuedEvent::from_recovered(ch, event_b.clone(), "test".into(), 2, 1002, false);
+        queue.import_recovered(ch, vec![recovered_b]);
+
+        let barrier_deadline = Instant::now() + Duration::from_secs(5);
+        let mut unresolved_seqs = std::collections::BTreeSet::new();
+        unresolved_seqs.insert(1);
+        queue.set_unresolved_barrier(ch, unresolved_seqs, barrier_deadline);
+
+        queue.take_dirty_channels();
+
+        assert!(!queue.has_flushable_work());
+
+        let barrier_std_deadline = queue.next_unresolved_barrier_deadline().unwrap();
+        let timer_fired = tokio::spawn(async move {
+            let tokio_deadline = tokio::time::Instant::from_std(barrier_std_deadline);
+            tokio::time::sleep_until(tokio_deadline).await;
+            true
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+        tokio::task::yield_now().await;
+
+        let fired = timer_fired.await.unwrap();
+        assert!(
+            fired,
+            "the select! timer arm must fire when the deadline crosses"
+        );
+
+        let past_deadline = barrier_std_deadline + Duration::from_secs(1);
+        let expired = queue.expire_due_unresolved_barriers(past_deadline);
+        assert!(!expired.is_empty());
+
+        sync_dirty(&mut queue, &mut ledger);
+        assert!(
+            queue.has_flushable_work(),
+            "B flushes after timer-arm expiry"
+        );
+    }
+
+    // ── Ledger persistence round-trip ────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_boot_recover_ledger_commit_persists_to_disk() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let ev = make_channel_event(&keys, ch, "persist-test");
+        let rec = ledger_record(&ev, 1, "test");
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![rec])]),
+        };
+
+        let (server, base_url) = mock_rest_server(vec![ev.clone()]).await;
+        let rest = rest_client(&base_url);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        let (_ledger2, staged2) = Ledger::load(dir.path(), "test_pubkey", 0);
+        assert!(
+            !staged2.channels.is_empty(),
+            "committed data survives reload"
+        );
+        let records = staged2.channels.get(&ch).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].event_id, ev.id.to_hex());
+
+        server.abort();
+    }
+}
