@@ -213,6 +213,19 @@ impl Ledger {
             .unwrap_or_default()
     }
 
+    /// Look up an unresolved record by event id, without consuming it.
+    /// Read-only — the caller must call [`Ledger::resolve_unresolved`]
+    /// only *after* handing the returned record's event to the queue
+    /// (e.g. via `EventQueue::admit_recovered`), preserving the
+    /// consume-after-ownership ordering documented there.
+    pub fn find_unresolved(&self, channel_id: Uuid, event_id: &str) -> Option<LedgerRecord> {
+        self.unresolved
+            .get(&channel_id)?
+            .iter()
+            .find(|r| r.event_id == event_id)
+            .cloned()
+    }
+
     /// Consume an unresolved record by event id — call **only** after the
     /// event has been admitted into the queue's ownership (e.g. via
     /// `EventQueue::admit_recovered`), so there is never a window where
