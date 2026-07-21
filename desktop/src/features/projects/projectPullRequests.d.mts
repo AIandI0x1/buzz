@@ -50,6 +50,14 @@ export type ProjectPullRequestChangeRequest = {
   reviewDecision: "changes-requested";
 };
 
+export type ProjectConversationLink = {
+  id: string;
+  channelId: string;
+  messageId: string;
+  threadRootId: string | null;
+  createdAt: number;
+};
+
 export const PR_REVIEW_REQUEST_LABEL: string;
 export const PR_APPROVAL_LABEL: string;
 export const PR_CHANGES_REQUESTED_LABEL: string;
@@ -93,6 +101,7 @@ export type ProjectPullRequest = {
   updatedAt: number;
   updates: ProjectPullRequestUpdate[];
   comments: ProjectPullRequestComment[];
+  conversationLinks: ProjectConversationLink[];
 };
 
 export function eventToProjectPullRequest(
@@ -100,6 +109,7 @@ export function eventToProjectPullRequest(
   updateEvents?: RelayEvent[],
   commentEvents?: RelayEvent[],
   statusEvents?: RelayEvent[],
+  activityLinkEvents?: RelayEvent[],
 ): ProjectPullRequest;
 export function nextProjectPullRequestStatusCreatedAt(
   pullRequest: Pick<ProjectPullRequest, "statusCreatedAt">,
@@ -139,4 +149,5 @@ export function projectPullRequestEventsToPullRequests(
   updateEvents?: RelayEvent[],
   commentEvents?: RelayEvent[],
   statusEvents?: RelayEvent[],
+  activityLinkEvents?: RelayEvent[],
 ): ProjectPullRequest[];

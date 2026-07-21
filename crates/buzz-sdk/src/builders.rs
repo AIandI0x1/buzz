@@ -11,8 +11,8 @@ use buzz_core::{
         KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT, KIND_GIT_STATUS_MERGED,
         KIND_GIT_STATUS_OPEN, KIND_IA_ARCHIVE_REQUEST, KIND_IA_UNARCHIVE_REQUEST,
         KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT,
-        KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE, KIND_WORKFLOW_DEF,
-        KIND_WORKFLOW_TRIGGER,
+        KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE,
+        KIND_PROJECT_ACTIVITY_LINK, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
     },
     observer::{
         content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -1368,6 +1368,37 @@ pub fn build_git_pull_request(
     }
 
     Ok(EventBuilder::new(Kind::Custom(KIND_GIT_PULL_REQUEST as u16), content).tags(tags))
+}
+
+/// Build a channel-scoped provenance event connecting a project artifact to
+/// the conversation that caused it.
+///
+/// The artifact and source are referenced with marked `e` tags. Keeping this
+/// relation in the source channel, rather than on the global artifact event,
+/// prevents private channel identifiers from leaking through public projects.
+pub fn build_project_activity_link(
+    channel_id: Uuid,
+    repo: &GitRepoCoord,
+    artifact_event_id: &str,
+    source_event_id: &str,
+    source_thread_root_id: Option<&str>,
+) -> Result<EventBuilder, SdkError> {
+    let artifact = check_hex_exact(artifact_event_id, 64, "artifact_event_id")?;
+    let source = check_hex_exact(source_event_id, 64, "source_event_id")?;
+    let repo_address = repo.to_a_tag_value()?;
+    let mut tags = vec![
+        tag(&["h", &channel_id.to_string()])?,
+        tag(&["a", &repo_address])?,
+        tag(&["artifact", "pull-request"])?,
+        tag(&["e", &artifact, "", "artifact"])?,
+        tag(&["e", &source, "", "source"])?,
+    ];
+    if let Some(root) = source_thread_root_id {
+        let root = check_hex_exact(root, 64, "source_thread_root_id")?;
+        tags.push(tag(&["e", &root, "", "root"])?);
+    }
+
+    Ok(EventBuilder::new(Kind::Custom(KIND_PROJECT_ACTIVITY_LINK as u16), "").tags(tags))
 }
 
 /// Metadata for a git pull-request update event (kind:1619, NIP-34). A PR
@@ -3366,6 +3397,34 @@ mod tests {
             full_clone_tag(&ev),
             vec!["https://example.com/repo.git".to_string()]
         );
+    }
+
+    #[test]
+    fn project_activity_link_is_channel_scoped_and_marks_both_events() {
+        let channel_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let artifact = "b".repeat(64);
+        let source = "c".repeat(64);
+        let root = "d".repeat(64);
+        let ev = sign(
+            build_project_activity_link(channel_id, &pr_repo(), &artifact, &source, Some(&root))
+                .unwrap(),
+        );
+
+        assert_eq!(ev.kind.as_u16(), KIND_PROJECT_ACTIVITY_LINK as u16);
+        assert!(has_tag(&ev, "h", &channel_id.to_string()));
+        assert!(has_tag(&ev, "a", &format!("30617:{}:repo", "a".repeat(64))));
+        assert!(ev
+            .tags
+            .iter()
+            .any(|tag| tag.as_slice() == ["e", artifact.as_str(), "", "artifact"]));
+        assert!(ev
+            .tags
+            .iter()
+            .any(|tag| tag.as_slice() == ["e", source.as_str(), "", "source"]));
+        assert!(ev
+            .tags
+            .iter()
+            .any(|tag| tag.as_slice() == ["e", root.as_str(), "", "root"]));
     }
 
     #[test]

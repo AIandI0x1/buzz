@@ -41,6 +41,71 @@ test("reads source and target branches from the pull request", () => {
   assert.equal(pullRequest.targetBranch, "release");
 });
 
+test("reads trusted channel conversation links for the pull request", () => {
+  const source = "1".repeat(64);
+  const root = "2".repeat(64);
+  const link = {
+    id: "3".repeat(64),
+    kind: 40009,
+    pubkey: AUTHOR,
+    created_at: 110,
+    content: "",
+    tags: [
+      ["h", "11111111-1111-1111-1111-111111111111"],
+      ["a", REPO_ADDRESS],
+      ["artifact", "pull-request"],
+      ["e", "f".repeat(64), "", "artifact"],
+      ["e", source, "", "source"],
+      ["e", root, "", "root"],
+    ],
+  };
+
+  const pullRequest = eventToProjectPullRequest(
+    pullRequestEvent(),
+    [],
+    [],
+    [],
+    [link, { ...link, id: "4".repeat(64), created_at: 120 }],
+  );
+
+  assert.deepEqual(pullRequest.conversationLinks, [
+    {
+      id: "3".repeat(64),
+      channelId: "11111111-1111-1111-1111-111111111111",
+      messageId: source,
+      threadRootId: root,
+      createdAt: 110,
+    },
+  ]);
+});
+
+test("ignores project conversation links from anyone except the PR author", () => {
+  const link = {
+    id: "3".repeat(64),
+    kind: 40009,
+    pubkey: ATTACKER,
+    created_at: 110,
+    content: "",
+    tags: [
+      ["h", "11111111-1111-1111-1111-111111111111"],
+      ["a", REPO_ADDRESS],
+      ["artifact", "pull-request"],
+      ["e", "f".repeat(64), "", "artifact"],
+      ["e", "1".repeat(64), "", "source"],
+    ],
+  };
+
+  const pullRequest = eventToProjectPullRequest(
+    pullRequestEvent(),
+    [],
+    [],
+    [],
+    [link],
+  );
+
+  assert.deepEqual(pullRequest.conversationLinks, []);
+});
+
 function updateEvent({ pubkey, createdAt, commit, cloneUrl }) {
   return {
     id: `update-${pubkey.slice(0, 8)}-${createdAt}`,

@@ -33,6 +33,7 @@ import {
   KIND_GIT_STATUS_MERGED,
   KIND_GIT_STATUS_OPEN,
   KIND_HUDDLE_STARTED,
+  KIND_PROJECT_ACTIVITY_LINK,
   KIND_MEMBER_ADDED_NOTIFICATION,
   KIND_MEMBER_REMOVED_NOTIFICATION,
   KIND_REPO_ANNOUNCEMENT,
@@ -4740,6 +4741,7 @@ const MOCK_PROJECT_KINDS = new Set<number>([
   KIND_GIT_STATUS_MERGED,
   KIND_GIT_STATUS_CLOSED,
   KIND_GIT_STATUS_DRAFT,
+  KIND_PROJECT_ACTIVITY_LINK,
 ]);
 
 function mulberry32(seed: number) {
@@ -4880,7 +4882,31 @@ function buildMockProjectEvents(): RelayEvent[] {
             : []),
         ];
 
-        events.push(createMockEvent(kind, subject, tags, author, createdAt));
+        const projectEvent = createMockEvent(
+          kind,
+          subject,
+          tags,
+          author,
+          createdAt,
+        );
+        events.push(projectEvent);
+        if (projectIndex === 0 && kind === KIND_GIT_PULL_REQUEST) {
+          events.push(
+            createMockEvent(
+              KIND_PROJECT_ACTIVITY_LINK,
+              "",
+              [
+                ["h", "1c7e1c02-87bb-5e88-b2da-5a7a9432d0c9"],
+                ["a", repoAddress],
+                ["artifact", "pull-request"],
+                ["e", projectEvent.id, "", "artifact"],
+                ["e", "mock-engineering-shipped", "", "source"],
+              ],
+              author,
+              createdAt + 1,
+            ),
+          );
+        }
       }
     }
   }

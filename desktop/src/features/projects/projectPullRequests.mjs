@@ -43,6 +43,47 @@ function eventsForPullRequest(pullRequestId, events) {
     .sort((left, right) => left.created_at - right.created_at);
 }
 
+function markedEventId(event, marker) {
+  return (
+    event.tags.find(
+      (tag) => tag[0] === "e" && tag[3] === marker && tag[1],
+    )?.[1] ?? null
+  );
+}
+
+function conversationLinksForPullRequest(pullRequest, activityLinkEvents) {
+  const links = new Map();
+  for (const event of activityLinkEvents) {
+    if (
+      event.pubkey.toLowerCase() !== pullRequest.pubkey.toLowerCase() ||
+      getTag(event, "a") !== getTag(pullRequest, "a") ||
+      getTag(event, "artifact") !== "pull-request" ||
+      markedEventId(event, "artifact") !== pullRequest.id
+    ) {
+      continue;
+    }
+    const channelId = getTag(event, "h");
+    const messageId = markedEventId(event, "source");
+    const threadRootId = markedEventId(event, "root");
+    if (!channelId || !messageId) continue;
+    const key = `${channelId}:${threadRootId ?? messageId}`;
+    const existing = links.get(key);
+    if (!existing || event.created_at < existing.createdAt) {
+      links.set(key, {
+        id: event.id,
+        channelId,
+        messageId,
+        threadRootId,
+        createdAt: event.created_at,
+      });
+    }
+  }
+  return [...links.values()].sort(
+    (left, right) =>
+      left.createdAt - right.createdAt || left.id.localeCompare(right.id),
+  );
+}
+
 function getCloneUrls(event) {
   return event.tags
     .filter((tag) => tag[0] === "clone")
@@ -299,6 +340,7 @@ export function eventToProjectPullRequest(
   updateEvents = [],
   commentEvents = [],
   statusEvents = [],
+  activityLinkEvents = [],
 ) {
   const latestUpdate = latestUpdateForPullRequest(pullRequest, updateEvents);
   const latestStatus = latestStatusForPullRequest(pullRequest, statusEvents);
@@ -385,6 +427,10 @@ export function eventToProjectPullRequest(
       pullRequest.created_at,
     updates,
     comments,
+    conversationLinks: conversationLinksForPullRequest(
+      pullRequest,
+      activityLinkEvents,
+    ),
   };
 }
 
@@ -393,6 +439,7 @@ export function projectPullRequestEventsToPullRequests(
   updateEvents = [],
   commentEvents = [],
   statusEvents = [],
+  activityLinkEvents = [],
 ) {
   return [...pullRequestEvents]
     .map((pullRequest) =>
@@ -401,6 +448,7 @@ export function projectPullRequestEventsToPullRequests(
         updateEvents,
         commentEvents,
         statusEvents,
+        activityLinkEvents,
       ),
     )
     .sort((left, right) => right.updatedAt - left.updatedAt);

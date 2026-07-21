@@ -28,12 +28,13 @@ use buzz_core::kind::{
     KIND_NIP29_EDIT_METADATA, KIND_NIP29_JOIN_REQUEST, KIND_NIP29_LEAVE_REQUEST,
     KIND_NIP29_PUT_USER, KIND_NIP29_REMOVE_USER, KIND_NIP43_LEAVE_REQUEST,
     KIND_NIP65_RELAY_LIST_METADATA, KIND_PERSONA, KIND_PIN_LIST, KIND_PRESENCE_UPDATE,
-    KIND_PRODUCT_FEEDBACK, KIND_PROFILE, KIND_REACTION, KIND_READ_STATE, KIND_REPORT,
-    KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_BOOKMARKED, KIND_STREAM_MESSAGE_DIFF,
-    KIND_STREAM_MESSAGE_EDIT, KIND_STREAM_MESSAGE_PINNED, KIND_STREAM_MESSAGE_SCHEDULED,
-    KIND_STREAM_MESSAGE_V2, KIND_STREAM_REMINDER, KIND_TEAM, KIND_TEXT_NOTE, KIND_USER_STATUS,
-    KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER, RELAY_ADMIN_ADD_MEMBER, RELAY_ADMIN_CHANGE_ROLE,
-    RELAY_ADMIN_REMOVE_MEMBER, RELAY_ADMIN_SET_WORKSPACE_PROFILE,
+    KIND_PRODUCT_FEEDBACK, KIND_PROFILE, KIND_PROJECT_ACTIVITY_LINK, KIND_REACTION,
+    KIND_READ_STATE, KIND_REPORT, KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_BOOKMARKED,
+    KIND_STREAM_MESSAGE_DIFF, KIND_STREAM_MESSAGE_EDIT, KIND_STREAM_MESSAGE_PINNED,
+    KIND_STREAM_MESSAGE_SCHEDULED, KIND_STREAM_MESSAGE_V2, KIND_STREAM_REMINDER, KIND_TEAM,
+    KIND_TEXT_NOTE, KIND_USER_STATUS, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
+    RELAY_ADMIN_ADD_MEMBER, RELAY_ADMIN_CHANGE_ROLE, RELAY_ADMIN_REMOVE_MEMBER,
+    RELAY_ADMIN_SET_WORKSPACE_PROFILE,
 };
 use buzz_core::tenant::TenantContext;
 use buzz_core::verification::verify_event;
@@ -224,6 +225,7 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         | KIND_STREAM_MESSAGE_SCHEDULED
         | KIND_STREAM_REMINDER
         | KIND_STREAM_MESSAGE_DIFF
+        | KIND_PROJECT_ACTIVITY_LINK
         | KIND_FORUM_POST
         | KIND_FORUM_VOTE
         | KIND_FORUM_COMMENT => Ok(Scope::MessagesWrite),
@@ -447,6 +449,7 @@ pub(crate) fn requires_h_channel_scope(kind: u32) -> bool {
             | KIND_STREAM_MESSAGE_SCHEDULED
             | KIND_STREAM_REMINDER
             | KIND_STREAM_MESSAGE_DIFF
+            | KIND_PROJECT_ACTIVITY_LINK
             | KIND_CANVAS
             | KIND_FORUM_POST
             | KIND_FORUM_VOTE
@@ -930,6 +933,130 @@ fn validate_diff_event(event: &Event) -> Result<(), String> {
     }
     if !has_commit {
         return Err("diff event requires a commit tag".to_string());
+    }
+    Ok(())
+}
+
+/// Validate a channel-scoped project provenance relation.
+///
+/// The relation must be authored by the PR author and may only point back to
+/// events in the same channel. This prevents members from fabricating PR
+/// provenance or using the relation kind to expose private-channel metadata.
+async fn load_project_activity_event(
+    community_id: CommunityId,
+    event_id: &str,
+    state: &AppState,
+) -> Result<buzz_core::StoredEvent, String> {
+    let bytes = hex::decode(event_id).map_err(|_| "invalid event ID".to_string())?;
+    if bytes.len() != 32 {
+        return Err("invalid event ID".to_string());
+    }
+    state
+        .db
+        .get_event_by_id(community_id, &bytes)
+        .await
+        .map_err(|e| format!("db error: {e}"))?
+        .ok_or_else(|| format!("referenced event {event_id} not found"))
+}
+
+async fn validate_project_activity_link(
+    community_id: CommunityId,
+    event: &Event,
+    state: &AppState,
+) -> Result<(), String> {
+    if !event.content.is_empty() {
+        return Err("project activity link content must be empty".to_string());
+    }
+
+    let channel_id = extract_channel_id(event).ok_or_else(|| "missing h tag".to_string())?;
+    let mut repo_addresses = Vec::new();
+    let mut artifact_types = Vec::new();
+    let mut artifact_ids = Vec::new();
+    let mut source_ids = Vec::new();
+    let mut root_ids = Vec::new();
+    for tag in event.tags.iter() {
+        let parts = tag.as_slice();
+        if parts.len() < 2 {
+            continue;
+        }
+        match parts[0].as_str() {
+            "a" => repo_addresses.push(parts[1].as_str()),
+            "artifact" => artifact_types.push(parts[1].as_str()),
+            "e" if parts.get(3).map(String::as_str) == Some("artifact") => {
+                artifact_ids.push(parts[1].as_str());
+            }
+            "e" if parts.get(3).map(String::as_str) == Some("source") => {
+                source_ids.push(parts[1].as_str());
+            }
+            "e" if parts.get(3).map(String::as_str) == Some("root") => {
+                root_ids.push(parts[1].as_str());
+            }
+            _ => {}
+        }
+    }
+    if repo_addresses.len() != 1
+        || artifact_types.as_slice() != ["pull-request"]
+        || artifact_ids.len() != 1
+        || source_ids.len() != 1
+        || root_ids.len() > 1
+    {
+        return Err(
+            "requires one a tag, pull-request artifact tag, artifact e tag, source e tag, and at most one root e tag"
+                .to_string(),
+        );
+    }
+
+    let artifact = load_project_activity_event(community_id, artifact_ids[0], state).await?;
+    if event_kind_u32(&artifact.event) != KIND_GIT_PULL_REQUEST {
+        return Err("artifact must reference a pull request".to_string());
+    }
+    if artifact.event.pubkey != event.pubkey {
+        return Err(
+            "project activity link must be authored by the pull request author".to_string(),
+        );
+    }
+    let artifact_repo = artifact.event.tags.iter().find_map(|tag| {
+        let parts = tag.as_slice();
+        (parts.len() >= 2 && parts[0].as_str() == "a").then(|| parts[1].as_str())
+    });
+    if artifact_repo != Some(repo_addresses[0]) {
+        return Err("repository does not match the pull request".to_string());
+    }
+
+    let source = load_project_activity_event(community_id, source_ids[0], state).await?;
+    if source.channel_id != Some(channel_id) {
+        return Err("source event must belong to the relation channel".to_string());
+    }
+    if !matches!(
+        event_kind_u32(&source.event),
+        KIND_STREAM_MESSAGE | KIND_STREAM_MESSAGE_V2 | KIND_FORUM_POST | KIND_FORUM_COMMENT
+    ) {
+        return Err("source event must be a channel conversation message".to_string());
+    }
+    let source_root = source
+        .event
+        .tags
+        .iter()
+        .find_map(|tag| {
+            let parts = tag.as_slice();
+            (parts.len() >= 4 && parts[0].as_str() == "e" && parts[3].as_str() == "root")
+                .then(|| parts[1].as_str())
+        })
+        .or_else(|| {
+            source.event.tags.iter().find_map(|tag| {
+                let parts = tag.as_slice();
+                (parts.len() >= 4 && parts[0].as_str() == "e" && parts[3].as_str() == "reply")
+                    .then(|| parts[1].as_str())
+            })
+        });
+    if root_ids.first().copied() != source_root {
+        return Err("thread root does not match the source conversation".to_string());
+    }
+    if let Some(root_id) = root_ids.first() {
+        let root = load_project_activity_event(community_id, root_id, state).await?;
+        if root.channel_id != Some(channel_id) {
+            return Err("thread root must belong to the relation channel".to_string());
+        }
     }
     Ok(())
 }
@@ -1957,6 +2084,12 @@ async fn ingest_event_inner(
         validate_diff_event(&event).map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
     }
 
+    if kind_u32 == KIND_PROJECT_ACTIVITY_LINK {
+        validate_project_activity_link(tenant.community(), &event, state)
+            .await
+            .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+    }
+
     if kind_u32 == KIND_AGENT_ENGRAM {
         validate_engram_envelope(&event)
             .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
@@ -2561,6 +2694,7 @@ mod tests {
         for kind in [
             KIND_STREAM_MESSAGE,
             KIND_STREAM_MESSAGE_DIFF,
+            KIND_PROJECT_ACTIVITY_LINK,
             KIND_CANVAS,
             KIND_FORUM_POST,
             KIND_FORUM_VOTE,
@@ -2769,6 +2903,7 @@ mod tests {
             KIND_NIP29_LEAVE_REQUEST,
             KIND_STREAM_MESSAGE_EDIT,
             KIND_STREAM_MESSAGE_DIFF,
+            KIND_PROJECT_ACTIVITY_LINK,
             KIND_CANVAS,
             KIND_FORUM_POST,
             KIND_FORUM_VOTE,

@@ -1329,6 +1329,9 @@ pub enum PrCmd {
         /// Root patch event id this PR revises
         #[arg(long)]
         revision_of: Option<String>,
+        /// Channel message that caused this PR; records a private provenance link
+        #[arg(long)]
+        source_event: Option<String>,
     },
     /// Update a git pull request tip (NIP-34 kind:1619)
     Update {

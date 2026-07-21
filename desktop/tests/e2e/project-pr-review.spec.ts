@@ -54,6 +54,9 @@ test("PR creator/owner can toggle draft, request reviews, and approve", async ({
 
   const header = page.getByRole("heading", { level: 3 });
   await expect(header.first()).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "#engineering" }),
+  ).toBeVisible();
 
   // Owner viewing an open PR: draft toggle and both review decisions are offered.
   const convertToDraft = page.getByRole("button", {

@@ -12,6 +12,7 @@ import {
 import * as React from "react";
 import { toast } from "sonner";
 
+import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { useIsManagedAgent } from "@/features/agent-memory/hooks";
 import { ForumComposer } from "@/features/forum/ui/ForumComposer";
 import {
@@ -24,6 +25,7 @@ import { relativeTime } from "@/features/projects/lib/projectsViewHelpers";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import type { ChannelMember } from "@/shared/api/types";
+import { useChannelNavigation } from "@/shared/context/ChannelNavigationContext";
 import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
 import { Markdown } from "@/shared/ui/markdown";
 import {
@@ -363,6 +365,8 @@ export function PullRequestMetaRail({
   pullRequest: ProjectPullRequest;
 }) {
   const identityQuery = useIdentityQuery();
+  const { goChannel } = useAppNavigation();
+  const { channels } = useChannelNavigation();
   const authorProfile = profileForPubkey(pullRequest.author, profiles);
   const authorLabel = labelForPubkey(pullRequest.author, profiles);
   const targetBranch =
@@ -376,6 +380,10 @@ export function PullRequestMetaRail({
   const isManagedAgentOwner = useIsManagedAgent(project.owner) === true;
   const canRequestReview =
     Boolean(viewer) && (isAuthor || isOwner || isManagedAgentOwner);
+  const channelNames = React.useMemo(
+    () => new Map(channels.map((channel) => [channel.id, channel.name])),
+    [channels],
+  );
 
   return (
     <aside className="min-w-0 space-y-6 border-t border-border/60 p-4 xl:border-l xl:border-t-0">
@@ -426,6 +434,33 @@ export function PullRequestMetaRail({
           </p>
         </div>
       </OverviewRailSection>
+      {pullRequest.conversationLinks.length > 0 ? (
+        <OverviewRailSection title="Conversations">
+          <ul className="space-y-1.5">
+            {pullRequest.conversationLinks.map((conversation) => (
+              <li key={conversation.id}>
+                <button
+                  className="flex min-w-0 items-center gap-1.5 text-left text-xs font-medium text-primary hover:underline"
+                  onClick={() =>
+                    void goChannel(conversation.channelId, {
+                      messageId: conversation.messageId,
+                      threadRootId: conversation.threadRootId,
+                    })
+                  }
+                  type="button"
+                >
+                  <MessageSquare className="h-3.5 w-3.5 shrink-0" />
+                  <span className="truncate">
+                    {channelNames.has(conversation.channelId)
+                      ? `#${channelNames.get(conversation.channelId)}`
+                      : "Channel conversation"}
+                  </span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        </OverviewRailSection>
+      ) : null}
       <OverviewRailSection title="Activity">
         <dl className="space-y-1.5 text-xs text-muted-foreground">
           <div className="flex items-center justify-between gap-3">

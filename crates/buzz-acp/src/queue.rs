@@ -1245,7 +1245,7 @@ fn format_context_hints(
 
     // DM check comes first — a DM reply has both thread tags AND is_dm=true,
     // and the scope should be "dm" (not "thread") because the agent is in a DM.
-    if is_dm {
+    let mut context = if is_dm {
         let is_reply = thread_tags.root_event_id.is_some();
         // DM replies use thread command because /messages excludes thread replies.
         // DM non-replies use get for recent conversation.
@@ -1310,7 +1310,11 @@ fn format_context_hints(
             append_new_thread_reply_instruction(&mut s, event_id);
         }
         s
-    }
+    };
+    context.push_str(
+        "\nProject provenance: If this request leads you to open a pull request, pass `--source-event <triggering Event ID>` to `buzz pr open`.",
+    );
+    context
 }
 
 /// Format a conversation context section (thread or DM).

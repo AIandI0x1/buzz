@@ -23,6 +23,7 @@ import {
   KIND_GIT_STATUS_DRAFT,
   KIND_GIT_STATUS_MERGED,
   KIND_GIT_STATUS_OPEN,
+  KIND_PROJECT_ACTIVITY_LINK,
   KIND_REPO_ANNOUNCEMENT,
   KIND_REPO_STATE,
   KIND_TEXT_NOTE,
@@ -394,40 +395,51 @@ async function fetchProjectIssues(project: Project): Promise<ProjectIssue[]> {
 async function fetchProjectPullRequests(
   project: Project,
 ): Promise<ProjectPullRequest[]> {
-  const [pullRequestEvents, updateEvents, commentEvents, statusEvents] =
-    await Promise.all([
-      relayClient.fetchEvents({
-        kinds: [KIND_GIT_PULL_REQUEST],
-        "#a": [project.repoAddress],
-        limit: 200,
-      }),
-      relayClient.fetchEvents({
-        kinds: [KIND_GIT_PR_UPDATE],
-        "#a": [project.repoAddress],
-        limit: 500,
-      }),
-      relayClient.fetchEvents({
-        kinds: [KIND_TEXT_NOTE],
-        "#a": [project.repoAddress],
-        limit: 500,
-      }),
-      relayClient.fetchEvents({
-        kinds: [
-          KIND_GIT_STATUS_OPEN,
-          KIND_GIT_STATUS_MERGED,
-          KIND_GIT_STATUS_CLOSED,
-          KIND_GIT_STATUS_DRAFT,
-        ],
-        "#a": [project.repoAddress],
-        limit: 500,
-      }),
-    ]);
+  const [
+    pullRequestEvents,
+    updateEvents,
+    commentEvents,
+    statusEvents,
+    activityLinkEvents,
+  ] = await Promise.all([
+    relayClient.fetchEvents({
+      kinds: [KIND_GIT_PULL_REQUEST],
+      "#a": [project.repoAddress],
+      limit: 200,
+    }),
+    relayClient.fetchEvents({
+      kinds: [KIND_GIT_PR_UPDATE],
+      "#a": [project.repoAddress],
+      limit: 500,
+    }),
+    relayClient.fetchEvents({
+      kinds: [KIND_TEXT_NOTE],
+      "#a": [project.repoAddress],
+      limit: 500,
+    }),
+    relayClient.fetchEvents({
+      kinds: [
+        KIND_GIT_STATUS_OPEN,
+        KIND_GIT_STATUS_MERGED,
+        KIND_GIT_STATUS_CLOSED,
+        KIND_GIT_STATUS_DRAFT,
+      ],
+      "#a": [project.repoAddress],
+      limit: 500,
+    }),
+    relayClient.fetchEvents({
+      kinds: [KIND_PROJECT_ACTIVITY_LINK],
+      "#a": [project.repoAddress],
+      limit: 500,
+    }),
+  ]);
 
   return projectPullRequestEventsToPullRequests(
     pullRequestEvents,
     updateEvents,
     commentEvents,
     statusEvents,
+    activityLinkEvents,
   );
 }
 

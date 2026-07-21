@@ -4,6 +4,71 @@ use crate::validate::{
     read_file_or_stdin, read_or_stdin, sdk_err, validate_hex64, validate_repo_id,
 };
 use buzz_sdk::{GitPrUpdateMeta, GitPullRequestMeta, GitRepoCoord, GitStatusMeta};
+use uuid::Uuid;
+
+struct SourceConversation {
+    channel_id: Uuid,
+    event_id: String,
+    thread_root_id: Option<String>,
+}
+
+async fn resolve_source_conversation(
+    client: &BuzzClient,
+    event_id: &str,
+) -> Result<SourceConversation, CliError> {
+    validate_hex64(event_id)?;
+    let raw = client
+        .query(&serde_json::json!({ "ids": [event_id], "limit": 1 }))
+        .await?;
+    let events: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| CliError::Other(format!("failed to parse source event: {e}")))?;
+    let event = events
+        .as_array()
+        .and_then(|items| items.first())
+        .ok_or_else(|| CliError::Other(format!("source event {event_id} not found")))?;
+    let tags = event
+        .get("tags")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| CliError::Other("source event is missing tags".into()))?;
+
+    let mut channel_id = None;
+    let mut root = None;
+    let mut reply = None;
+    for tag in tags {
+        let Some(parts) = tag.as_array() else {
+            continue;
+        };
+        match parts.first().and_then(serde_json::Value::as_str) {
+            Some("h") => {
+                channel_id = parts
+                    .get(1)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+            }
+            Some("e") => {
+                let referenced = parts.get(1).and_then(serde_json::Value::as_str);
+                match (parts.get(3).and_then(serde_json::Value::as_str), referenced) {
+                    (Some("root"), Some(id)) => root = Some(id.to_string()),
+                    (Some("reply"), Some(id)) => reply = Some(id.to_string()),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    let channel_id = channel_id
+        .ok_or_else(|| CliError::Other("source event is not channel-scoped".into()))
+        .and_then(|value| {
+            Uuid::parse_str(&value)
+                .map_err(|_| CliError::Other(format!("invalid source channel UUID: {value}")))
+        })?;
+
+    Ok(SourceConversation {
+        channel_id,
+        event_id: event_id.to_string(),
+        thread_root_id: root.or(reply),
+    })
+}
 
 fn read_optional_body(body: Option<&str>, body_file: Option<&str>) -> Result<String, CliError> {
     match (body, body_file) {
@@ -32,6 +97,7 @@ pub async fn cmd_open_pr(
     labels: &[String],
     to: &[String],
     revision_of: Option<&str>,
+    source_event: Option<&str>,
 ) -> Result<(), CliError> {
     validate_hex64(repo_owner)?;
     validate_repo_id(repo_id)?;
@@ -53,9 +119,38 @@ pub async fn cmd_open_pr(
         revision_of: revision_of.map(str::to_string),
     };
 
+    let source = match source_event {
+        Some(event_id) => Some(resolve_source_conversation(client, event_id).await?),
+        None => None,
+    };
     let builder = buzz_sdk::build_git_pull_request(&repo, &content, &meta).map_err(sdk_err)?;
     let event = client.sign_event(builder)?;
+    let pull_request_id = event.id.to_hex();
     let resp = client.submit_event(event).await?;
+    if let Some(source) = source {
+        let accepted = serde_json::from_str::<serde_json::Value>(&resp)
+            .ok()
+            .and_then(|value| value.get("accepted")?.as_bool())
+            .unwrap_or(false);
+        if !accepted {
+            println!("{resp}");
+            return Ok(());
+        }
+        let builder = buzz_sdk::build_project_activity_link(
+            source.channel_id,
+            &repo,
+            &pull_request_id,
+            &source.event_id,
+            source.thread_root_id.as_deref(),
+        )
+        .map_err(sdk_err)?;
+        let link = client.sign_event(builder)?;
+        if let Err(error) = client.submit_event(link).await {
+            return Err(CliError::Other(format!(
+                "pull request {pull_request_id} was created, but its source conversation link failed: {error}"
+            )));
+        }
+    }
     println!("{resp}");
     Ok(())
 }
@@ -228,6 +323,7 @@ pub async fn dispatch(cmd: crate::PrCmd, client: &BuzzClient) -> Result<(), CliE
             label,
             to,
             revision_of,
+            source_event,
         } => {
             cmd_open_pr(
                 client,
@@ -244,6 +340,7 @@ pub async fn dispatch(cmd: crate::PrCmd, client: &BuzzClient) -> Result<(), CliE
                 &label,
                 &to,
                 revision_of.as_deref(),
+                source_event.as_deref(),
             )
             .await
         }
