@@ -35,6 +35,7 @@ echo first > "$work/file"
 git -C "$work" add file
 git -C "$work" commit -qm first
 git -C "$work" branch -M main
+git --git-dir="$remote" symbolic-ref HEAD refs/heads/main
 git -C "$work" -c "url.file://$remote.insteadOf=$canonical_origin" \
   -c protocol.file.allow=always push -q -u origin main
 
