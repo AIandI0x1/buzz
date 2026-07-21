@@ -617,23 +617,24 @@ impl EventQueue {
     /// Boot-only bulk restore: re-admits a channel's complete durable
     /// trigger set, in `admission_seq` order, bypassing cap eviction (the
     /// durable set can legitimately exceed [`MAX_PENDING_PER_CHANNEL`] —
-    /// see module docs on cap enforcement). Applies the promotion rule:
-    /// if none of `events` is already `cap_exempt` (no exempt record
-    /// survived the previous generation), the whole snapshot is promoted
-    /// to exempt; otherwise every record keeps its persisted class. A
-    /// no-op for an empty `events`.
+    /// see module docs on cap enforcement). Each event's `cap_exempt` is
+    /// taken verbatim from the caller — this function does not compute or
+    /// apply the whole-snapshot promotion rule itself. The promotion
+    /// decision requires seeing every gated record for a channel (fetched
+    /// *and* unresolved), which only the caller (`boot_recover`) has in
+    /// scope; `events` here is just the fetched subset. Settling the class
+    /// here from a partial subset would re-derive the wrong answer (e.g. an
+    /// unfetched exempt record leaving a fetched non-exempt record as the
+    /// only entry in `events`, spuriously promoting it). A no-op for an
+    /// empty `events`.
     pub fn import_recovered(&mut self, channel_id: Uuid, mut events: Vec<QueuedEvent>) {
         if events.is_empty() {
             return;
         }
         events.sort_by_key(|e| e.admission_seq);
-        let promote = !events.iter().any(|e| e.cap_exempt);
         let queue = self.queues.entry(channel_id).or_default();
         for mut event in events {
             event.channel_id = channel_id;
-            if promote {
-                event.cap_exempt = true;
-            }
             queue.push_back(event);
         }
         self.dirty_channels.insert(channel_id);
@@ -5830,29 +5831,41 @@ mod tests {
         assert_eq!(seq2, 102);
     }
 
-    // ── import_recovered: promotion rule ───────────────────────────────────
+    // ── import_recovered: caller-supplied class is passed through verbatim ──
+    //
+    // The whole-snapshot promotion rule (plan:136,147-149) is computed by
+    // `boot_recover` over ALL gated records (fetched + unresolved) before
+    // the fetch split — see `test_boot_recover_promotion_from_full_snapshot_
+    // unfetched_promotes` and `test_boot_recover_promotion_preserves_class_
+    // when_exempt_exists` in lib.rs. `import_recovered` only ever sees the
+    // fetched subset, so it must not re-derive promotion from that partial
+    // view; these tests pin the pass-through contract at the queue level.
 
     #[test]
-    fn test_import_recovered_promotes_whole_snapshot_when_no_exempt_record() {
+    fn test_import_recovered_preserves_caller_supplied_exempt_bits() {
         let mut q = EventQueue::new(DedupMode::Queue);
         let ch = Uuid::new_v4();
         let mut e1 = make_queued(ch, "a");
         e1.admission_seq = 5;
+        e1.cap_exempt = true; // caller already decided: promote.
         let mut e2 = make_queued(ch, "b");
         e2.admission_seq = 6;
-        // Neither record carries cap_exempt=true — the whole snapshot promotes.
+        e2.cap_exempt = true;
         q.import_recovered(ch, vec![e2, e1]);
 
         let triggers = q.recoverable_triggers(ch);
         assert_eq!(triggers.len(), 2);
-        assert!(triggers.iter().all(|t| t.cap_exempt));
+        assert!(
+            triggers.iter().all(|t| t.cap_exempt),
+            "import_recovered must not clear a caller-supplied exempt bit"
+        );
         // Restored in admission_seq order regardless of input order.
         assert_eq!(triggers[0].admission_seq, 5);
         assert_eq!(triggers[1].admission_seq, 6);
     }
 
     #[test]
-    fn test_import_recovered_keeps_persisted_class_when_one_exempt_survives() {
+    fn test_import_recovered_keeps_mixed_classes_when_caller_does_not_promote() {
         let mut q = EventQueue::new(DedupMode::Queue);
         let ch = Uuid::new_v4();
         let mut exempt = make_queued(ch, "a");
@@ -5867,11 +5880,13 @@ mod tests {
         let triggers = q.recoverable_triggers(ch);
         assert!(
             triggers[0].cap_exempt,
-            "persisted exempt record kept exempt"
+            "import_recovered must not touch an already-exempt record"
         );
         assert!(
             !triggers[1].cap_exempt,
-            "persisted counted record kept counted"
+            "import_recovered must not promote a record the caller left counted \
+             — this is exactly the P2-F2(b) regression: import_recovered has no \
+             business re-deriving promotion from a partial (fetched-only) view"
         );
     }
 
@@ -6114,5 +6129,342 @@ mod tests {
             q.flush_next().is_none(),
             "cancelled-only fallback must respect the barrier too"
         );
+    }
+
+    // ── complete_batch disposition matrix (plan:244) ─────────────────────
+
+    #[test]
+    fn test_complete_batch_success_clears_in_flight_dirties_channel() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        q.push(make_queued(ch, "a"));
+        q.take_dirty_channels();
+        let batch = q.flush_next().unwrap();
+        q.take_dirty_channels();
+
+        let dead = q.complete_batch(ch, Some(batch), BatchDisposition::Success);
+        assert!(dead.is_none(), "success never dead-letters");
+        assert!(!any_in_flight(&q));
+        assert!(
+            !q.take_dirty_channels().is_empty(),
+            "completion must dirty the channel"
+        );
+        assert!(q.recoverable_triggers(ch).is_empty());
+    }
+
+    #[test]
+    fn test_complete_batch_retry_requeues_and_dead_letters_on_max() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        q.push(make_queued(ch, "a"));
+        let mut dead = None;
+        for _ in 0..=MAX_RETRIES {
+            q.retry_after
+                .insert(ch, Instant::now() - Duration::from_secs(1));
+            let batch = q.flush_next().unwrap();
+            dead = q.complete_batch(ch, Some(batch), BatchDisposition::Retry);
+        }
+        assert!(
+            dead.is_some(),
+            "after MAX_RETRIES+1 attempts, batch must be dead-lettered"
+        );
+        assert!(q.flush_next().is_none(), "dead-lettered event is gone");
+    }
+
+    #[test]
+    fn test_complete_batch_cancelled_steer_preserves_events() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        q.push(make_queued(ch, "a"));
+        q.push(make_queued(ch, "b"));
+        let batch = q.flush_next().unwrap();
+        let event_count = batch.events.len();
+
+        q.complete_batch(
+            ch,
+            Some(batch),
+            BatchDisposition::Cancelled(CancelReason::Steer),
+        );
+        let triggers = q.recoverable_triggers(ch);
+        assert_eq!(
+            triggers.len(),
+            event_count,
+            "cancelled events must be preserved in recoverable set"
+        );
+    }
+
+    #[test]
+    fn test_complete_batch_dropped_removes_events() {
+        let mut q = EventQueue::new(DedupMode::Drop);
+        let ch = Uuid::new_v4();
+        q.push(make_queued(ch, "a"));
+        let batch = q.flush_next().unwrap();
+
+        let dead = q.complete_batch(ch, Some(batch), BatchDisposition::Dropped);
+        assert!(dead.is_none());
+        assert!(q.recoverable_triggers(ch).is_empty());
+    }
+
+    #[test]
+    fn test_complete_batch_preserve_timestamps_requeues() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        q.push(make_queued(ch, "a"));
+        let batch = q.flush_next().unwrap();
+        let orig_seq = batch.events[0].admission_seq;
+
+        q.complete_batch(ch, Some(batch), BatchDisposition::PreserveTimestamps);
+        let triggers = q.recoverable_triggers(ch);
+        assert_eq!(triggers.len(), 1);
+        assert_eq!(
+            triggers[0].admission_seq, orig_seq,
+            "PreserveTimestamps must keep original admission_seq"
+        );
+    }
+
+    // ── all-public-mutator dirty census ──────────────────────────────────
+
+    #[test]
+    fn test_every_public_mutator_dirties_its_channel() {
+        let ch = Uuid::new_v4();
+
+        // push
+        let mut q = EventQueue::new(DedupMode::Queue);
+        q.push(make_queued(ch, "a"));
+        assert!(!q.take_dirty_channels().is_empty(), "push must dirty");
+
+        // flush_next
+        let batch = q.flush_next().unwrap();
+        assert!(!q.take_dirty_channels().is_empty(), "flush_next must dirty");
+
+        // complete_batch (Success)
+        q.complete_batch(ch, Some(batch), BatchDisposition::Success);
+        assert!(
+            !q.take_dirty_channels().is_empty(),
+            "complete_batch must dirty"
+        );
+
+        // import_recovered
+        let mut e = make_queued(ch, "b");
+        e.admission_seq = 10;
+        q.import_recovered(ch, vec![e]);
+        assert!(
+            !q.take_dirty_channels().is_empty(),
+            "import_recovered must dirty"
+        );
+
+        // admit_recovered
+        let mut e2 = make_queued(ch, "c");
+        e2.admission_seq = 5;
+        e2.restart_recovery = true;
+        q.admit_recovered(ch, e2);
+        assert!(
+            !q.take_dirty_channels().is_empty(),
+            "admit_recovered must dirty"
+        );
+    }
+
+    // ── enforce_cap five-path matrix ─────────────────────────────────────
+
+    #[test]
+    fn test_enforce_cap_push_evicts_from_front() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        for _ in 0..MAX_PENDING_PER_CHANNEL {
+            let mut e = make_queued(ch, "fill");
+            e.cap_exempt = false;
+            q.push(e);
+        }
+        let first_seq = q.recoverable_triggers(ch)[0].admission_seq;
+
+        let mut overflow = make_queued(ch, "overflow");
+        overflow.cap_exempt = false;
+        q.push(overflow);
+
+        let triggers = q.recoverable_triggers(ch);
+        let counted = triggers.iter().filter(|t| !t.cap_exempt).count();
+        assert!(
+            counted <= MAX_PENDING_PER_CHANNEL,
+            "push must enforce cap on counted events"
+        );
+        assert!(
+            !triggers.iter().any(|t| t.admission_seq == first_seq),
+            "oldest counted event must be evicted from front"
+        );
+    }
+
+    #[test]
+    fn test_enforce_cap_exempt_events_not_evicted() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let events: Vec<QueuedEvent> = (0..(MAX_PENDING_PER_CHANNEL as u64 + 50))
+            .map(|seq| {
+                let mut e = make_queued(ch, "exempt");
+                e.admission_seq = seq;
+                e.cap_exempt = true;
+                e
+            })
+            .collect();
+        q.import_recovered(ch, events);
+        let triggers = q.recoverable_triggers(ch);
+        assert_eq!(
+            triggers.len(),
+            MAX_PENDING_PER_CHANNEL + 50,
+            "exempt events must never be evicted"
+        );
+    }
+
+    #[test]
+    fn test_enforce_cap_sustained_live_over_exempt_backlog() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        for i in 0..(MAX_PENDING_PER_CHANNEL + 100) {
+            let mut e = make_queued(ch, "exempt-backlog");
+            e.cap_exempt = true;
+            e.admission_seq = i as u64;
+            q.import_recovered(ch, vec![e]);
+        }
+
+        for _ in 0..20 {
+            let mut live = make_queued(ch, "live");
+            live.cap_exempt = false;
+            q.push(live);
+        }
+
+        let triggers = q.recoverable_triggers(ch);
+        let exempt_count = triggers.iter().filter(|t| t.cap_exempt).count();
+        let counted_count = triggers.iter().filter(|t| !t.cap_exempt).count();
+        assert_eq!(
+            exempt_count,
+            MAX_PENDING_PER_CHANNEL + 100,
+            "exempt backlog must be fully preserved"
+        );
+        assert!(
+            counted_count <= MAX_PENDING_PER_CHANNEL,
+            "live counted events must still be cap-bounded"
+        );
+    }
+
+    // ── three-generation restart bound ───────────────────────────────────
+
+    #[test]
+    fn test_three_generation_restart_no_ratchet() {
+        let ch = Uuid::new_v4();
+
+        // Generation 1: push + recover
+        let mut q = EventQueue::new(DedupMode::Queue);
+        q.push(make_queued(ch, "gen1"));
+        let gen1_triggers = q.recoverable_triggers(ch);
+        assert_eq!(gen1_triggers.len(), 1);
+
+        // Generation 2: import gen1's triggers, push more
+        let mut q2 = EventQueue::new(DedupMode::Queue);
+        let mut e = make_queued(ch, "gen1-recovered");
+        e.admission_seq = gen1_triggers[0].admission_seq;
+        q2.import_recovered(ch, vec![e]);
+        q2.push(make_queued(ch, "gen2-fresh"));
+        let gen2_triggers = q2.recoverable_triggers(ch);
+        assert_eq!(gen2_triggers.len(), 2);
+
+        // Generation 3: import gen2's triggers
+        let mut q3 = EventQueue::new(DedupMode::Queue);
+        let events: Vec<QueuedEvent> = gen2_triggers
+            .iter()
+            .map(|t| {
+                let mut e = make_queued(ch, "gen-recovered");
+                e.admission_seq = t.admission_seq;
+                e.cap_exempt = t.cap_exempt;
+                e
+            })
+            .collect();
+        q3.import_recovered(ch, events);
+
+        let gen3_triggers = q3.recoverable_triggers(ch);
+        assert_eq!(
+            gen3_triggers.len(),
+            2,
+            "three-generation restart must not ratchet — count stays bounded"
+        );
+    }
+
+    // ── repeated cancel/restart amplification ────────────────────────────
+
+    #[test]
+    fn test_repeated_cancel_restart_no_amplification() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        q.push(make_queued(ch, "original"));
+
+        for _ in 0..10 {
+            let batch = q.flush_next().unwrap();
+            q.complete_batch(
+                ch,
+                Some(batch),
+                BatchDisposition::Cancelled(CancelReason::Steer),
+            );
+        }
+
+        let counted = q
+            .recoverable_triggers(ch)
+            .iter()
+            .filter(|t| !t.cap_exempt)
+            .count();
+        assert!(
+            counted <= MAX_PENDING_PER_CHANNEL,
+            "repeated cancel+restart must not amplify beyond cap"
+        );
+    }
+
+    // ── same-second ordering ─────────────────────────────────────────────
+
+    #[test]
+    fn test_same_second_in_flight_and_queued_preserves_order() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let e_a = make_queued(ch, "A");
+        let e_b = make_queued(ch, "B");
+        let seq_a = {
+            q.push(e_a);
+            q.recoverable_triggers(ch).last().unwrap().admission_seq
+        };
+        let seq_b = {
+            q.push(e_b);
+            q.recoverable_triggers(ch).last().unwrap().admission_seq
+        };
+
+        assert!(
+            seq_a < seq_b,
+            "same-second pushes must get monotonically increasing admission_seq"
+        );
+
+        let triggers = q.recoverable_triggers(ch);
+        let a_trigger = triggers.iter().find(|t| t.admission_seq == seq_a).unwrap();
+        let b_trigger = triggers.iter().find(|t| t.admission_seq == seq_b).unwrap();
+        assert_eq!(a_trigger.event_id.len(), 64);
+        assert_eq!(b_trigger.event_id.len(), 64);
+    }
+
+    // ── field stability across transitions ───────────────────────────────
+
+    #[test]
+    fn test_field_stability_across_push_flush_cancel_requeue() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        q.push(make_queued(ch, "stable"));
+        let orig = q.recoverable_triggers(ch)[0].clone();
+
+        let batch = q.flush_next().unwrap();
+        q.complete_batch(
+            ch,
+            Some(batch),
+            BatchDisposition::Cancelled(CancelReason::Steer),
+        );
+
+        let after_cancel = q.recoverable_triggers(ch)[0].clone();
+        assert_eq!(orig.admission_seq, after_cancel.admission_seq);
+        assert_eq!(orig.enqueued_at_unix, after_cancel.enqueued_at_unix);
+        assert_eq!(orig.cap_exempt, after_cancel.cap_exempt);
+        assert_eq!(orig.prompt_tag, after_cancel.prompt_tag);
+        assert_eq!(orig.event_id, after_cancel.event_id);
     }
 }

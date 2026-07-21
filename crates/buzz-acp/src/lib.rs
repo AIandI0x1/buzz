@@ -6140,12 +6140,71 @@ mod boot_recovery_integration_tests {
         }
     }
 
+    fn ledger_record_exempt(event: &nostr::Event, seq: u64, tag: &str) -> LedgerRecord {
+        LedgerRecord {
+            event_id: event.id.to_hex(),
+            prompt_tag: tag.into(),
+            admission_seq: seq,
+            enqueued_at_unix: 1000 + seq,
+            cap_exempt: true,
+        }
+    }
+
     fn rest_client(base_url: &str) -> RestClient {
         RestClient {
             http: reqwest::Client::new(),
             base_url: base_url.into(),
             keys: Keys::generate(),
             auth_tag_json: None,
+        }
+    }
+
+    /// Minimal `PromptContext` for driving `dispatch_pending` directly —
+    /// same shape as `pool::tests::make_prompt_context_impl`, duplicated
+    /// here because that helper is private to `pool`'s test module.
+    fn test_prompt_context() -> Arc<PromptContext> {
+        let agent_keys = Keys::generate();
+        Arc::new(PromptContext {
+            mcp_servers: vec![],
+            initial_message: None,
+            idle_timeout: Duration::from_secs(60),
+            max_turn_duration: Duration::from_secs(120),
+            turn_liveness_interval: Duration::ZERO,
+            dedup_mode: DedupMode::Queue,
+            system_prompt: None,
+            team_instructions: None,
+            heartbeat_prompt: None,
+            base_prompt: None,
+            cwd: ".".to_string(),
+            rest_client: rest_client("http://127.0.0.1:0"),
+            channel_info: HashMap::new(),
+            context_message_limit: 0,
+            max_turns_per_session: 0,
+            permission_mode: crate::config::PermissionMode::Default,
+            agent_keys: agent_keys.clone(),
+            agent_owner_pubkey: None,
+            memory_enabled: false,
+            harness_name: "goose".to_string(),
+        })
+    }
+
+    /// Spawn a real but inert agent subprocess (`cat`) so `dispatch_pending`
+    /// has a genuine `OwnedAgent` to claim — mirrors `dummy_agent` in the
+    /// top-level test module (private there, duplicated here for the same
+    /// reason as `test_prompt_context` above).
+    async fn dummy_agent(index: usize) -> pool::OwnedAgent {
+        pool::OwnedAgent {
+            index,
+            acp: acp::AcpClient::spawn("cat", &[], &[], false)
+                .await
+                .expect("spawn cat as inert agent"),
+            state: Default::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name: "unknown".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
         }
     }
 
@@ -6161,6 +6220,69 @@ mod boot_recovery_integration_tests {
                 };
                 let mut buf = vec![0u8; 8192];
                 let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    events_json.len(),
+                    events_json
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (handle, base_url)
+    }
+
+    /// Like `mock_rest_server`, but serves raw JSON values instead of
+    /// `nostr::Event`s — lets tests inject malformed/forged/tampered
+    /// responses (e.g. a corrupted `sig`) that a valid `nostr::Event` could
+    /// never represent.
+    async fn mock_rest_server_values(
+        values: Vec<serde_json::Value>,
+    ) -> (tokio::task::JoinHandle<()>, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+        let handle = tokio::spawn(async move {
+            let events_json = serde_json::to_string(&values).unwrap();
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    events_json.len(),
+                    events_json
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (handle, base_url)
+    }
+
+    /// Like `mock_rest_server`, but sleeps for `delay` (a tokio timer, so it
+    /// respects `start_paused` + `tokio::time::advance`) after reading the
+    /// request and before writing the response — lets tests simulate fetch
+    /// latency that must be advanced through WHILE `boot_recover`'s fetch
+    /// loop is actually awaiting the response, not before it starts.
+    async fn mock_rest_server_delayed(
+        events: Vec<nostr::Event>,
+        delay: Duration,
+    ) -> (tokio::task::JoinHandle<()>, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+        let handle = tokio::spawn(async move {
+            let events_json = serde_json::to_string(&events).unwrap();
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                tokio::time::sleep(delay).await;
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                     events_json.len(),
@@ -6341,6 +6463,150 @@ mod boot_recovery_integration_tests {
         );
 
         assert!(suppression.contains(&event_a.id.to_hex()));
+
+        server.abort();
+    }
+
+    // Mode matrix: the two arrival-order tests above pin `DedupMode::Queue`.
+    // `boot_recover` populates `recovered_suppression` identically
+    // regardless of dedup mode (the mode only affects `EventQueue::push`,
+    // which boot_recover never calls — it uses `import_recovered`), so the
+    // discriminating check is the same suppression-set assertion under
+    // `DedupMode::Drop`.
+    #[tokio::test]
+    async fn test_suppression_set_prevents_duplicate_live_push_drop_mode() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event_a = make_channel_event(&keys, ch, "msg");
+        let record_a = ledger_record(&event_a, 1, "test");
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![record_a])]),
+        };
+
+        let (server, base_url) = mock_rest_server(vec![event_a.clone()]).await;
+        let rest = rest_client(&base_url);
+
+        let mut queue = EventQueue::new(DedupMode::Drop);
+        let mut ledger = Ledger::disabled();
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+        assert!(suppression.contains(&event_a.id.to_hex()));
+
+        let triggers = queue.recoverable_triggers(ch);
+        assert_eq!(triggers.len(), 1, "only the boot-imported copy exists");
+
+        server.abort();
+    }
+
+    // "Replay-only for non-ledger events" (plan:192): an event that was
+    // never staged in the ledger must never appear in the suppression set,
+    // regardless of dedup mode — the live-admission seam's suppression
+    // check is keyed strictly on ids `boot_recover` actually imported.
+    #[tokio::test]
+    async fn test_suppression_does_not_affect_non_ledger_event() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event_ledger = make_channel_event(&keys, ch, "recovered");
+        let event_fresh = make_channel_event(&keys, ch, "never-staged");
+        let record = ledger_record(&event_ledger, 1, "test");
+
+        let (server, base_url) = mock_rest_server(vec![event_ledger.clone()]).await;
+        let rest = rest_client(&base_url);
+
+        for mode in [DedupMode::Queue, DedupMode::Drop] {
+            let staged = StagedLedger {
+                channels: HashMap::from([(ch, vec![record.clone()])]),
+            };
+            let mut queue = EventQueue::new(mode);
+            let mut ledger = Ledger::disabled();
+            let live_channels = HashSet::from([ch]);
+            let mut suppression = HashSet::new();
+
+            boot_recover(
+                &mut queue,
+                &mut ledger,
+                staged,
+                &live_channels,
+                &rest,
+                &mut suppression,
+            )
+            .await;
+
+            assert!(
+                !suppression.contains(&event_fresh.id.to_hex()),
+                "a never-staged event's id must never land in the suppression set ({mode:?})"
+            );
+        }
+
+        server.abort();
+    }
+
+    // "with an event timestamped inside the skew window" (plan:192): the
+    // suppression set is a pure id-based match, but the timing scenario it
+    // exists to guard is a fast restart where the relay's reconnect `since`
+    // subtracts `SINCE_SKEW_SECS` (relay.rs) and could replay an event
+    // admitted just before the crash. Pin that the suppression check does
+    // not depend on how recently the record was enqueued — a record
+    // enqueued at "now" (the skew-window case) suppresses identically to
+    // one enqueued long ago.
+    #[tokio::test]
+    async fn test_suppression_covers_event_inside_skew_window() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event_a = make_channel_event(&keys, ch, "just-before-crash");
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let record_a = LedgerRecord {
+            event_id: event_a.id.to_hex(),
+            prompt_tag: "test".into(),
+            admission_seq: 1,
+            // Enqueued inside the SINCE_SKEW_SECS window relative to "now" —
+            // the exact case where a fast restart's reconnect replay could
+            // otherwise double-admit this event over WS.
+            enqueued_at_unix: now_unix.saturating_sub(2),
+            cap_exempt: false,
+        };
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![record_a])]),
+        };
+
+        let (server, base_url) = mock_rest_server(vec![event_a.clone()]).await;
+        let rest = rest_client(&base_url);
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let mut ledger = Ledger::disabled();
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        assert!(
+            suppression.contains(&event_a.id.to_hex()),
+            "a recently-enqueued (skew-window) record must still be suppressed \
+             against a WS replay of the same event"
+        );
 
         server.abort();
     }
@@ -6779,6 +7045,17 @@ mod boot_recovery_integration_tests {
             "hanging bridge leaves triggers unresolved"
         );
 
+        // The plan's acceptance criterion is "boot reaches dispatch within
+        // the global budget", not merely "returns". `boot_recover` having
+        // returned already proves that (the fetch loop cannot outlive
+        // `BOOT_RECOVERY_FETCH_DEADLINE` — asserted above); this additionally
+        // confirms boot reached the barrier-registration step rather than
+        // hanging or panicking partway through the fetch loop.
+        assert!(
+            queue.next_unresolved_barrier_deadline().is_some(),
+            "boot must reach the barrier-registration step, not hang in the fetch loop"
+        );
+
         server.abort();
     }
 
@@ -6934,6 +7211,105 @@ mod boot_recovery_integration_tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn test_chunk_reconciliation_invalid_signature_stays_unresolved() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let ev_good = make_channel_event(&keys, ch, "valid");
+        let ev_forged = make_channel_event(&keys, ch, "forged");
+        let rec_good = ledger_record(&ev_good, 1, "test");
+        let rec_forged = ledger_record(&ev_forged, 2, "test");
+
+        // Tamper the forged event's signature after signing — the id is
+        // still requested (matches the ledger record), but verification
+        // must fail, so the record must stay unresolved-retained rather
+        // than importing untrusted content (R6-F5).
+        let mut forged_json = serde_json::to_value(&ev_forged).unwrap();
+        let tampered_sig = "0".repeat(128);
+        forged_json["sig"] = serde_json::Value::String(tampered_sig);
+
+        let good_json = serde_json::to_value(&ev_good).unwrap();
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![rec_good, rec_forged])]),
+        };
+
+        let (server, base_url) = mock_rest_server_values(vec![good_json, forged_json]).await;
+        let rest = rest_client(&base_url);
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        let triggers = queue.recoverable_triggers(ch);
+        assert_eq!(triggers.len(), 1, "only the validly-signed event imports");
+        assert_eq!(triggers[0].event_id, ev_good.id.to_hex());
+        assert!(
+            ledger.find_unresolved(ch, &ev_forged.id.to_hex()).is_some(),
+            "invalid-signature event must stay unresolved-retained, never imported"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_chunk_reconciliation_omitted_id_stays_unresolved() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let ev_returned = make_channel_event(&keys, ch, "returned");
+        let ev_omitted = make_channel_event(&keys, ch, "omitted-by-bridge");
+        let rec_returned = ledger_record(&ev_returned, 1, "test");
+        let rec_omitted = ledger_record(&ev_omitted, 2, "test");
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![rec_returned, rec_omitted])]),
+        };
+
+        // Bridge returns only one of the two requested ids — a partial
+        // chunk response, not a failure.
+        let (server, base_url) = mock_rest_server(vec![ev_returned.clone()]).await;
+        let rest = rest_client(&base_url);
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        let triggers = queue.recoverable_triggers(ch);
+        assert_eq!(triggers.len(), 1);
+        assert_eq!(triggers[0].event_id, ev_returned.id.to_hex());
+        assert!(
+            ledger
+                .find_unresolved(ch, &ev_omitted.id.to_hex())
+                .is_some(),
+            "requested-but-omitted id must stay unresolved-retained, never dropped"
+        );
+
+        server.abort();
+    }
+
     // ── Scenario 13: steer short-circuit (R6-F2) ─────────────────────────
 
     #[tokio::test]
@@ -7035,7 +7411,15 @@ mod boot_recovery_integration_tests {
         assert!(batch.events[0].restart_recovery);
     }
 
-    #[tokio::test(start_paused = true)]
+    // Not `start_paused`: `expire_due_unresolved_barriers` takes
+    // `std::time::Instant::now()` (real wall clock) in the production
+    // select! arm at :2270. Under a paused virtual clock that call can
+    // never observe the advance — driving it with a synthetic
+    // `past_deadline` (as the old version of this test did) hides that
+    // divergence entirely, since the synthetic value passes regardless of
+    // whether real time elapsed. Use a short real deadline instead and run
+    // the identical production expression on the real clock.
+    #[tokio::test]
     async fn test_quiet_harness_select_timer_arm_wakes_loop() {
         let keys = Keys::generate();
         let ch = Uuid::new_v4();
@@ -7051,7 +7435,7 @@ mod boot_recovery_integration_tests {
             QueuedEvent::from_recovered(ch, event_b.clone(), "test".into(), 2, 1002, false);
         queue.import_recovered(ch, vec![recovered_b]);
 
-        let barrier_deadline = Instant::now() + Duration::from_secs(5);
+        let barrier_deadline = std::time::Instant::now() + Duration::from_millis(50);
         let mut unresolved_seqs = std::collections::BTreeSet::new();
         unresolved_seqs.insert(1);
         queue.set_unresolved_barrier(ch, unresolved_seqs, barrier_deadline);
@@ -7060,32 +7444,38 @@ mod boot_recovery_integration_tests {
 
         assert!(!queue.has_flushable_work());
 
+        // Same construct as the production select! timer arm at :2262-2266:
+        // convert the barrier's std deadline to a tokio deadline and sleep
+        // on it. The real clock (not virtual) must cross 50ms for this to
+        // resolve.
         let barrier_std_deadline = queue.next_unresolved_barrier_deadline().unwrap();
-        let timer_fired = tokio::spawn(async move {
-            let tokio_deadline = tokio::time::Instant::from_std(barrier_std_deadline);
-            tokio::time::sleep_until(tokio_deadline).await;
-            true
-        });
+        let tokio_deadline = tokio::time::Instant::from_std(barrier_std_deadline);
+        tokio::time::sleep_until(tokio_deadline).await;
 
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(6)).await;
-        tokio::task::yield_now().await;
-
-        let fired = timer_fired.await.unwrap();
+        // Same production expression as the timer arm body at :2270: expire
+        // against the real, now-advanced clock — no synthetic timestamp.
+        let expired = queue.expire_due_unresolved_barriers(std::time::Instant::now());
         assert!(
-            fired,
-            "the select! timer arm must fire when the deadline crosses"
+            !expired.is_empty(),
+            "the real clock must have crossed the barrier deadline"
         );
-
-        let past_deadline = barrier_std_deadline + Duration::from_secs(1);
-        let expired = queue.expire_due_unresolved_barriers(past_deadline);
-        assert!(!expired.is_empty());
+        assert!(expired.contains(&ch));
 
         sync_dirty(&mut queue, &mut ledger);
-        assert!(
-            queue.has_flushable_work(),
-            "B flushes after timer-arm expiry"
+
+        // Drive the same post-expiry dispatch the production arm calls at
+        // :2277, proving B is claimed, not merely flushable.
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        let ctx = test_prompt_context();
+        let dispatched = dispatch_pending(&mut pool, &mut queue, &mut ledger, &ctx);
+
+        assert_eq!(
+            dispatched.len(),
+            1,
+            "B must dispatch once the barrier's real deadline has passed"
         );
+        assert_eq!(dispatched[0].0, ch);
     }
 
     // ── Ledger persistence round-trip ────────────────────────────────────
@@ -7128,6 +7518,338 @@ mod boot_recovery_integration_tests {
         let records = staged2.channels.get(&ch).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].event_id, ev.id.to_hex());
+
+        server.abort();
+    }
+
+    // ── F1: boot-recovery wake — dispatch occurs with no external event ──
+
+    #[tokio::test]
+    async fn test_boot_recover_dispatches_immediately_on_quiet_harness() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event_a = make_channel_event(&keys, ch, "boot-wake");
+        let record_a = ledger_record(&event_a, 1, "test");
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![record_a])]),
+        };
+
+        let (server, base_url) = mock_rest_server(vec![event_a.clone()]).await;
+        let rest = rest_client(&base_url);
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let mut ledger = Ledger::disabled();
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        // `has_flushable_work` is true on the old code too (boot_recover
+        // always left work flushable — the defect was that nothing woke up
+        // to *dispatch* it). Drive the actual production wake seam: the
+        // pre-loop `dispatch_pending` call the main loop makes immediately
+        // after `boot_recover` returns, with no external event, no
+        // maintenance tick, and no unresolved barrier. Deleting that call
+        // (reverting to F1-old) must fail this test.
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        let ctx = test_prompt_context();
+
+        let dispatched = dispatch_pending(&mut pool, &mut queue, &mut ledger, &ctx);
+
+        assert_eq!(
+            dispatched.len(),
+            1,
+            "quiet-boot dispatch must claim the recovered channel's batch immediately"
+        );
+        assert_eq!(dispatched[0].0, ch);
+        assert_eq!(
+            pool.task_map().len(),
+            1,
+            "dispatch must spawn exactly one prompt task for the recovered batch"
+        );
+        assert!(
+            !queue.has_flushable_work(),
+            "the recovered batch must have been claimed, not left pending"
+        );
+
+        server.abort();
+    }
+
+    // ── F2: epoch promotion from full snapshot, not just fetched subset ──
+
+    #[tokio::test]
+    async fn test_boot_recover_promotion_from_full_snapshot_unfetched_promotes() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let ev_fetched = make_channel_event(&keys, ch, "fetched-B");
+        let ev_unfetched = make_channel_event(&keys, ch, "unfetched-A");
+        let rec_fetched = ledger_record(&ev_fetched, 2, "test");
+        let rec_unfetched = ledger_record(&ev_unfetched, 1, "test");
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![rec_unfetched, rec_fetched])]),
+        };
+
+        let (server, base_url) = mock_rest_server(vec![ev_fetched.clone()]).await;
+        let rest = rest_client(&base_url);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        let triggers = queue.recoverable_triggers(ch);
+        assert_eq!(triggers.len(), 1, "only fetched event in queue");
+        assert!(
+            triggers[0].cap_exempt,
+            "fetched event must be promoted (no exempt in full snapshot)"
+        );
+
+        let unresolved = ledger.find_unresolved(ch, &ev_unfetched.id.to_hex());
+        assert!(unresolved.is_some(), "unfetched must be unresolved");
+        assert!(
+            unresolved.unwrap().cap_exempt,
+            "unresolved must also be promoted (whole-snapshot epoch rule)"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_boot_recover_promotion_preserves_class_when_exempt_exists() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let ev_exempt = make_channel_event(&keys, ch, "exempt-A");
+        let ev_counted = make_channel_event(&keys, ch, "counted-B");
+        let rec_exempt = ledger_record_exempt(&ev_exempt, 1, "test");
+        let rec_counted = ledger_record(&ev_counted, 2, "test");
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![rec_exempt, rec_counted])]),
+        };
+
+        let (server, base_url) =
+            mock_rest_server(vec![ev_exempt.clone(), ev_counted.clone()]).await;
+        let rest = rest_client(&base_url);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        let triggers = queue.recoverable_triggers(ch);
+        assert_eq!(triggers.len(), 2);
+        let exempt_trigger = triggers.iter().find(|t| t.admission_seq == 1).unwrap();
+        let counted_trigger = triggers.iter().find(|t| t.admission_seq == 2).unwrap();
+        assert!(
+            exempt_trigger.cap_exempt,
+            "exempt record must keep its class"
+        );
+        assert!(
+            !counted_trigger.cap_exempt,
+            "counted record must keep its class when exempt exists"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_boot_recover_promotion_unresolved_keeps_class_when_exempt_exists() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let ev_exempt = make_channel_event(&keys, ch, "exempt-A");
+        let ev_counted = make_channel_event(&keys, ch, "counted-unfetched");
+        let rec_exempt = ledger_record_exempt(&ev_exempt, 1, "test");
+        let rec_counted = ledger_record(&ev_counted, 2, "test");
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![rec_exempt, rec_counted])]),
+        };
+
+        let (server, base_url) = mock_rest_server(vec![ev_exempt.clone()]).await;
+        let rest = rest_client(&base_url);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        let unresolved = ledger.find_unresolved(ch, &ev_counted.id.to_hex());
+        assert!(unresolved.is_some());
+        assert!(
+            !unresolved.unwrap().cap_exempt,
+            "unresolved counted record must keep its class when exempt exists in snapshot"
+        );
+
+        server.abort();
+    }
+
+    // P2-F2(b) residual: an exempt record that the bridge OMITS (stays
+    // unresolved) must not cause the fetched, non-exempt counterpart to be
+    // promoted anyway. `boot_recover` decides promote_channels from the full
+    // gated snapshot (both records: one exempt) — so the channel is NOT in
+    // promote_channels, and the fetched counted record must reach
+    // `import_recovered` still bearing `cap_exempt = false`. Before the
+    // P2-F2(b) fix, `import_recovered` independently recomputed promotion
+    // from only the events vector it received (just the fetched one),
+    // saw zero exempt records in THAT subset, and promoted it anyway —
+    // this is the exact defect Paul's residual review caught.
+    #[tokio::test]
+    async fn test_boot_recover_exempt_unfetched_does_not_promote_fetched_counted() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let ev_exempt_unfetched = make_channel_event(&keys, ch, "exempt-omitted-by-bridge");
+        let ev_counted_fetched = make_channel_event(&keys, ch, "counted-fetched");
+        let rec_exempt = ledger_record_exempt(&ev_exempt_unfetched, 1, "test");
+        let rec_counted = ledger_record(&ev_counted_fetched, 2, "test");
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![rec_exempt, rec_counted])]),
+        };
+
+        // Bridge returns only the counted record — the exempt record is
+        // omitted (stays unresolved), mirroring a partial chunk response.
+        let (server, base_url) = mock_rest_server(vec![ev_counted_fetched.clone()]).await;
+        let rest = rest_client(&base_url);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        let triggers = queue.recoverable_triggers(ch);
+        assert_eq!(
+            triggers.len(),
+            1,
+            "only the fetched record reaches the queue"
+        );
+        assert!(
+            !triggers[0].cap_exempt,
+            "fetched counted record must stay counted — it must not be promoted \
+             just because it was the only entry import_recovered's events vec saw"
+        );
+
+        // Round-trip through commit + reload: the persisted class for the
+        // unresolved exempt record must also be untouched.
+        let unresolved = ledger.find_unresolved(ch, &ev_exempt_unfetched.id.to_hex());
+        assert!(unresolved.is_some());
+        assert!(
+            unresolved.unwrap().cap_exempt,
+            "unresolved exempt record must keep its class"
+        );
+
+        server.abort();
+    }
+
+    // ── F3: barrier deadline survives fetch latency ─────────────────────
+
+    // Not `start_paused`: the barrier deadline is `std::time::Instant`
+    // (real wall clock), but the fetch-latency simulation lives inside the
+    // mock server's tokio timer. Under a paused virtual clock the two
+    // would never interact — `std::time::Instant::now()` cannot observe a
+    // virtual-clock advance — so this test needs a real sleep to actually
+    // race fetch latency against the barrier deadline, same as the
+    // large-ledger hanging-bridge test above.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_boot_recover_barrier_deadline_not_consumed_by_fetch() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let ev_fetched = make_channel_event(&keys, ch, "fetched-B");
+        let ev_unfetched = make_channel_event(&keys, ch, "unfetched-A");
+        let rec_fetched = ledger_record(&ev_fetched, 2, "test");
+        let rec_unfetched = ledger_record(&ev_unfetched, 1, "test");
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![rec_unfetched, rec_fetched])]),
+        };
+
+        // Real 50s delay inside the mock server's request handler — the
+        // fetch loop is genuinely awaiting the response for 50 of the 60s
+        // fetch budget when boot_recover reaches barrier registration.
+        let (server, base_url) =
+            mock_rest_server_delayed(vec![ev_fetched.clone()], Duration::from_secs(50)).await;
+        let rest = rest_client(&base_url);
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let mut ledger = Ledger::disabled();
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        let deadline = queue.next_unresolved_barrier_deadline();
+        assert!(deadline.is_some(), "barrier must be armed for unfetched A");
+
+        let remaining = deadline
+            .unwrap()
+            .saturating_duration_since(std::time::Instant::now());
+        assert!(
+            remaining >= Duration::from_secs(55),
+            "barrier must have nearly the full 60s window remaining (got {remaining:?}), \
+             not be consumed by the 50s fetch latency"
+        );
 
         server.abort();
     }

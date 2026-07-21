@@ -620,7 +620,8 @@ mod tests {
 
         let (_ledger, staged) = Ledger::load(dir.path(), "deadbeefdeadbeefdeadbeef", 0);
         // Round-trip must preserve the exact persisted cap_exempt bits —
-        // `import_recovered`'s promotion rule reads these values directly.
+        // `boot_recover`'s whole-snapshot promotion rule reads these values
+        // directly from the staged ledger before deciding per-channel promotion.
         assert!(staged.channels[&ch_no_exempt].iter().all(|r| !r.cap_exempt));
         let one_exempt = &staged.channels[&ch_one_exempt];
         assert!(one_exempt.iter().any(|r| r.cap_exempt));

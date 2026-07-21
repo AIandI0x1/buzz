@@ -2723,4 +2723,71 @@ channels = "ALL"
             assert!(MAX_TURN_DURATION_CEILING_SECS < u64::MAX - 100);
         }
     }
+
+    /// `BUZZ_ACP_RESUME_ON_RESTART` is process-global; `resume_on_restart_
+    /// env_false_disables` below sets/clears it around its parse, so any
+    /// other test that parses `CliArgs` without an explicit
+    /// `--resume-on-restart` flag (and would therefore observe the env var)
+    /// must serialize against it with this same lock. Tests that pass an
+    /// explicit flag are unaffected — clap's explicit-arg-over-env
+    /// precedence means the flag always wins regardless of the race.
+    static RESUME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn resume_on_restart_default_is_true() {
+        let _guard = RESUME_ENV_LOCK.lock().unwrap();
+        let args = CliArgs::try_parse_from(["buzz-acp", "--private-key", TEST_PRIVATE_KEY])
+            .expect("clap should parse args");
+        assert!(args.resume_on_restart);
+    }
+
+    #[test]
+    fn resume_on_restart_bare_flag_is_true() {
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--resume-on-restart",
+        ])
+        .expect("clap should parse args");
+        assert!(args.resume_on_restart);
+    }
+
+    #[test]
+    fn resume_on_restart_equals_false_disables() {
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--resume-on-restart=false",
+        ])
+        .expect("clap should parse args");
+        assert!(!args.resume_on_restart);
+    }
+
+    #[test]
+    fn resume_on_restart_equals_true_enables() {
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--resume-on-restart=true",
+        ])
+        .expect("clap should parse args");
+        assert!(args.resume_on_restart);
+    }
+
+    #[test]
+    fn resume_on_restart_env_false_disables() {
+        // See RESUME_ENV_LOCK doc comment above — env var is process-global.
+        let _guard = RESUME_ENV_LOCK.lock().unwrap();
+        std::env::set_var("BUZZ_ACP_RESUME_ON_RESTART", "false");
+        let args = CliArgs::try_parse_from(["buzz-acp", "--private-key", TEST_PRIVATE_KEY]);
+        std::env::remove_var("BUZZ_ACP_RESUME_ON_RESTART");
+        let args = args.expect("clap should parse args");
+        assert!(
+            !args.resume_on_restart,
+            "BUZZ_ACP_RESUME_ON_RESTART=false must disable resume without a CLI flag"
+        );
+    }
 }
