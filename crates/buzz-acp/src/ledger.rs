@@ -76,11 +76,16 @@ pub struct StagedLedger {
 /// hot path is never blocked by a degraded filesystem.
 pub struct Ledger {
     path: Option<PathBuf>,
-    /// Per-channel record set as last written to disk, keyed identically
-    /// to what `sync`/`commit` persist. Used for the skip-identical-write
-    /// optimization — `recoverable_triggers()` output is stable across
-    /// syncs unless something actually changed (P2-F3).
+    /// Per-channel record set reflecting desired in-memory state — always
+    /// mutated unconditionally before any persist attempt so removals and
+    /// additions are never lost if a write fails. The skip-identical-write
+    /// check uses `last_written` for content comparison; `dirty` carries the
+    /// "write failed, must retry" signal.
     last_written: HashMap<Uuid, Vec<LedgerRecord>>,
+    /// True when the last `persist_candidate` call failed. Forces the next
+    /// `sync` to attempt the write even if the record set is unchanged,
+    /// ensuring a transient failure is healed at the next opportunity.
+    dirty: bool,
     /// Unresolved boot-fetch records, keyed by channel. Preserved across
     /// ordinary `sync()` rewrites of the same channel until resolved
     /// (event arrives live) or invalidated (channel removed) — see
@@ -98,6 +103,7 @@ impl Ledger {
         Ledger {
             path: None,
             last_written: HashMap::new(),
+            dirty: false,
             unresolved: HashMap::new(),
         }
     }
@@ -120,6 +126,7 @@ impl Ledger {
                 Ledger {
                     path: None,
                     last_written: HashMap::new(),
+                    dirty: false,
                     unresolved: HashMap::new(),
                 },
                 StagedLedger::default(),
@@ -174,6 +181,7 @@ impl Ledger {
             Ledger {
                 path: Some(path),
                 last_written: HashMap::new(),
+                dirty: false,
                 unresolved: HashMap::new(),
             },
             StagedLedger { channels },
@@ -246,15 +254,11 @@ impl Ledger {
     /// channel drain, because a removed channel never dirties again.
     pub fn invalidate_channel(&mut self, channel_id: Uuid) {
         let had_unresolved = self.unresolved.remove(&channel_id).is_some();
-        let had_written = self.last_written.contains_key(&channel_id);
+        let had_written = self.last_written.remove(&channel_id).is_some();
         if had_unresolved || had_written {
-            // Stage the removal in a copy; only commit if persist succeeds
-            // (P3-F3: last_written advances only on successful write).
-            let mut candidate = self.last_written.clone();
-            candidate.remove(&channel_id);
-            if self.persist_candidate(&candidate) {
-                self.last_written = candidate;
-            }
+            // last_written already reflects intent (channel removed above).
+            // Persist; on failure set dirty so the next sync heals the file.
+            self.dirty = !self.persist_candidate(&self.last_written.clone());
         }
     }
 
@@ -262,7 +266,8 @@ impl Ledger {
     /// any unresolved records for that channel (the two are disjoint by
     /// construction — see the module-level design doc). Skips the write
     /// entirely if the merged record set is unchanged since the last
-    /// write to this channel (skip-identical-write, P2-F3).
+    /// write to this channel AND no prior write failed (skip-identical-write,
+    /// P2-F3; dirty-flag retry, P3-F3).
     pub fn sync(&mut self, channel_id: Uuid, triggers: Vec<RecoverableTrigger>) {
         if self.path.is_none() {
             return;
@@ -273,20 +278,19 @@ impl Ledger {
             Some(existing) => *existing != records,
             None => !records.is_empty(),
         };
-        if !changed {
+        if !changed && !self.dirty {
             return;
         }
-        // Stage the update in a candidate copy; only commit to last_written
-        // after a successful disk write (P3-F3).
-        let mut candidate = self.last_written.clone();
+        // Unconditionally update last_written to reflect desired state before
+        // persisting — removals must be visible even if the write fails, so
+        // subsequent successful writes of any channel naturally omit removed
+        // entries and heal the file.
         if records.is_empty() {
-            candidate.remove(&channel_id);
+            self.last_written.remove(&channel_id);
         } else {
-            candidate.insert(channel_id, records);
+            self.last_written.insert(channel_id, records);
         }
-        if self.persist_candidate(&candidate) {
-            self.last_written = candidate;
-        }
+        self.dirty = !self.persist_candidate(&self.last_written.clone());
     }
 
     /// Boot-only: commit the single transactional snapshot computed as
@@ -304,10 +308,9 @@ impl Ledger {
                 channels.insert(channel_id, records);
             }
         }
-        // Only advance last_written if the disk write succeeds (P3-F3).
-        if self.persist_candidate(&channels) {
-            self.last_written = channels;
-        }
+        // Unconditionally update last_written to reflect desired state.
+        self.last_written = channels;
+        self.dirty = !self.persist_candidate(&self.last_written.clone());
     }
 
     fn merge_with_unresolved(

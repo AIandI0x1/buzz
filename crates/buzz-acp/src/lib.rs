@@ -8272,20 +8272,21 @@ mod boot_recovery_integration_tests {
 
     #[tokio::test]
     async fn test_exit_via_handle_prompt_result_syncs_ledger_before_break() {
-        // P3-F2 fix: when handle_prompt_result returns LoopAction::Exit
-        // (circuit open, all agents dead) the main loop must call
-        // sync_dirty before breaking — otherwise the in-flight triggers
-        // dirtied by complete_batch are never persisted, and the next boot
-        // resurrects work that was deliberately terminated.
+        // P3-F2 model: this test is a NON-DISCRIMINATING model of the break-
+        // site contract, not a red-on-old mutation of production code.
         //
-        // The test models the fixed main-loop path: dispatch in-flight,
-        // force Exit return from handle_prompt_result, call sync_dirty
-        // (what the fixed break site now does), reload. Zero triggers expected.
+        // It models the fixed main-loop path — dispatch in-flight, force Exit
+        // from handle_prompt_result, explicitly call sync_dirty (mirroring what
+        // each of the three fixed break sites now does), then reload — to
+        // confirm the zero-triggers post-condition holds when sync_dirty IS
+        // called. Because sync_dirty is called in the test body itself, removing
+        // any of the three production sync_dirty calls does not make this test
+        // fail; source review of the three break sites (lib.rs ~2290, ~2308,
+        // ~2336) is the discriminating verification for P3-F2.
         //
-        // Red-on-old (without the sync_dirty call before break): the
-        // classify_and_complete_batch call inside handle_prompt_result clears
-        // in_flight_channels but the ledger is NOT synced — reload returns
-        // the original in-flight trigger.
+        // Contract: after a circuit-open exit path that calls sync_dirty, the
+        // reloaded ledger must contain zero recovered triggers (the terminated
+        // in-flight work must not resurrect).
         let keys = Keys::generate();
         let ch = Uuid::new_v4();
         let event_a = make_channel_event(&keys, ch, "msg");
@@ -8416,6 +8417,74 @@ mod boot_recovery_integration_tests {
         let records = staged.channels.get(&ch).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].event_id, event_a.id.to_hex());
+    }
+
+    // ── P3-F3 (invalidate_channel): failed persist → different channel sync → removed channel absent
+
+    #[test]
+    fn test_invalidate_channel_failed_persist_heals_on_subsequent_sync() {
+        // P3-F3 regression guard for invalidate_channel: when the invalidation
+        // write fails (dirty flag set), a later successful sync of a DIFFERENT
+        // channel must write the full map WITHOUT the removed channel, healing
+        // the file.
+        //
+        // Red-on-old (advance-on-success): invalidate_channel kept the removed
+        // channel in last_written on persist failure; subsequent syncs wrote it
+        // back, permanently losing the removal intent until reboot.
+        let ch_keep = Uuid::new_v4();
+        let ch_remove = Uuid::new_v4();
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+
+        // Write both channels to disk.
+        let prefix: String = "test_pubkey".chars().take(16).collect();
+        let ledger_path = dir.path().join(format!("pending-turns-{prefix}.json"));
+        let tmp_path = {
+            let mut s = ledger_path.as_os_str().to_os_string();
+            s.push(".tmp");
+            std::path::PathBuf::from(s)
+        };
+
+        let trigger_keep = crate::queue::RecoverableTrigger {
+            event_id: "keep-event".into(),
+            prompt_tag: "mention".into(),
+            admission_seq: 1,
+            enqueued_at_unix: 1000,
+            cap_exempt: false,
+        };
+        let trigger_remove = crate::queue::RecoverableTrigger {
+            event_id: "remove-event".into(),
+            prompt_tag: "mention".into(),
+            admission_seq: 2,
+            enqueued_at_unix: 1001,
+            cap_exempt: false,
+        };
+        ledger.sync(ch_keep, vec![trigger_keep.clone()]);
+        ledger.sync(ch_remove, vec![trigger_remove]);
+        assert!(ledger_path.exists(), "setup: both channels written");
+
+        // Block the .tmp path so the invalidation write fails.
+        std::fs::create_dir_all(&tmp_path).expect("create blocker dir");
+        ledger.invalidate_channel(ch_remove);
+        // The persist failed — but last_written must already reflect the removal.
+
+        // Unblock and sync a DIFFERENT channel — this must write the full map
+        // (dirty flag forces a write even though ch_keep's content is unchanged).
+        std::fs::remove_dir_all(&tmp_path).expect("remove blocker");
+        ledger.sync(ch_keep, vec![trigger_keep.clone()]);
+
+        // Reload: removed channel must be absent.
+        let (_, staged) = Ledger::load(dir.path(), "test_pubkey", 0);
+        assert!(
+            !staged.channels.contains_key(&ch_remove),
+            "after invalidation + failed persist + different-channel sync, removed channel must be absent on reload (got: {:?})",
+            staged.channels,
+        );
+        assert!(
+            staged.channels.contains_key(&ch_keep),
+            "kept channel must still be present"
+        );
     }
 
     // ── P3-F4: persisted prompt_tag through from_recovered ───────────────
