@@ -69,8 +69,9 @@ Every push to `main` continues to publish the rolling relay `:main` and
    `scripts/mobile-release.sh candidate X.Y.Z`. The script resolves and fetches
    the exact current `origin/main` commit, derives the next number from exact
    remote tags for that marketing version, and publishes an annotated
-   `mobile-vX.Y.Z-rc.N` tag there. It never uses the operator's checked-out
-   commit and never moves an existing candidate.
+   `mobile-vX.Y.Z-rc.N` tag there through the dedicated `buzz-release-bot`
+   GitHub App. It never uses the operator's checked-out commit and never moves
+   an existing candidate.
 2. **Build the exact tag.** Enter the candidate tag as `mobile_ref` in the
    private Buzz mobile Buildkite pipeline. OSS CI deliberately cannot trigger
    that private pipeline. The tag supplies both source commit and release
@@ -85,6 +86,11 @@ RC tags. For example, iOS can ship `mobile-v0.5.0-rc.2` while Android ships
 `mobile-v0.5.0-rc.3`. Each platform's exact candidate tag is its source record.
 There is intentionally no single selected or final candidate for the marketing
 version.
+
+The simplification trades away a separate stabilization line. Unrelated commits
+that reach `main` become part of every later candidate, and there is no retained
+hotfix branch or branch-ancestry history. Add a dedicated hotfix flow later if a
+release actually needs isolation from `main`.
 
 `mobile/pubspec.yaml` keeps `0.0.0+1` only as a valid, visibly non-release
 fallback for local development and validation builds. Release jobs always
@@ -169,10 +175,14 @@ host's Wayland/GStreamer/graphics stack and requires GLib >= 2.72
 - **Write access** to the `block/buzz` GitHub repository
 - An `origin` remote whose configured URL is the canonical `block/buzz`
   repository
-- Repository tag rules that make `mobile-v*` immutable while allowing the
-  intended release operator to create a new candidate tag
-- The following **GitHub Actions secrets** must be configured for the desktop
-  release lane:
+- `gh` CLI version 2.87.0 or newer, authenticated with permission to dispatch
+  the candidate workflow
+- Release tag ruleset [`14378754`](https://github.com/block/buzz/rules/14378754)
+  active for `mobile-v*`, with creation, update, deletion, and non-fast-forward
+  protections and `buzz-release-bot` as its sole always-bypass actor
+- The `buzz-release-bot` App credentials configured for GitHub Actions
+- The following **GitHub Actions secrets** must also be configured for the
+  desktop release lane:
 
   | Secret | Purpose |
   |--------|---------|
@@ -180,9 +190,14 @@ host's Wayland/GStreamer/graphics stack and requires GLib >= 2.72
   | `TAURI_SIGNING_PRIVATE_KEY` | Tauri updater private key |
   | `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Password for the private key |
 
-The mobile candidate command uses `git` directly. It does not need the `gh` CLI,
-GitHub workflow dispatch permissions, GitHub Releases permissions, or a mobile
-release-branch ruleset.
+Mobile candidate publication requires workflow-dispatch access and the existing
+release App because strict tag protection denies direct human creation. The App
+must be installed on `block/buzz`, have Contents write and Metadata read, and
+retain an `always` bypass on the immutable `mobile-v*` tag rules. It does not
+require GitHub Releases permissions, repository Administration permission, or a
+mobile release-branch ruleset. The publisher validates the App token's effective
+`current_user_can_bypass` value rather than reading the ruleset's hidden bypass
+actor list.
 
 ---
 
@@ -201,17 +216,27 @@ fix reaches remote `main`. It publishes a new immutable RC tag at the new exact
 remote commit. Continue referring to each tested or shipped platform artifact by
 its own exact tag.
 
+### `scripts/mobile-release.sh candidate` fails because `main` moved during publication
+
+The App-backed workflow may already have published the requested immutable RC
+at the prior `main` tip before the operator command detects the race. Do not
+move or delete that tag, and do not treat it as the candidate for current
+`main`. Inspect the run URL from the command output, then rerun
+`scripts/mobile-release.sh candidate <version>` to publish the next RC from the
+new current `main` tip.
+
 ### A mobile candidate command selects the wrong RC number
 
 Do not retry by moving or deleting a tag. Inspect the exact remote `mobile-v*`
 tags and resolve the unexpected state. Candidate numbers are monotonically
 increasing remote identities.
 
-### A mobile candidate push is rejected by repository rules
+### A mobile candidate publication is rejected by repository rules
 
-Confirm the intended operator is allowed to create `mobile-v*` tags. Do not
-weaken update or deletion protection. Existing candidate tags must remain
-immutable.
+Confirm `buzz-release-bot` remains the sole always-bypass actor for the active
+`mobile-v*` ruleset and that its Actions credentials are available. Do not grant
+direct human creation or weaken update or deletion protection. Existing
+candidate tags must remain immutable.
 
 ### Auto-updater reports "no update available"
 Verify that the `buzz-desktop-latest` release exists and contains a
