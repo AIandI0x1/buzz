@@ -114,13 +114,39 @@ release-metadata PR.
 
 ---
 
-## Manual Fallback
+## Signed macOS Canary
 
-Desktop supports the manual GitHub Actions fallback:
+Use the manual **Signed macOS Canary** workflow when you need an Apple Silicon
+build of current `main` for explicit testing without publishing a release:
 
-1. Go to **Actions > Release** in the GitHub UI.
-2. Click **Run workflow**.
-3. Provide the semver version and the immutable tag ref to build.
+```sh
+gh workflow run signed-macos-canary.yml --repo block/buzz --ref main
+```
+
+The workflow derives a `-test.<run-number>` version, signs and notarizes the
+DMG, verifies it with Gatekeeper, and uploads it as a short-lived Actions
+artifact with seven-day retention. Because this is a public repository, any
+signed-in GitHub user can download that artifact while it exists; it is
+unpublished, not private. The workflow has no release permissions, does not
+create or move tags, and cannot update `buzz-desktop-latest` or `latest.json`.
+
+Download the artifact from the completed run:
+
+```sh
+gh run download <run-id> --repo block/buzz --name <artifact-name>
+```
+
+The workflow intentionally accepts only `main`. Use the normal release process
+for distributable builds or builds from an immutable release tag.
+
+---
+
+## Manual Release Retry
+
+The **Release** workflow's manual dispatch is only a retry mechanism for an
+existing immutable `v<version>` tag. Select that tag in the ref picker and
+provide the matching semver version without the `v` prefix. It cannot build
+from `main` or another caller-selected source ref.
 
 Mobile intentionally has no branch or arbitrary-ref fallback. The private
 Buildkite pipeline accepts only an exact candidate tag.

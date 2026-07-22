@@ -109,6 +109,7 @@ export default defineConfig({
         "**/onboarding-agent-defaults.spec.ts",
         "**/nostr-bind.spec.ts",
         "**/profile-nsec-reveal.spec.ts",
+        "**/signout-confirmation.spec.ts",
         "**/agent-provider-dropdowns.spec.ts",
         "**/agent-lifecycle-feedback.spec.ts",
         "**/inbox-live-update.spec.ts",
@@ -135,6 +136,7 @@ export default defineConfig({
         "**/persona-env-vars.spec.ts",
         "**/persona-sync.spec.ts",
         "**/team-snapshot.spec.ts",
+        "**/agents-everywhere.live.spec.ts",
         "**/parity-ancestor-island.spec.ts",
       ],
       use: {
