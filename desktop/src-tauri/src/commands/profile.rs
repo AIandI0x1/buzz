@@ -112,7 +112,7 @@ pub async fn update_profile_at_relay(
         "authors": [expected_pubkey],
         "limit": 1
     });
-    let prior_events = query_relay_at(&state, &api_base_url, &[filter.clone()]).await?;
+    let prior_events = query_relay_at(&state, &api_base_url, std::slice::from_ref(&filter)).await?;
     let current: Value = prior_events
         .first()
         .and_then(|event| serde_json::from_str::<Value>(&event.content).ok())
