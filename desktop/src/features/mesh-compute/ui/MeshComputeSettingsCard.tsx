@@ -29,6 +29,7 @@ import {
   useMeshDownloadProgress,
 } from "../hooks/useMeshDownloadProgress";
 import { useMeshNodeStatus } from "../hooks/useMeshNodeStatus";
+import { deriveMeshShareToggle } from "../shareToggleState";
 
 const MODEL_DRAFT_STORAGE_KEY = "buzz.mesh-compute.share.model.v1";
 const MAX_VRAM_DRAFT_STORAGE_KEY = "buzz.mesh-compute.share.max-vram-gb.v1";
@@ -130,8 +131,15 @@ export function MeshComputeSettingsCard() {
     }
   }, [status?.state, status?.modelId, modelInput]);
 
-  const isOn = status?.state === "running" || status?.state === "starting";
-  const controlsDisabled = isOn || actionInFlight;
+  // The Share toggle reflects ONLY serve-mode occupancy. A client-mode runtime
+  // (this machine consuming a peer's compute) shares the single runtime slot
+  // and also reports state:"running" — but it must NOT light this switch, and
+  // toggling off must never tear down that unrelated consume session.
+  const { isSharing, isConsuming, slotOccupied } =
+    deriveMeshShareToggle(status);
+  // Any occupying runtime (serve or client, healthy or failed) locks the model
+  // inputs and blocks a fresh start — stop it before reconfiguring.
+  const controlsDisabled = slotOccupied || actionInFlight;
   const refClass = classifyModelRef(modelInput);
   const canStart =
     refClass.kind !== "unknown" &&
@@ -139,6 +147,13 @@ export function MeshComputeSettingsCard() {
     status?.state !== "starting";
 
   async function handleToggle(next: boolean) {
+    // Never let the Share switch tear down a consume session. The switch is
+    // already disabled while consuming, but status can be stale between polls,
+    // so refuse a stop that isn't stopping OUR serve node as a belt-and-braces
+    // guard (the backend enforces this authoritatively too).
+    if (!next && !isSharing) {
+      return;
+    }
     setActionError(null);
     setPendingAction(next ? "start" : "stop");
     setActionInFlight(true);
@@ -202,12 +217,24 @@ export function MeshComputeSettingsCard() {
             >
               Share this machine
             </label>
-            <StatusLine pendingAction={pendingAction} status={status} />
+            <StatusLine
+              isConsuming={isConsuming}
+              pendingAction={pendingAction}
+              status={status}
+            />
           </div>
           <Switch
-            checked={isOn}
+            checked={isSharing}
             data-testid="mesh-share-compute-toggle"
-            disabled={actionInFlight || (!isOn && !canStart)}
+            disabled={
+              // When the slot is occupied, the switch is only actionable if
+              // WE are sharing (so it can stop a serve node — even a failed
+              // one). Any other occupant (consuming, or an unexpected
+              // modeless-running node) would make a fresh start throw "already
+              // running", so keep it disabled. When the slot is empty, gate on
+              // a valid model ref.
+              actionInFlight || (slotOccupied ? !isSharing : !canStart)
+            }
             id="mesh-share-compute-toggle"
             onCheckedChange={handleToggle}
           />
@@ -488,9 +515,11 @@ function CatalogPicker({
 }
 
 function StatusLine({
+  isConsuming,
   pendingAction,
   status,
 }: {
+  isConsuming: boolean;
   pendingAction: "start" | "stop" | null;
   status: MeshNodeStatus | null;
 }) {
@@ -499,6 +528,18 @@ function StatusLine({
   }
   if (pendingAction === "stop") {
     return <p className="text-sm text-muted-foreground">Stopping…</p>;
+  }
+  // A client-mode runtime owns the single slot: this machine is consuming a
+  // peer's compute, not sharing. Explain why Share is off + disabled instead
+  // of showing the misleading "Sharing … with relay members" serve copy. The
+  // client node is app-session-lived infra with no user stop control, so the
+  // copy states the fact rather than promising an action that doesn't exist.
+  if (isConsuming) {
+    return (
+      <p className="text-sm text-muted-foreground">
+        This machine is currently using another member's shared compute.
+      </p>
+    );
   }
   if (!status) {
     return <p className="text-sm text-muted-foreground">Checking status…</p>;

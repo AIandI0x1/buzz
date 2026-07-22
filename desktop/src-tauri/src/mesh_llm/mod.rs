@@ -381,6 +381,14 @@ impl DesktopMeshRuntime {
         &self.start_request
     }
 
+    /// The role this runtime was started in. Serve = this machine is SHARING
+    /// compute; Client = this machine is CONSUMING a peer's compute. Both
+    /// occupy the single runtime slot, so callers that act only on the sharing
+    /// role (e.g. the Share-compute stop path) must check this first.
+    pub fn mode(&self) -> MeshNodeMode {
+        self.mode
+    }
+
     pub async fn status(&self) -> anyhow::Result<MeshNodeStatus> {
         let status = self.handle.status().await?;
         self.status_from_sdk(status)

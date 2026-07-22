@@ -1021,6 +1021,14 @@ declare global {
       admitted?: boolean;
       models?: Array<{ id: string; name: string | null }>;
       denyReason?: string;
+      /** Seed the runtime slot's lifecycle state (default "off"). */
+      nodeState?: "off" | "running";
+      /**
+       * Seed the runtime slot's role. "client" models this machine CONSUMING a
+       * peer's compute — it shares the single slot and reports state:"running",
+       * so the Share toggle must stay off. Drives the toggle-on regression test.
+       */
+      nodeMode?: "serve" | "client" | null;
     }) => void;
     __BUZZ_E2E_SEED_ACTIVE_TURNS__?: (input: {
       agentPubkey: string;
@@ -9066,6 +9074,8 @@ export function maybeInstallE2eTauriMocks() {
     if (mesh.models !== undefined) mockMeshState.models = mesh.models;
     if (mesh.denyReason !== undefined)
       mockMeshState.denyReason = mesh.denyReason;
+    if (mesh.nodeState !== undefined) mockMeshState.nodeState = mesh.nodeState;
+    if (mesh.nodeMode !== undefined) mockMeshState.nodeMode = mesh.nodeMode;
   };
   let seedTurnSeq = Date.now();
   window.__BUZZ_E2E_SEED_ACTIVE_TURNS__ = ({
@@ -9194,6 +9204,14 @@ export function maybeInstallE2eTauriMocks() {
         return meshNodeStatus(mockMeshState.nodeState, mockMeshState.nodeMode);
       }
       case "mesh_stop_node":
+        // Mirror the backend contract: "stop sharing" must never tear down a
+        // client (consume) node occupying the single slot. Leave it running.
+        if (mockMeshState.nodeMode === "client") {
+          return meshNodeStatus(
+            mockMeshState.nodeState,
+            mockMeshState.nodeMode,
+          );
+        }
         mockMeshState.nodeState = "off";
         mockMeshState.nodeMode = null;
         return meshNodeStatus("off", null);

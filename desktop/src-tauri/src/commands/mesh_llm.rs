@@ -45,6 +45,18 @@ fn load_mesh_sharing_config(app: &AppHandle) -> Result<Option<MeshSharingConfig>
 const RELAY_MESH_RUNTIME_NO_TARGET: &str =
     "Buzz shared compute requires a live serving member; start serving the selected model on a member, then try again";
 
+/// Whether the Share-compute "stop sharing" path (`mesh_stop_node`) should tear
+/// down the runtime currently occupying the single slot.
+///
+/// Serve nodes (this machine SHARING compute) are torn down. Client nodes (this
+/// machine CONSUMING a peer's compute) share the same slot and MUST be left
+/// running — stopping "Share compute" must never kill a consume session the
+/// user didn't start from this switch.
+#[cfg(feature = "mesh-llm")]
+fn share_stop_should_teardown(mode: mesh_llm::MeshNodeMode) -> bool {
+    matches!(mode, mesh_llm::MeshNodeMode::Serve)
+}
+
 pub type CmdResult<T> = Result<T, String>;
 
 fn advance_mesh_status_cursor(
@@ -411,8 +423,22 @@ pub async fn mesh_stop_node(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> CmdResult<mesh_llm::MeshNodeStatus> {
-    let runtime = state.mesh_llm_runtime.lock().await.take();
-    if let Some(runtime) = runtime {
+    // The single runtime slot is shared by serve (this machine SHARING
+    // compute) and client (this machine CONSUMING a peer's compute) roles.
+    // Stopping "Share compute" must NEVER tear down a client node: inspect the
+    // role under the lock and, when it's a consume session, leave it running
+    // and return its live status unchanged. The frontend also guards this, but
+    // status can be stale between polls, so the backend is authoritative.
+    let taken = {
+        let mut guard = state.mesh_llm_runtime.lock().await;
+        if let Some(runtime) = guard.as_ref() {
+            if !share_stop_should_teardown(runtime.mode()) {
+                return runtime.status().await.map_err(|error| error.to_string());
+            }
+        }
+        guard.take()
+    };
+    if let Some(runtime) = taken {
         runtime.stop().await.map_err(|error| error.to_string())?;
     }
     save_mesh_sharing_config(
@@ -544,6 +570,52 @@ mod tests {
         let targets = vec![target("model-a", "addr-a")];
         // No live target serves this model -> caller falls closed.
         assert_eq!(pick_serve_target_for_model(targets, "model-missing"), None);
+    }
+
+    #[test]
+    fn share_stop_tears_down_serve_but_not_client() {
+        // Stopping "Share compute" tears down a serve node (we were sharing)
+        // but must leave a client node alone (we are consuming a peer). This is
+        // the backend half of the toggle-on regression: a client node occupies
+        // the single slot and reports state:"running", and the stop path must
+        // not kill it.
+        assert!(
+            share_stop_should_teardown(mesh_llm::MeshNodeMode::Serve),
+            "serve node is our sharing runtime; stop must tear it down"
+        );
+        assert!(
+            !share_stop_should_teardown(mesh_llm::MeshNodeMode::Client),
+            "client node is a consume session; stop must NOT tear it down"
+        );
+    }
+
+    #[test]
+    fn client_status_serializes_with_running_state_and_client_mode() {
+        // Contract pin for the TS mock (e2eBridge.ts) and the frontend
+        // predicate: a consuming node serializes as
+        // {"state":"running","mode":"client"}. If serde renaming drifts, the
+        // hand-written mock shape and `deriveMeshShareToggle` would silently
+        // stop matching the real IPC payload.
+        let status = mesh_llm::MeshNodeStatus {
+            state: mesh_llm::MeshNodeState::Running,
+            mode: Some(mesh_llm::MeshNodeMode::Client),
+            // `MeshHealth::ok()` is module-private; build via the public fields.
+            health: mesh_llm::MeshHealth {
+                status: mesh_llm::MeshHealthStatus::Ok,
+                reason: None,
+            },
+            api_base_url: Some("http://127.0.0.1:9337/v1".to_string()),
+            console_url: None,
+            model_id: None,
+            model_name: None,
+            invite_token: None,
+            endpoint_id: None,
+            device_id: None,
+            device_name: None,
+        };
+        let value = serde_json::to_value(&status).expect("serialize mesh status");
+        assert_eq!(value["state"], serde_json::json!("running"));
+        assert_eq!(value["mode"], serde_json::json!("client"));
     }
 
     #[tokio::test]
