@@ -8,26 +8,24 @@ pub struct SubmitEventResponse {
     pub message: String,
 }
 
-/// Build an `EventBuilder` from the events module, sign it with the user's keys,
-/// and POST the signed event to `/events` with NIP-98 auth.
-pub async fn submit_event_at(
+/// Sign with an explicit identity and POST the event to an explicit relay.
+///
+/// The caller owns the signer lifetime. This is important for deferred work:
+/// an in-process identity swap cannot retarget the event or its NIP-98 auth
+/// after the caller has validated which identity the operation belongs to.
+pub async fn submit_event_at_with_keys(
     builder: nostr::EventBuilder,
     state: &AppState,
     api_base_url: &str,
+    keys: &nostr::Keys,
 ) -> Result<SubmitEventResponse, String> {
     crate::relay_admission::wait_for_rate_limit().await;
-    // All synchronous work (signing) must complete before any .await
-    // so the MutexGuard is dropped and the future remains Send.
     let url = format!("{}/events", api_base_url.trim_end_matches('/'));
-    let (auth_header, body_bytes) = {
-        let keys = state.signing_keys()?;
-        let event = builder
-            .sign_with_keys(&keys)
-            .map_err(|e| format!("failed to sign event: {e}"))?;
-        let body = event.as_json().into_bytes();
-        let auth = build_nip98_auth_header_for_keys(&keys, &Method::POST, &url, &body)?;
-        (auth, body)
-    }; // keys dropped here
+    let event = builder
+        .sign_with_keys(keys)
+        .map_err(|e| format!("failed to sign event: {e}"))?;
+    let body_bytes = event.as_json().into_bytes();
+    let auth_header = build_nip98_auth_header_for_keys(keys, &Method::POST, &url, &body_bytes)?;
 
     let response = state
         .http_client
@@ -44,7 +42,6 @@ pub async fn submit_event_at(
     }
 
     let result: SubmitEventResponse = parse_json_response(response).await?;
-
     if !result.accepted {
         return Err(format!("relay rejected event: {}", result.message));
     }
@@ -52,11 +49,12 @@ pub async fn submit_event_at(
     Ok(result)
 }
 
-/// Build, sign, and submit an event to the currently active workspace relay.
+/// Build and submit an event to the currently active workspace relay.
 pub async fn submit_event(
     builder: nostr::EventBuilder,
     state: &AppState,
 ) -> Result<SubmitEventResponse, String> {
     let api_base_url = relay_api_base_url_with_override(state);
-    submit_event_at(builder, state, &api_base_url).await
+    let keys = state.signing_keys()?;
+    submit_event_at_with_keys(builder, state, &api_base_url, &keys).await
 }

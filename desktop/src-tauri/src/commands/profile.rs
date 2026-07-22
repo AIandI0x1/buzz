@@ -9,7 +9,9 @@ use crate::{
     events,
     models::{ProfileInfo, SearchUsersResponse, UserNotesResponse, UsersBatchResponse},
     nostr_convert,
-    relay::{query_relay, query_relay_at, relay_http_base_url, submit_event, submit_event_at},
+    relay::{
+        query_relay, query_relay_at, relay_http_base_url, submit_event, submit_event_at_with_keys,
+    },
 };
 
 #[tauri::command]
@@ -102,10 +104,7 @@ pub async fn update_profile_at_relay(
     avatar_url: String,
     state: State<'_, AppState>,
 ) -> Result<ProfileInfo, String> {
-    let current_pubkey = current_pubkey_hex(&state)?;
-    if current_pubkey != expected_pubkey {
-        return Err("profile identity changed before avatar save".to_string());
-    }
+    let signer = capture_expected_signer(&state, &expected_pubkey)?;
 
     let api_base_url = relay_http_base_url(&relay_url);
     let filter = serde_json::json!({
@@ -133,7 +132,7 @@ pub async fn update_profile_at_relay(
     let about = current.get("about").and_then(Value::as_str);
     let nip05 = current.get("nip05").and_then(Value::as_str);
     let builder = events::build_profile(display_name, name, Some(&avatar_url), about, nip05)?;
-    submit_event_at(builder, &state, &api_base_url).await?;
+    submit_event_at_with_keys(builder, &state, &api_base_url, &signer).await?;
 
     let events = query_relay_at(&state, &api_base_url, &[filter]).await?;
     Ok(events
@@ -141,6 +140,14 @@ pub async fn update_profile_at_relay(
         .map(nostr_convert::profile_info_from_event)
         .transpose()?
         .unwrap_or_else(|| empty_profile_info(&expected_pubkey)))
+}
+
+fn capture_expected_signer(state: &AppState, expected_pubkey: &str) -> Result<nostr::Keys, String> {
+    let signer = state.signing_keys()?;
+    if signer.public_key().to_hex() != expected_pubkey {
+        return Err("profile identity changed before avatar save".to_string());
+    }
+    Ok(signer)
 }
 
 fn normalized_avatar_url(avatar_url: Option<&str>) -> Option<&str> {
@@ -387,6 +394,27 @@ fn empty_profile_info(pubkey: &str) -> ProfileInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_profile_signer_is_captured_and_rejects_wrong_identity() {
+        let state = crate::app_state::build_app_state();
+        let original = state.signing_keys().expect("signable identity");
+        let original_pubkey = original.public_key().to_hex();
+
+        let captured = capture_expected_signer(&state, &original_pubkey)
+            .expect("matching identity should be captured");
+        *state.keys.lock().expect("lock keys") = nostr::Keys::generate();
+
+        assert_eq!(captured.public_key().to_hex(), original_pubkey);
+        assert_ne!(
+            state.keys.lock().expect("lock keys").public_key().to_hex(),
+            original_pubkey
+        );
+        assert_eq!(
+            capture_expected_signer(&state, &original_pubkey).unwrap_err(),
+            "profile identity changed before avatar save"
+        );
+    }
 
     #[test]
     fn user_search_filter_requests_prefix_mode_for_typeahead() {
