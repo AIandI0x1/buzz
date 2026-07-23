@@ -627,7 +627,10 @@ fn serving_usage_extracts_local_and_remote_attempts() {
     assert_eq!(usage.local_attempts, 4);
     assert_eq!(usage.remote_attempts, 0);
     assert_eq!(usage.endpoint_attempts, 0);
-    assert!(!usage.has_remote_consumers(), "all-local traffic is not a remote consumer");
+    assert!(
+        !usage.has_remote_consumers(),
+        "all-local traffic is not a remote consumer"
+    );
 }
 
 #[test]
@@ -647,7 +650,10 @@ fn serving_usage_flags_remote_consumer() {
     assert_eq!(usage.remote_attempts, 6);
     assert_eq!(usage.endpoint_attempts, 1);
     assert_eq!(usage.peers, 2);
-    assert!(usage.has_remote_consumers(), "remote/endpoint attempts mean someone else is using my compute");
+    assert!(
+        usage.has_remote_consumers(),
+        "remote/endpoint attempts mean someone else is using my compute"
+    );
 }
 
 #[test]
