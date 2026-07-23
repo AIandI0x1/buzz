@@ -521,7 +521,9 @@ test("reviewer can leave a commit-scoped inline diff comment", async ({
   );
 
   await page.getByRole("tab", { name: "Conversation" }).click();
-  await page.getByTestId("project-pull-request-review-history-toggle").click();
+  await expect(
+    page.getByTestId("project-pull-request-review-history-toggle"),
+  ).toHaveAttribute("aria-expanded", "true");
   await expect(
     page.getByText("Please add a type for this parameter."),
   ).toBeVisible();
