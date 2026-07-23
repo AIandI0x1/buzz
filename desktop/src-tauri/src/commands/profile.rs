@@ -11,7 +11,8 @@ use crate::{
     models::{ProfileInfo, SearchUsersResponse, UserNotesResponse, UsersBatchResponse},
     nostr_convert,
     relay::{
-        query_relay, query_relay_at, relay_http_base_url, submit_event, submit_event_at_with_keys,
+        query_relay, query_relay_at_with_keys, relay_http_base_url, submit_event,
+        submit_event_at_with_keys,
     },
 };
 
@@ -113,7 +114,14 @@ pub async fn update_profile_at_relay(
         "authors": [expected_pubkey],
         "limit": 1
     });
-    let prior_events = query_relay_at(&state, &api_base_url, std::slice::from_ref(&filter)).await?;
+    let prior_events = query_relay_at_with_keys(
+        &state,
+        &api_base_url,
+        std::slice::from_ref(&filter),
+        &signer,
+        None,
+    )
+    .await?;
     let prior_event = prior_events.first();
     let current: Value = prior_event
         .and_then(|event| serde_json::from_str::<Value>(&event.content).ok())
@@ -131,7 +139,7 @@ pub async fn update_profile_at_relay(
     let builder = build_deferred_profile_event(&current, &avatar_url, prior_event)?;
     submit_event_at_with_keys(builder, &state, &api_base_url, &signer).await?;
 
-    let events = query_relay_at(&state, &api_base_url, &[filter]).await?;
+    let events = query_relay_at_with_keys(&state, &api_base_url, &[filter], &signer, None).await?;
     Ok(events
         .first()
         .map(nostr_convert::profile_info_from_event)
