@@ -420,6 +420,7 @@ test("team cards use the thread-style overlapping avatar stack", async ({
   await installMockBridge(page, {
     personas: [
       {
+        avatarUrl: "/onboarding/starter-team/fizz.png",
         id: personaIds[0],
         displayName: "Design",
         systemPrompt: "You design interfaces.",
@@ -461,6 +462,29 @@ test("team cards use the thread-style overlapping avatar stack", async ({
   expect(boxes[2]?.left).toBeLessThan(boxes[1]?.right ?? 0);
   await expect(avatars.first()).not.toHaveCSS("mask-image", "none");
   await expect(avatars.last()).toHaveCSS("mask-image", "none");
+  const avatarSurfaceStyles = await avatars
+    .locator(":scope > *")
+    .evaluateAll((elements) =>
+      elements.map((element) => {
+        const styles = getComputedStyle(element);
+        const hasVisibleShadow = [
+          ...styles.boxShadow.matchAll(/rgba?\(([^)]+)\)/g),
+        ].some((match) => {
+          if (match[0].startsWith("rgb(")) return true;
+          const channels = match[1]?.split(/[\s,/]+/).filter(Boolean) ?? [];
+          return Number(channels.at(-1)) > 0;
+        });
+        return {
+          borderWidth: styles.borderTopWidth,
+          hasVisibleShadow,
+        };
+      }),
+    );
+  expect(avatarSurfaceStyles).toEqual([
+    { borderWidth: "0px", hasVisibleShadow: false },
+    { borderWidth: "0px", hasVisibleShadow: false },
+    { borderWidth: "0px", hasVisibleShadow: false },
+  ]);
 });
 
 test("agent defaults stays in the header without an actions menu", async ({

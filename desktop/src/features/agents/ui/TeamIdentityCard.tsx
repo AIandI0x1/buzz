@@ -147,7 +147,7 @@ function TeamAvatarRow({
             className={visiblePersonas.length > 0 ? "-ml-5" : ""}
             style={{ zIndex: stackItemCount }}
           >
-            <span className="flex h-14 w-14 items-center justify-center rounded-full border-[3px] border-background bg-card text-sm font-semibold text-muted-foreground shadow-sm">
+            <span className="flex h-14 w-14 items-center justify-center rounded-full bg-card text-sm font-semibold text-muted-foreground">
               +{overflowCount}
             </span>
           </div>
@@ -184,13 +184,14 @@ function TeamAvatarItem({
       {avatarUrl ? (
         <ProfileAvatar
           avatarUrl={avatarUrl}
-          className="h-full w-full border-[3px] border-background bg-muted shadow-sm"
+          className="h-full w-full bg-muted shadow-none"
           iconClassName="h-6 w-6"
           label={persona.displayName}
           testId={`team-member-avatar-${persona.id}`}
         />
       ) : (
         <IdentityInitialsAvatar
+          className="border-0 shadow-none"
           colorIndex={index}
           label={persona.displayName}
           size={56}
