@@ -767,6 +767,12 @@ async fn discover_databricks_models(
     }))
 }
 
+/// Return whether this build enforces owner-only managed-agent access.
+#[tauri::command]
+pub fn agent_access_owner_only() -> bool {
+    crate::managed_agents::internal_agent_access_owner_only()
+}
+
 /// Update mutable fields on an existing managed agent record.
 ///
 /// Does NOT auto-restart the agent. Runtime config changes (system prompt,
@@ -874,14 +880,20 @@ pub async fn update_managed_agent(
             record.relay_mesh = Some(crate::managed_agents::RelayMeshConfig { model_ref });
         }
 
-        // Inbound author gate: merge patch onto current values, then validate
-        // the merged state. This lets a single update switch to Allowlist AND
-        // supply pubkeys atomically.
-        let prospective_mode = input.respond_to.unwrap_or(record.respond_to);
-        let prospective_allowlist = match input.respond_to_allowlist.as_ref() {
-            Some(list) => crate::managed_agents::validate_respond_to_allowlist(list)?,
-            None => record.respond_to_allowlist.clone(),
-        };
+        // Inbound author gate: internal builds enforce owner-only regardless
+        // of the caller's patch; OSS builds merge and validate configurable
+        // access as before.
+        let (prospective_mode, prospective_allowlist) =
+            if crate::managed_agents::internal_agent_access_owner_only() {
+                (crate::managed_agents::RespondTo::OwnerOnly, Vec::new())
+            } else {
+                let mode = input.respond_to.unwrap_or(record.respond_to);
+                let allowlist = match input.respond_to_allowlist.as_ref() {
+                    Some(list) => crate::managed_agents::validate_respond_to_allowlist(list)?,
+                    None => record.respond_to_allowlist.clone(),
+                };
+                (mode, allowlist)
+            };
         if prospective_mode == crate::managed_agents::RespondTo::Allowlist
             && prospective_allowlist.is_empty()
         {
@@ -891,9 +903,11 @@ pub async fn update_managed_agent(
             );
         }
         record.respond_to = prospective_mode;
-        // Preserve the persisted allowlist across mode toggles — only replace
-        // when the caller explicitly supplied a new list.
-        if input.respond_to_allowlist.is_some() {
+        if crate::managed_agents::internal_agent_access_owner_only() {
+            record.respond_to_allowlist.clear();
+        } else if input.respond_to_allowlist.is_some() {
+            // Preserve the persisted allowlist across OSS mode toggles — only
+            // replace when the caller explicitly supplied a new list.
             record.respond_to_allowlist = prospective_allowlist;
         }
 

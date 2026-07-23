@@ -27,6 +27,13 @@ pub(crate) fn baked_build_env() -> BTreeMap<String, String> {
     )
 }
 
+/// Whether this is an internal release build and therefore managed-agent
+/// access must be owner-only. Internal builds bake provider configuration;
+/// OSS builds have no baked environment.
+pub(crate) fn internal_agent_access_owner_only() -> bool {
+    !baked_build_env().is_empty()
+}
+
 /// Assemble a build-time env map from optional raw bake-in values.
 ///
 /// Separated from `baked_build_env` so the assembly logic can be exercised in

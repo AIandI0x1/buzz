@@ -80,7 +80,9 @@ const overrides = new Map([
   // ratcheting 1443 -> 1295. Queued to split further in the A2 fold.
   // global-agent-config: resolve_deploy_model_provider + visibility exports
   // add ~40 lines on top of the 1A.1 ratchet. Queued to split.
-  ["src-tauri/src/commands/agents.rs", 1340],
+  // internal-owner-only: create-time policy normalization adds a small
+  // security boundary while keeping OSS respond-to behavior unchanged.
+  ["src-tauri/src/commands/agents.rs", 1349],
   // agent-lifecycle-fixes: cascade-delete in delete_persona restructured into
   // 3-phase (stage/stop/commit) + commit_cascade_agents injectable helper for
   // retry-safety. Load-bearing reviewer-required change; queued to split.
@@ -131,7 +133,9 @@ const overrides = new Map([
   // record_provider param + applies persona_field_with_record_fallback. +5 lines.
   // global-agent-config: spawn_agent_child loads global config and merges as
   // lowest env layer (+8 lines). Queued to split.
-  ["src-tauri/src/managed_agents/runtime.rs", 2216],
+  // internal-owner-only: runtime authorization normalization protects stale
+  // or hand-edited records before spawning an internal managed agent.
+  ["src-tauri/src/managed_agents/runtime.rs", 2224],
   // config-bridge setup-payload env-boundary fix adds readiness wiring in
   // spawn_agent_child; load-bearing security fix, queued to split.
   ["src-tauri/src/managed_agents/config_bridge/reader.rs", 1016],
@@ -541,7 +545,9 @@ const overrides = new Map([
   // isRuntimeAutoSeededRef tracking for edit-mode seeding (Fizz shows models);
   // runtimeSupportsLlmProviderSelection guard on discovery provider (codex fix);
   // hideProviderIds computation for Databricks v1 gate. Queued to split.
-  ["src/features/agents/ui/AgentDefinitionDialog.tsx", 1035],
+  // internal-owner-only: queries the backend policy so the internal build can
+  // hide definition-level access controls while OSS keeps them configurable.
+  ["src/features/agents/ui/AgentDefinitionDialog.tsx", 1043],
 ]);
 
 await runFileSizeCheck({

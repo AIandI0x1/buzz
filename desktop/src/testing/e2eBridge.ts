@@ -10285,6 +10285,8 @@ export function maybeInstallE2eTauriMocks() {
       }
       case "get_baked_build_env_keys":
         return (config?.mock?.bakedBuildEnv ?? []).map((entry) => entry.key);
+      case "agent_access_owner_only":
+        return (config?.mock?.bakedBuildEnv ?? []).length > 0;
       case "update_managed_agent":
         return handleUpdateManagedAgent(
           payload as Parameters<typeof handleUpdateManagedAgent>[0],
