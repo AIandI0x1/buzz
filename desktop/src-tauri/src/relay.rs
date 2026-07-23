@@ -347,6 +347,7 @@ pub async fn query_relay_at_with_keys(
     keys: &Keys,
     auth_tag: Option<&str>,
 ) -> Result<Vec<nostr::Event>, String> {
+    crate::relay_admission::wait_for_rate_limit().await;
     let url = format!("{}/query", api_base_url);
     let body_bytes =
         serde_json::to_vec(filters).map_err(|e| format!("filter serialization failed: {e}"))?;
